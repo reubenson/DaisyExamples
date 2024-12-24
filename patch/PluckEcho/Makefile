@@ -1,6 +1,7 @@
 # Project Name
 TARGET = PluckEcho
 
+# import for pluck
 USE_DAISYSP_LGPL = 1
 
 # Sources

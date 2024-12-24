@@ -11,7 +11,7 @@ int curveTimeMode;
 
 struct envStruct
 {
-    AdEnv     env;
+    Adsr      env;
     Parameter attackParam;
     Parameter decayParam;
     Parameter curveParam;
@@ -31,8 +31,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     for(size_t i = 0; i < size; i++)
     {
         //Get the next envelope samples
-        envelopes[0].envSig = envelopes[0].env.Process();
-        envelopes[1].envSig = envelopes[1].env.Process();
+        envelopes[0].envSig = std::max(envelopes[0].env.Process(hw.gate_input[0].State()), hw.controls[3].Process());
+        envelopes[1].envSig = std::max(envelopes[1].env.Process(hw.gate_input[1].State()), hw.controls[3].Process());
+        // envelopes[1].envSig = envelopes[1].env.Process();
 
         for(size_t chn = 0; chn < 2; chn++)
         {
@@ -49,9 +50,9 @@ void InitEnvelopes(float samplerate)
     {
         //envelope values and Init
         envelopes[i].env.Init(samplerate);
-        envelopes[i].env.SetMax(1);
-        envelopes[i].env.SetMin(0);
-        envelopes[i].env.SetCurve(0);
+        // envelopes[i].env.SetMax(1);
+        // envelopes[i].env.SetMin(0);
+        // envelopes[i].env.SetCurve(0);
     }
 
     //envelope parameters (control inputs)
@@ -62,10 +63,10 @@ void InitEnvelopes(float samplerate)
     envelopes[0].curveParam.Init(hw.controls[0], -10, 10, Parameter::LINEAR);
 
     envelopes[1].attackParam.Init(
-        hw.controls[2], .01, 2, Parameter::EXPONENTIAL);
+        hw.controls[0], .01, 2, Parameter::EXPONENTIAL);
     envelopes[1].decayParam.Init(
-        hw.controls[3], .01, 2, Parameter::EXPONENTIAL);
-    envelopes[1].curveParam.Init(hw.controls[2], -10, 10, Parameter::LINEAR);
+        hw.controls[1], .01, 2, Parameter::EXPONENTIAL);
+    envelopes[1].curveParam.Init(hw.controls[0], -10, 10, Parameter::LINEAR);
 }
 
 void UpdateOled();
@@ -89,9 +90,9 @@ int main(void)
     {
         //Send the latest envelope values to the CV outs
         hw.seed.dac.WriteValue(DacHandle::Channel::ONE,
-                               envelopes[0].envSig * 4095);
+                        envelopes[0].envSig * 4095);
         hw.seed.dac.WriteValue(DacHandle::Channel::TWO,
-                               envelopes[1].envSig * 4095);
+                        envelopes[1].envSig * 4095);
         hw.DelayMs(1);
     }
 }
@@ -101,13 +102,21 @@ void UpdateOled()
     hw.display.Fill(false);
 
     hw.display.SetCursor(0, 0);
-    std::string str  = "env1";
+    std::string str  = "A";
     char*       cstr = &str[0];
-    hw.display.WriteString(cstr, Font_7x10, true);
+    hw.display.WriteString(cstr, Font_6x8, true);
+
+    hw.display.SetCursor(35, 0);
+    str = "D/R";
+    hw.display.WriteString(cstr, Font_6x8, true);
 
     hw.display.SetCursor(70, 0);
-    str = "env2";
-    hw.display.WriteString(cstr, Font_7x10, true);
+    str = "S";
+    hw.display.WriteString(cstr, Font_6x8, true);
+
+    hw.display.SetCursor(105, 0);
+    str = "MIN";
+    hw.display.WriteString(cstr, Font_6x8, true);
 
     hw.display.SetCursor(0, 50);
     //curve or attack/decay mode
@@ -117,9 +126,9 @@ void UpdateOled()
     }
     else
     {
-        str = "attack/decay";
+        str = "ADSR :)";
     }
-    hw.display.WriteString(cstr, Font_7x10, true);
+    hw.display.WriteString(cstr, Font_6x8, true);
 
     hw.display.Update();
 }
@@ -138,18 +147,32 @@ void ProcessEncoder()
 
 void ProcessKnobs()
 {
-    for(int i = 0; i < 2; i++)
+    for(int i = 0; i < 1; i++)
     {
         if(curveTimeMode == 0)
         {
-            envelopes[i].env.SetTime(ADENV_SEG_ATTACK,
+            envelopes[0].env.SetTime(ADSR_SEG_ATTACK,
                                      envelopes[i].attackParam.Process());
-            envelopes[i].env.SetTime(ADENV_SEG_DECAY,
+            envelopes[0].env.SetTime(ADSR_SEG_DECAY,
                                      envelopes[i].decayParam.Process());
+            envelopes[0].env.SetSustainLevel(hw.controls[2].Process());                                 
+            envelopes[0].env.SetTime(ADSR_SEG_RELEASE,
+                                     envelopes[i].decayParam.Process());
+                                    // 0);
+            envelopes[1].env.SetTime(ADSR_SEG_ATTACK,
+                                     envelopes[i].attackParam.Process());
+            envelopes[1].env.SetTime(ADSR_SEG_DECAY,
+                                     envelopes[i].decayParam.Process());
+            envelopes[1].env.SetSustainLevel(hw.controls[2].Process());
+            envelopes[1].env.SetTime(ADSR_SEG_RELEASE,
+                                     envelopes[i].decayParam.Process());
+                                    // 0);
         }
         else
         {
-            envelopes[i].env.SetCurve(envelopes[i].curveParam.Process());
+            // envelopes[i].env.SetCurve(envelopes[i].curveParam.Process());
+            // envelopes[0].env.SetCurve(envelopes[i].curveParam.Process());
+            // envelopes[1].env.SetCurve(envelopes[i].curveParam.Process());
         }
     }
 }
@@ -160,7 +183,7 @@ void ProcessGates()
     {
         if(hw.gate_input[i].Trig())
         {
-            envelopes[i].env.Trigger();
+            envelopes[i].env.Retrigger(true);
         }
     }
 }

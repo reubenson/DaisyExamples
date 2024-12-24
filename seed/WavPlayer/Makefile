@@ -11,6 +11,9 @@ DAISYSP_DIR = ../../DaisySP
 # Includes FatFS source files within project.
 USE_FATFS = 1
 
+# set optimization so my code fits on the flash :)
+OPT = -Os
+
 # Core location, and generic makefile.
 SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
 include $(SYSTEM_FILES_DIR)/Makefile

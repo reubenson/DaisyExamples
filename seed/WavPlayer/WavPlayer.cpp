@@ -7,20 +7,20 @@
 //
 #include <stdio.h>
 #include <string.h>
-#include "daisy_pod.h"
-//#include "daisy_patch.h"
+// #include "daisy_pod.h"
+#include "daisy_patch.h"
 
 using namespace daisy;
 
 //DaisyPatch   hw;
-DaisyPod       hw;
+DaisyPatch       hw;
 SdmmcHandler   sdcard;
 FatFSInterface fsi;
 WavPlayer      sampler;
 
-void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
-                   AudioHandle::InterleavingOutputBuffer out,
-                   size_t                                size)
+void AudioCallback(AudioHandle::InputBuffer  in,
+                   AudioHandle::OutputBuffer out,
+                   size_t                    size)
 {
     int32_t inc;
 
@@ -63,7 +63,7 @@ void AudioCallback(AudioHandle::InterleavingInputBuffer  in,
 
     for(size_t i = 0; i < size; i += 2)
     {
-        out[i] = out[i + 1] = s162f(sampler.Stream()) * 0.5f;
+        out[0][i] = out[0][i + 1] = s162f(sampler.Stream()) * 0.5f;
     }
 }
 
@@ -76,6 +76,7 @@ int main(void)
     //    hw.ClearLeds();
     SdmmcHandler::Config sd_cfg;
     sd_cfg.Defaults();
+    sd_cfg.speed = SdmmcHandler::Speed::SLOW;
     sdcard.Init(sd_cfg);
     fsi.Init(FatFSInterface::Config::MEDIA_SD);
     f_mount(&fsi.GetSDFileSystem(), "/", 1);
