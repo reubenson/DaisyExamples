@@ -18,6 +18,12 @@ float cvOut2;
 float panOutput;
 int8_t currentHighestNote = 0;
 int8_t lastHighestNote = 0;
+int8_t currentLowestNote = 0;
+int8_t lastLowestNote = 0;
+
+// Display update timing
+uint32_t lastDisplayUpdate = 0;
+const uint32_t DISPLAY_UPDATE_INTERVAL_MS = 100; // Update display every 100ms
 
 struct panelStruct
 {
@@ -286,16 +292,18 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         out[1][i] = results[1];
     }
 
-    bool shouldUpdateDisplay = knobChanged;
-    if (shouldUpdateDisplay)
-    {
-        UpdateOled();
-        knobChanged = false;
-    }
+    // Note: Display updates moved to main loop to prevent audio dropouts
 }
 
 void InitEnvelopes(float samplerate)
 {
+    // Read current knob values for initialization
+    float currentKnobValues[4];
+    for(int i = 0; i < 4; i++)
+    {
+        currentKnobValues[i] = hw.controls[i].Process();
+    }
+    
     for(int i = 0; i < 4; i++)
     {
         //envelope values and Init
@@ -307,6 +315,12 @@ void InitEnvelopes(float samplerate)
         envelopes[i].attackParam.Init(hw.controls[0], .01, 1, Parameter::LINEAR);
         envelopes[i].decayParam.Init(hw.controls[1], .01, 1, Parameter::LINEAR);
         envelopes[i].curveParam.Init(hw.controls[0], -10, 10, Parameter::LINEAR);
+        
+        // Set initial ADSR values based on current knob positions (circle back to this after deciding about multiple panels)
+        // envelopes[i].env.SetTime(ADSR_SEG_ATTACK, currentKnobValues[0]);
+        // envelopes[i].env.SetTime(ADSR_SEG_DECAY, currentKnobValues[1]);
+        // envelopes[i].env.SetTime(ADSR_SEG_RELEASE, currentKnobValues[1]);
+        // envelopes[i].env.SetSustainLevel(currentKnobValues[2]);
     }
 }
 
@@ -407,6 +421,15 @@ int8_t getCurrentHighestNote() {
     return highestNote;
 }
 
+int8_t getCurrentLowestNote() {
+    int8_t lowestNote = voices[0].note;
+    for (int i = 1; i < 4; i++)
+    {
+        lowestNote = std::min(lowestNote, voices[i].note);
+    }
+    return lowestNote;
+}
+
 void HandleMidiMessage(MidiEvent m)
 {   
     // no longer need passthrough after MIDI 1U firmware update
@@ -438,6 +461,7 @@ void HandleMidiMessage(MidiEvent m)
             DisplayMessage(message);
 
             // pass highest currently held note to Intellijel via channel 16 and CC 1
+            // 8 on the Intellijel Xpander
             currentHighestNote = getCurrentHighestNote();
             if (currentHighestNote != lastHighestNote) {
                 SendMidiMesssage(currentHighestNote, 15, "NOTE_ON");
@@ -447,6 +471,18 @@ void HandleMidiMessage(MidiEvent m)
                 SendMidiMesssage(lastHighestNote, 15, "NOTE_OFF");
             }
             lastHighestNote = currentHighestNote;
+
+            // pass lowest currently held note to Intellijel via channel 15 and CC 1
+            // 7 on the Intellijel Xpander
+            currentLowestNote = getCurrentLowestNote();
+            if (currentLowestNote != lastLowestNote) {
+                SendMidiMesssage(currentLowestNote, 14, "NOTE_ON");
+            }
+            // turn off previous note
+            if (lastLowestNote != 0 && lastLowestNote != currentLowestNote) {
+                SendMidiMesssage(lastLowestNote, 14, "NOTE_OFF");
+            }
+            lastLowestNote = currentLowestNote;
             
             noteCount++;
         }
@@ -455,6 +491,29 @@ void HandleMidiMessage(MidiEvent m)
         {
             NoteOffEvent p = m.AsNoteOff();
             envelopes[p.channel - channelOffset].gate = false;
+            
+            // update highest and lowest notes when a note is released
+            currentHighestNote = getCurrentHighestNote();
+            if (currentHighestNote != lastHighestNote) {
+                if (lastHighestNote != 0) {
+                    SendMidiMesssage(lastHighestNote, 15, "NOTE_OFF");
+                }
+                if (currentHighestNote != 0) {
+                    SendMidiMesssage(currentHighestNote, 15, "NOTE_ON");
+                }
+            }
+            lastHighestNote = currentHighestNote;
+
+            currentLowestNote = getCurrentLowestNote();
+            if (currentLowestNote != lastLowestNote) {
+                if (lastLowestNote != 0) {
+                    SendMidiMesssage(lastLowestNote, 14, "NOTE_OFF");
+                }
+                if (currentLowestNote != 0) {
+                    SendMidiMesssage(currentLowestNote, 14, "NOTE_ON");
+                }
+            }
+            lastLowestNote = currentLowestNote;
         }
         default: break;
     }
@@ -469,6 +528,12 @@ int main(void)
     samplerate = hw.AudioSampleRate();
 
     InitEnvelopes(samplerate);
+
+    // Initialize display panel values with current knob positions
+    for(int i = 0; i < 4; i++)
+    {
+        displayPanels[0].values[i] = hw.controls[i].Process();
+    }
 
     panelMode = 0;
     currentPanel = displayPanels[panelMode];
@@ -513,6 +578,14 @@ int main(void)
             HandleMidiMessage(hw.midi.PopEvent());
         }
 
+        // Throttled display updates to prevent audio dropouts
+        uint32_t currentTime = hw.seed.system.GetNow();
+        if (knobChanged || (currentTime - lastDisplayUpdate) >= DISPLAY_UPDATE_INTERVAL_MS)
+        {
+            UpdateOled();
+            knobChanged = false;
+            lastDisplayUpdate = currentTime;
+        }
         
         // envelopes[p.channel].trig = true;
 
