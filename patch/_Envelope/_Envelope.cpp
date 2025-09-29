@@ -1,6 +1,7 @@
 #include "daisy_patch.h"
 #include "daisysp.h"
 #include <string>
+#include <cmath>
 
 using namespace daisy;
 using namespace daisysp;
@@ -25,6 +26,12 @@ int8_t lastLowestNote = 0;
 uint32_t lastDisplayUpdate = 0;
 const uint32_t DISPLAY_UPDATE_INTERVAL_MS = 100; // Update display every 100ms
 
+// Trigger off timing
+int8_t currentNote = 0;
+uint32_t triggerOffTime = 0;
+const uint32_t TRIGGER_OFF_DELAY_MS = 50; // 10ms delay for trigger off
+bool triggerOffPending = false;
+
 struct panelStruct
 {
     std::string     name;
@@ -36,7 +43,7 @@ struct panelStruct
 };
 panelStruct displayPanels[2] = {
     { 
-        name: "ADSR", 
+        name: "ADSR   ", 
         input1Name: "A", 
         input2Name: "D/R", 
         input3Name: "S",
@@ -82,9 +89,6 @@ voiceStruct voices[4];
 struct envStruct
 {
     Adsr      env;
-    Parameter attackParam;
-    Parameter decayParam;
-    Parameter curveParam;
     float     envSig;
     bool      gate;
     bool      trig;
@@ -122,7 +126,7 @@ bool      knobChanged = false;
 
 void DisplayMessage(const char* str)
 {
-    hw.display.Fill(false);
+    // hw.display.Fill(false);
     hw.display.SetCursor(0, 50);
     hw.display.WriteString(str, Font_6x8, true);
     hw.display.Update();
@@ -208,7 +212,9 @@ void ApplyVCAs(float* data) {
         // snprintf(message, 60, "val: %d", voices[i].note);
         data[i] = data[i] * envelopes[i].envSig;
 
-        envVal = envelopes[i].envSig * (velOffset + (1 - velOffset) * voices[i].velocity / 127.0f);
+        // Safe velocity calculation - handle case where velocity might be 0 or invalid
+        float velocityFactor = (voices[i].velocity > 0) ? voices[i].velocity / 127.0f : 0.0f;
+        envVal = envelopes[i].envSig * (velOffset + (1 - velOffset) * velocityFactor);
 
         if (envVal > envMax)
         {
@@ -230,7 +236,13 @@ void AudioCallback(AudioHandle::InputBuffer  in,
                    size_t                    size)
 {
     ProcessControls();
-    // UpdateEnvelopes();
+    
+    // Process envelopes at audio rate for consistent timing
+    float ctrl4 = hw.controls[3].Process(); // the fourth control knob controls baseline level
+    for(int j = 0; j < 4; j++)
+    {
+        envelopes[j].envSig = std::max(envelopes[j].env.Process(envelopes[j].gate), ctrl4);
+    }
 
     // float trig, nn, decay;       // Pluck Vars
     // float sig, delsig;           // Mono Audio Vars
@@ -297,30 +309,17 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
 void InitEnvelopes(float samplerate)
 {
-    // Read current knob values for initialization
-    float currentKnobValues[4];
     for(int i = 0; i < 4; i++)
     {
-        currentKnobValues[i] = hw.controls[i].Process();
-    }
-    
-    for(int i = 0; i < 4; i++)
-    {
-        //envelope values and Init
+        // Initialize envelope objects
         envelopes[i].env.Init(samplerate);
-        // envelopes[i].env.SetMax(1);
-        // envelopes[i].env.SetMin(0);
-        // envelopes[i].env.SetCurve(0);
-
-        envelopes[i].attackParam.Init(hw.controls[0], .01, 1, Parameter::LINEAR);
-        envelopes[i].decayParam.Init(hw.controls[1], .01, 1, Parameter::LINEAR);
-        envelopes[i].curveParam.Init(hw.controls[0], -10, 10, Parameter::LINEAR);
         
-        // Set initial ADSR values based on current knob positions (circle back to this after deciding about multiple panels)
-        // envelopes[i].env.SetTime(ADSR_SEG_ATTACK, currentKnobValues[0]);
-        // envelopes[i].env.SetTime(ADSR_SEG_DECAY, currentKnobValues[1]);
-        // envelopes[i].env.SetTime(ADSR_SEG_RELEASE, currentKnobValues[1]);
-        // envelopes[i].env.SetSustainLevel(currentKnobValues[2]);
+        // Set initial ADSR values - these will be updated by ProcessKnobs based on current panel
+        // for some reason this is currently not working
+        envelopes[i].env.SetTime(ADSR_SEG_ATTACK, 0.0001f);    // 1ms attack
+        envelopes[i].env.SetTime(ADSR_SEG_DECAY, 0.5f);        // 500ms decay
+        envelopes[i].env.SetTime(ADSR_SEG_RELEASE, 0.5f);       // 200ms release
+        envelopes[i].env.SetSustainLevel(1.0f);                 // 100% sustain
     }
 }
 
@@ -405,6 +404,16 @@ void SendMidiMesssage(uint8_t value, uint8_t channel, char* type)
         uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + channel), value, 0};
         hw.midi.SendMessage(bytes, 3);
     }
+    else if (type == "TRIGGER_ON")
+    {
+        uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + channel), value, 127};
+        hw.midi.SendMessage(bytes, 3);
+    }
+    else if (type == "TRIGGER_OFF")
+    {
+        uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + channel), value, 0};
+        hw.midi.SendMessage(bytes, 3);
+    }
     // else if (type == 'CC')
     // {
     //     uint8_t bytes[3] = {0xB0, , note};
@@ -456,11 +465,7 @@ void HandleMidiMessage(MidiEvent m)
 
             envelopes[p.channel - channelOffset].env.Retrigger(true);
 
-            char message[60];
-            snprintf(message, 60, "Note: %d Ch: %d", p.note, static_cast<int>(p.channel));
-            DisplayMessage(message);
-
-            // pass highest currently held note to Intellijel via channel 16 and CC 1
+            // pass highest currently held note to Intellijel via channel 16 and CC
             // 8 on the Intellijel Xpander
             currentHighestNote = getCurrentHighestNote();
             if (currentHighestNote != lastHighestNote) {
@@ -472,7 +477,7 @@ void HandleMidiMessage(MidiEvent m)
             }
             lastHighestNote = currentHighestNote;
 
-            // pass lowest currently held note to Intellijel via channel 15 and CC 1
+            // pass lowest currently held note to Intellijel via channel 15 and CC
             // 7 on the Intellijel Xpander
             currentLowestNote = getCurrentLowestNote();
             if (currentLowestNote != lastLowestNote) {
@@ -483,6 +488,20 @@ void HandleMidiMessage(MidiEvent m)
                 SendMidiMesssage(lastLowestNote, 14, "NOTE_OFF");
             }
             lastLowestNote = currentLowestNote;
+
+            // pass current note and trigger to Intellijel via channel 13
+            currentNote = p.note;
+            SendMidiMesssage(p.note, 13, "NOTE_ON");
+            // SendMidiMesssage(1, 13, "TRIGGER_ON");
+            
+            // Set timer for trigger off after 10ms delay
+            triggerOffTime = hw.seed.system.GetNow() + TRIGGER_OFF_DELAY_MS;
+            triggerOffPending = true;
+
+            // probably move outside of audio callback
+            char message[60];
+            snprintf(message, 60, "Note: %d Ch: %d", p.note, static_cast<int>(p.channel));
+            DisplayMessage(message);
             
             noteCount++;
         }
@@ -491,6 +510,10 @@ void HandleMidiMessage(MidiEvent m)
         {
             NoteOffEvent p = m.AsNoteOff();
             envelopes[p.channel - channelOffset].gate = false;
+            
+            // Clear voice data when note is released
+            voices[p.channel - channelOffset].note = 0;
+            voices[p.channel - channelOffset].velocity = 0;
             
             // update highest and lowest notes when a note is released
             currentHighestNote = getCurrentHighestNote();
@@ -587,6 +610,14 @@ int main(void)
             lastDisplayUpdate = currentTime;
         }
         
+        // Check for trigger off timing
+        if (triggerOffPending && currentTime >= triggerOffTime)
+        {
+            SendMidiMesssage(currentNote, 13, "NOTE_OFF"); // might be a bug here in currentNote changing while trigger off is pending
+            // SendMidiMesssage(0, 13, "TRIGGER_OFF");
+            triggerOffPending = false;
+        }
+        
         // envelopes[p.channel].trig = true;
 
         // Prepare buffers for sampler as needed
@@ -598,7 +629,7 @@ int main(void)
 
 void UpdateOled()
 {
-    hw.display.Fill(false);
+    // hw.display.Fill(false);
 
     hw.display.SetCursor(0, 0);
     std::string str  = currentPanel.input1Name;
@@ -617,10 +648,10 @@ void UpdateOled()
     str = currentPanel.input4Name;
     hw.display.WriteString(cstr, Font_6x8, true);
 
-    hw.display.SetCursor(0, 50);
+    hw.display.SetCursor(0, 20);
 
     str = currentPanel.name;
-    hw.display.WriteString(cstr, Font_6x8, true);
+    hw.display.WriteString(cstr, Font_7x10, true);
     
     // draw current knob values
     for (int i = 0; i < 4; i++)
@@ -631,9 +662,9 @@ void UpdateOled()
         // bug: val oscillates between 0 and the actual value???
         // currently this seems to only get called when it is incorrectly reading 0 ... ?
         // if (val > 0.01f){
-            char printme[50];
-            snprintf(printme, sizeof(printme), "val: %d", static_cast<int>(val * 200));
-            DisplayMessage(printme);
+            // char printme[50];
+            // snprintf(printme, sizeof(printme), "val: %d", static_cast<int>(val * 200));
+            // DisplayMessage(printme);
             // int rectHeight = static_cast<int>(val * 20);
             // hw.display.DrawRect(i * 20, 40, i * 20 + 10, 40 - rectHeight, true, true);
         // }
@@ -703,29 +734,38 @@ void ProcessKnobs()
     if (currentPanel.name == "ADSR")
     {
         for (int i = 0; i < 4; i++)
+        {
+            switch(inputIndex)
             {
-                switch(inputIndex)
-                {
-                    case 0:
-                        envelopes[i].env.SetTime(ADSR_SEG_ATTACK, inputs[0]);
-                        break;
-                    case 1:
-                        // envelopes[i].env.SetTime(ADSR_SEG_DECAY,
-                        //             envelopes[i].decayParam.Process());
-                        // envelopes[i].env.SetTime(ADSR_SEG_RELEASE,
-                        //             envelopes[i].decayParam.Process());
-                        // DisplayMessage(std::to_string(inputIndex).c_str());
-                        envelopes[i].env.SetTime(ADSR_SEG_DECAY, inputs[1]);
-                        envelopes[i].env.SetTime(ADSR_SEG_RELEASE, inputs[1]);
-                        break;
-                    case 2:
-                        envelopes[i].env.SetSustainLevel(inputs[2]);
-                        break;
-                    case 3:
-                        break;
-                    default:
-                        break;
-                }
+                case 0:
+                    // Attack: logarithmic scaling 0.001s to 1.0s
+                    {
+                        float attackTime = 0.001f * powf(1000.0f, inputs[0]);
+                        envelopes[i].env.SetTime(ADSR_SEG_ATTACK, attackTime);
+                    }
+                    break;
+                case 1:
+                    // Decay/Release: logarithmic scaling 0.001s to 5.0s
+                    {
+                        float decayTime = 0.001f * powf(5000.0f, inputs[1]);
+                        envelopes[i].env.SetTime(ADSR_SEG_DECAY, decayTime);
+                        envelopes[i].env.SetTime(ADSR_SEG_RELEASE, decayTime);
+                    }
+                    break;
+                case 2:
+                    // Sustain: logarithmic scaling 0.01 to 1.0
+                    {
+                        float sustainLevel = 0.01f * powf(100.0f, inputs[2]);
+                        envelopes[i].env.SetSustainLevel(sustainLevel);
+                    }
+                    break;
+                case 3:
+                    // Minimum level (used in envelope processing)
+                    break;
+                default:
+                    break;
+            }
+        }
                 // envelopes[i].env.SetTime(ADSR_SEG_ATTACK,
                 //                         hw.GetKnobValue(DaisyPatch::CTRL_1));
                 // envelopes[i].env.SetTime(ADSR_SEG_DECAY,
@@ -739,7 +779,7 @@ void ProcessKnobs()
                 //                         envelopes[i].decayParam.Process());
                 // envelopes[i].env.SetTime(ADSR_SEG_RELEASE,
                 //                         envelopes[i].decayParam.Process());
-            }
+            // }
     }
     else if (currentPanel.name == "Panning")
     {
@@ -771,7 +811,6 @@ void ProcessKnobs()
     }
     else if (currentPanel.name == "Pluck")
     {
-        // DisplayMessage("inside");
         for (size_t j = 0; j < 4; j++)
         {
             plucks[j].wetDry = inputs[0];
@@ -784,7 +823,6 @@ void ProcessKnobs()
 
     for (int i = 0; i < 4; i++)
     {
-        envelopes[i].envSig = std::max(envelopes[i].env.Process(envelopes[i].gate), inputs[3]);
         previousKnobState[i] = inputs[i];
     }
 }
