@@ -1,7 +1,9 @@
 #include "daisy_patch.h"
 #include "daisysp.h"
+#include <algorithm>
 #include <string>
 #include <cmath>
+#include "midi/ShiftRegisterMidi.h"
 
 using namespace daisy;
 using namespace daisysp;
@@ -24,13 +26,28 @@ int8_t lastLowestNote = 0;
 
 // Shift Register Mode
 bool shiftRegisterMode = true;
-struct noteQueueStruct {
-    int8_t note;
-    int8_t velocity;
-    bool active;
+
+namespace envelope_midi = envelope::midi;
+
+struct DaisyMidiOutput : public envelope_midi::MidiOutput
+{
+    void Send(const envelope_midi::MidiMessage& message) override
+    {
+        uint8_t status_base =
+            (message.type == envelope_midi::MidiMessage::Type::kNoteOn) ? 0x90 : 0x80;
+        uint8_t bytes[3] = {
+            static_cast<uint8_t>(status_base + message.channel),
+            message.note,
+            message.velocity,
+        };
+        hw.midi.SendMessage(bytes, 3);
+    }
 };
-noteQueueStruct noteQueue[4]; // Queue of active notes for shift register mode
-int8_t queueSize = 0;
+
+static DaisyMidiOutput               daisy_midi_output;
+static envelope_midi::ShiftRegisterMidi shift_register(&daisy_midi_output);
+
+static void ApplyShiftRegisterState();
 
 // Display update timing
 uint32_t lastDisplayUpdate = 0;
@@ -130,7 +147,6 @@ void      InitPan(float samplerate);
 // Shift Register Mode functions
 void      AddNoteToQueue(int8_t note, int8_t velocity);
 void      RemoveNoteFromQueue(int8_t note);
-void      UpdateVoiceCascade();
 void      ClearAllVoices();
 
 void      initOscillators(float samplerate);
@@ -476,8 +492,8 @@ void HandleMidiMessage(MidiEvent m)
         {
             NoteOnEvent p = m.AsNoteOn();
             
-            if (shiftRegisterMode) {
-                // Add note to queue and update cascade
+            if (shiftRegisterMode)
+            {
                 AddNoteToQueue(p.note, p.velocity);
             } else {
                 // Original behavior
@@ -532,8 +548,8 @@ void HandleMidiMessage(MidiEvent m)
         {
             NoteOffEvent p = m.AsNoteOff();
             
-            if (shiftRegisterMode) {
-                // Remove note from queue and update cascade
+            if (shiftRegisterMode)
+            {
                 RemoveNoteFromQueue(p.note);
             } else {
                 // Original behavior
@@ -1044,90 +1060,59 @@ void plucksApply(float* data) {
 }
 
 // Shift Register Mode Implementation
-void AddNoteToQueue(int8_t note, int8_t velocity) {
-    // Shift existing notes down and add new note at the end
-    // This creates a sliding window effect for the canon
-    
-    // Shift all notes down by one position
-    for (int i = 0; i < 3; i++) {
-        noteQueue[i] = noteQueue[i + 1];
-    }
-    
-    // Add new note at the end (most recent position)
-    noteQueue[3].note = note;
-    noteQueue[3].velocity = velocity;
-    noteQueue[3].active = true;
-    
-    UpdateVoiceCascade();
-}
-
-void RemoveNoteFromQueue(int8_t note) {
-    // Find and remove the note from queue
-    for (int i = 0; i < 4; i++) {
-        if (noteQueue[i].active && noteQueue[i].note == note) {
-            noteQueue[i].active = false;
-            queueSize--;
-            
-            // Shift remaining notes down to fill gap
-            for (int j = i; j < 3; j++) {
-                if (noteQueue[j + 1].active) {
-                    noteQueue[j] = noteQueue[j + 1];
-                    noteQueue[j + 1].active = false;
-                } else {
-                    break;
-                }
+static void ApplyShiftRegisterState()
+{
+    const auto& voice_states = shift_register.GetVoices();
+    for(size_t i = 0; i < voice_states.size(); ++i)
+    {
+        const auto& state = voice_states[i];
+        if(state.active)
+        {
+            if(state.needs_retrigger)
+            {
+                envelopes[i].env.Retrigger(true);
             }
-            break;
+            envelopes[i].gate     = true;
+            voices[i].note         = static_cast<int8_t>(state.note);
+            voices[i].velocity     = static_cast<int8_t>(state.velocity);
+        }
+        else
+        {
+            envelopes[i].gate = false;
+            voices[i].note    = 0;
+            voices[i].velocity = 0;
         }
     }
-    UpdateVoiceCascade();
+
+    shift_register.ClearRetriggerFlags();
 }
 
-void UpdateVoiceCascade() {
-    // CORRECT CANON EFFECT: Each voice plays one note with proper delay
-    // noteQueue[0] = oldest note, noteQueue[3] = newest note
-    // Voice 0: plays newest note (noteQueue[3])
-    // Voice 1: plays 1-step delay (noteQueue[2])
-    // Voice 2: plays 2-step delay (noteQueue[1])
-    // Voice 3: plays 3-step delay (noteQueue[0])
-    
-    // Send note-offs for voices that will be reassigned
-    for (int i = 0; i < 4; i++) {
-        if (voices[i].note > 0) {
-            SendMidiMesssage(voices[i].note, i, "NOTE_OFF");
-        }
+void AddNoteToQueue(int8_t note, int8_t velocity)
+{
+    if(note < 0)
+    {
+        return;
     }
-    
-    // Clear all voices
-    for (int i = 0; i < 4; i++) {
-        voices[i].note = 0;
-        voices[i].velocity = 0;
-        envelopes[i].gate = false;
-    }
-    
-    // Assign notes to voices based on canon delay
-    for (int voiceIndex = 0; voiceIndex < 4; voiceIndex++) {
-        int noteIndex = 3 - voiceIndex; // Reverse mapping: voice 0 gets note 3, voice 1 gets note 2, etc.
-        
-        if (noteQueue[noteIndex].active) {
-            voices[voiceIndex].note = noteQueue[noteIndex].note;
-            voices[voiceIndex].velocity = noteQueue[noteIndex].velocity;
-            envelopes[voiceIndex].gate = true;
-            envelopes[voiceIndex].env.Retrigger(true);
-            
-            // Send MIDI note-on for this voice
-            SendMidiMesssage(noteQueue[noteIndex].note, voiceIndex, "NOTE_ON");
-        }
-    }
+
+    const uint8_t midi_note     = static_cast<uint8_t>(note);
+    const uint8_t midi_velocity = static_cast<uint8_t>(std::max<int>(0, velocity));
+    shift_register.HandleNoteOn(midi_note, midi_velocity);
+    ApplyShiftRegisterState();
 }
 
-void ClearAllVoices() {
-    for (int i = 0; i < 4; i++) {
-        if (voices[i].note > 0) {
-            SendMidiMesssage(voices[i].note, i, "NOTE_OFF");
-        }
-        voices[i].note = 0;
-        voices[i].velocity = 0;
-        envelopes[i].gate = false;
+void RemoveNoteFromQueue(int8_t note)
+{
+    if(note < 0)
+    {
+        return;
     }
+
+    shift_register.HandleNoteOff(static_cast<uint8_t>(note));
+    ApplyShiftRegisterState();
+}
+
+void ClearAllVoices()
+{
+    shift_register.Reset();
+    ApplyShiftRegisterState();
 }

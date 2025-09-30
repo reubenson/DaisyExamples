@@ -4,7 +4,7 @@ TARGET = _Envelope
 USE_DAISYSP_LGPL = 1
 
 # Sources
-CPP_SOURCES = _Envelope.cpp
+CPP_SOURCES = _Envelope.cpp midi/ShiftRegisterMidi.cpp
 
 # Library Locations
 LIBDAISY_DIR = ../../libDaisy
