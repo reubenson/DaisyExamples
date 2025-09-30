@@ -24,6 +24,7 @@ target_compile_options(shift_register PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(shift_register_tests
     ShiftRegisterMidiTest.cpp
+    SequentialNotesTest.cpp
 )
 target_link_libraries(shift_register_tests
     PRIVATE

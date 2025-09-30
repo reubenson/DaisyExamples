@@ -40,57 +40,79 @@ void ShiftRegisterMidi::HandleNoteOn(uint8_t note, uint8_t velocity)
         queue_[i] = queue_[i + 1];
     }
 
-    queue_[queue_.size() - 1] = QueueEntry{note, velocity, true};
+    QueueEntry new_entry;
+    new_entry.note     = note;
+    new_entry.velocity = velocity;
+    new_entry.active   = true;
+    new_entry.held     = true; // Mark as currently held
+    
+    queue_[queue_.size() - 1] = new_entry;
+
+    // Re-trigger ALL active notes in the cascade
+    for(auto& entry : queue_)
+    {
+        if(entry.active)
+        {
+            entry.held = true;
+        }
+    }
 
     UpdateAssignments();
 }
 
 void ShiftRegisterMidi::HandleNoteOff(uint8_t note)
 {
-    bool removed = false;
-    for(size_t i = 0; i < queue_.size(); ++i)
+    // Hierarchical gate control:
+    // - If the newest HELD note is released → release ALL gates
+    // - If an older note is released → release only that specific note's gate
+    
+    // Find the newest matching note (search backwards)
+    int newest_match_index = -1;
+    for(int i = static_cast<int>(queue_.size()) - 1; i >= 0; --i)
     {
-        if(!removed && queue_[i].active && queue_[i].note == note)
+        if(queue_[i].active && queue_[i].note == note && queue_[i].held)
         {
-            removed = true;
-        }
-
-        if(removed && i + 1 < queue_.size())
-        {
-            queue_[i] = queue_[i + 1];
+            newest_match_index = i;
+            break;
         }
     }
-
-    if(removed)
+    
+    if(newest_match_index == -1)
     {
-        queue_[queue_.size() - 1] = QueueEntry{};
-        // Compact queue so remaining notes occupy the most recent slots
-        size_t active_count = 0;
-        for(const auto& entry : queue_)
+        return; // Note not found or already released
+    }
+    
+    // Find the newest HELD note in the entire queue (not just matching notes)
+    int newest_held_index = -1;
+    for(int i = static_cast<int>(queue_.size()) - 1; i >= 0; --i)
+    {
+        if(queue_[i].active && queue_[i].held)
+        {
+            newest_held_index = i;
+            break;
+        }
+    }
+    
+    // Check if the note being released is the newest HELD note
+    bool is_newest_held = (newest_match_index == newest_held_index);
+    
+    if(is_newest_held)
+    {
+        // Release ALL gates when the newest held note is released
+        for(auto& entry : queue_)
         {
             if(entry.active)
             {
-                ++active_count;
+                entry.held = false;
             }
         }
-
-        std::array<QueueEntry, kMaxVoices> compacted{};
-        if(active_count > 0)
-        {
-            size_t start_index = kMaxVoices - active_count;
-            size_t current     = start_index;
-            for(const auto& entry : queue_)
-            {
-                if(entry.active)
-                {
-                    compacted[current++] = entry;
-                }
-            }
-        }
-
-        queue_ = compacted;
     }
-
+    else
+    {
+        // Release only this specific note's gate
+        queue_[newest_match_index].held = false;
+    }
+    
     UpdateAssignments();
 }
 
@@ -127,10 +149,11 @@ void ShiftRegisterMidi::UpdateAssignments()
             continue;
         }
 
-        voices_[voice_index].active         = true;
-        voices_[voice_index].note           = entry.note;
-        voices_[voice_index].velocity       = entry.velocity;
-        voices_[voice_index].needs_retrigger = true;
+        voices_[voice_index].active          = true;
+        voices_[voice_index].note            = entry.note;
+        voices_[voice_index].velocity        = entry.velocity;
+        voices_[voice_index].needs_retrigger = entry.held; // Only retrigger if gate is on
+        voices_[voice_index].gate_on         = entry.held; // Copy gate state
 
         SendNoteOn(voice_index, entry.note, entry.velocity);
     }

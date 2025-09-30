@@ -1072,14 +1072,15 @@ static void ApplyShiftRegisterState()
             {
                 envelopes[i].env.Retrigger(true);
             }
-            envelopes[i].gate     = true;
-            voices[i].note         = static_cast<int8_t>(state.note);
-            voices[i].velocity     = static_cast<int8_t>(state.velocity);
+            // Use gate_on state from the library (tracks note-on/off)
+            envelopes[i].gate  = state.gate_on;
+            voices[i].note     = static_cast<int8_t>(state.note);
+            voices[i].velocity = static_cast<int8_t>(state.velocity);
         }
         else
         {
-            envelopes[i].gate = false;
-            voices[i].note    = 0;
+            envelopes[i].gate  = false;
+            voices[i].note     = 0;
             voices[i].velocity = 0;
         }
     }

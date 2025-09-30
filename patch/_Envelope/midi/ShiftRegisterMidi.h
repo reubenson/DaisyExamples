@@ -31,10 +31,11 @@ class MidiOutput
 
 struct VoiceState
 {
-    bool    active         = false;
-    uint8_t note           = 0;
-    uint8_t velocity       = 0;
+    bool    active          = false;
+    uint8_t note            = 0;
+    uint8_t velocity        = 0;
     bool    needs_retrigger = false;
+    bool    gate_on         = false; // Is the note currently held (for envelope gate)?
 };
 
 class ShiftRegisterMidi
@@ -59,6 +60,7 @@ class ShiftRegisterMidi
         uint8_t note     = 0;
         uint8_t velocity = 0;
         bool    active   = false;
+        bool    held     = false; // Is the note currently held (gate on)?
     };
 
     void UpdateAssignments();
