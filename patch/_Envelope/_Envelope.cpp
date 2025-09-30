@@ -25,7 +25,7 @@ int8_t currentLowestNote = 0;
 int8_t lastLowestNote = 0;
 
 // Shift Register Mode
-bool shiftRegisterMode = true;
+bool shiftRegisterMode = false;
 
 namespace envelope_midi = envelope::midi;
 
@@ -58,6 +58,11 @@ int8_t currentNote = 0;
 uint32_t triggerOffTime = 0;
 const uint32_t TRIGGER_OFF_DELAY_MS = 50; // 10ms delay for trigger off
 bool triggerOffPending = false;
+
+// Encoder long press timing
+const float ENCODER_LONG_PRESS_MS = 1500.0f;
+bool encoderWasPressed = false;
+bool longPressHandled = false;
 
 struct panelStruct
 {
@@ -702,6 +707,10 @@ void UpdateOled()
     if (shiftRegisterMode) {
         hw.display.SetCursor(0, 35);
         hw.display.WriteString("SHIFT", Font_6x8, true);
+    } else {
+        // erase shift text
+        hw.display.SetCursor(0, 35);
+        hw.display.WriteString("     ", Font_6x8, true);
     }
     
     // draw current knob values
@@ -735,15 +744,48 @@ void UpdateOled()
 
 void ProcessEncoder()
 {
-    int edge = hw.encoder.RisingEdge();
-    panelMode += edge;
-    panelMode = panelMode % panelModesCount;
-    currentPanel = displayPanels[panelMode];
-
-    if(edge != 0)
+    bool encoderPressed = hw.encoder.Pressed();
+    float timeHeld = hw.encoder.TimeHeldMs();
+    
+    // Detect long press: trigger when held >= 3 seconds
+    if(encoderPressed && timeHeld >= ENCODER_LONG_PRESS_MS && !longPressHandled)
     {
+        // Long press detected - toggle shift register mode
+        shiftRegisterMode = !shiftRegisterMode;
+        longPressHandled = true;
+        
+        // Clear all state when switching modes to prevent MIDI artifacts
+        // Reset shift register (this sends note-offs for active voices)
+        shift_register.Reset();
+        ApplyShiftRegisterState();
+        
+        // Clear all voice and envelope states
+        for(size_t i = 0; i < 4; ++i)
+        {
+            voices[i].note = 0;
+            voices[i].velocity = 0;
+            envelopes[i].gate = false;
+        }
+        
+        // Update display to show mode change
         UpdateOled();
     }
+    else if(!encoderPressed && encoderWasPressed)
+    {
+        // Button was released
+        if(!longPressHandled)
+        {
+            // Short press - cycle through panel modes
+            panelMode = (panelMode + 1) % panelModesCount;
+            currentPanel = displayPanels[panelMode];
+            UpdateOled();
+        }
+        
+        // Reset long press flag for next press
+        longPressHandled = false;
+    }
+    
+    encoderWasPressed = encoderPressed;
 }
 
 void ProcessKnobs()
