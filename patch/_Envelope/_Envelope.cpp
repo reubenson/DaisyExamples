@@ -22,6 +22,16 @@ int8_t lastHighestNote = 0;
 int8_t currentLowestNote = 0;
 int8_t lastLowestNote = 0;
 
+// Shift Register Mode
+bool shiftRegisterMode = true;
+struct noteQueueStruct {
+    int8_t note;
+    int8_t velocity;
+    bool active;
+};
+noteQueueStruct noteQueue[4]; // Queue of active notes for shift register mode
+int8_t queueSize = 0;
+
 // Display update timing
 uint32_t lastDisplayUpdate = 0;
 const uint32_t DISPLAY_UPDATE_INTERVAL_MS = 100; // Update display every 100ms
@@ -43,7 +53,7 @@ struct panelStruct
 };
 panelStruct displayPanels[2] = {
     { 
-        name: "ADSR   ", 
+        name: "ADSR", 
         input1Name: "A", 
         input2Name: "D/R", 
         input3Name: "S",
@@ -116,6 +126,12 @@ void      ApplyPanning(float* data);
 void      UpdateOled();
 void      plucksApply();
 void      InitPan(float samplerate);
+
+// Shift Register Mode functions
+void      AddNoteToQueue(int8_t note, int8_t velocity);
+void      RemoveNoteFromQueue(int8_t note);
+void      UpdateVoiceCascade();
+void      ClearAllVoices();
 
 void      initOscillators(float samplerate);
 void      InitSampler();
@@ -441,8 +457,10 @@ int8_t getCurrentLowestNote() {
 
 void HandleMidiMessage(MidiEvent m)
 {   
-    // no longer need passthrough after MIDI 1U firmware update
-    PassthroughMidiMessage(m);
+    // Only passthrough MIDI when not in shift register mode
+    if (!shiftRegisterMode) {
+        PassthroughMidiMessage(m);
+    }
 
     // to handle round robin properly, may need to handle it here in Daisy, instead of using the setting
     // on MIDI 1U
@@ -457,13 +475,17 @@ void HandleMidiMessage(MidiEvent m)
         case NoteOn:
         {
             NoteOnEvent p = m.AsNoteOn();
-            envelopes[p.channel - channelOffset].gate = true;
-            // // need to turn off trig on the next tick, or a few ticks?
-            // envelopes[p.channel].trig = true;
-            voices[p.channel - channelOffset].note = p.note;
-            voices[p.channel - channelOffset].velocity = p.velocity;
-
-            envelopes[p.channel - channelOffset].env.Retrigger(true);
+            
+            if (shiftRegisterMode) {
+                // Add note to queue and update cascade
+                AddNoteToQueue(p.note, p.velocity);
+            } else {
+                // Original behavior
+                envelopes[p.channel - channelOffset].gate = true;
+                voices[p.channel - channelOffset].note = p.note;
+                voices[p.channel - channelOffset].velocity = p.velocity;
+                envelopes[p.channel - channelOffset].env.Retrigger(true);
+            }
 
             // pass highest currently held note to Intellijel via channel 16 and CC
             // 8 on the Intellijel Xpander
@@ -509,11 +531,18 @@ void HandleMidiMessage(MidiEvent m)
         case NoteOff:
         {
             NoteOffEvent p = m.AsNoteOff();
-            envelopes[p.channel - channelOffset].gate = false;
             
-            // Clear voice data when note is released
-            voices[p.channel - channelOffset].note = 0;
-            voices[p.channel - channelOffset].velocity = 0;
+            if (shiftRegisterMode) {
+                // Remove note from queue and update cascade
+                RemoveNoteFromQueue(p.note);
+            } else {
+                // Original behavior
+                envelopes[p.channel - channelOffset].gate = false;
+                
+                // Clear voice data when note is released
+                voices[p.channel - channelOffset].note = 0;
+                voices[p.channel - channelOffset].velocity = 0;
+            }
             
             // update highest and lowest notes when a note is released
             currentHighestNote = getCurrentHighestNote();
@@ -652,6 +681,12 @@ void UpdateOled()
 
     str = currentPanel.name;
     hw.display.WriteString(cstr, Font_7x10, true);
+    
+    // Show shift register mode indicator
+    if (shiftRegisterMode) {
+        hw.display.SetCursor(0, 35);
+        hw.display.WriteString("SHIFT", Font_6x8, true);
+    }
     
     // draw current knob values
     for (int i = 0; i < 4; i++)
@@ -1005,5 +1040,94 @@ void plucksApply(float* data) {
         dry = 1.0f - wet;
         data[i] = dry * data[i] + wet * sig;
         // data[i] = data[i];
+    }
+}
+
+// Shift Register Mode Implementation
+void AddNoteToQueue(int8_t note, int8_t velocity) {
+    // Shift existing notes down and add new note at the end
+    // This creates a sliding window effect for the canon
+    
+    // Shift all notes down by one position
+    for (int i = 0; i < 3; i++) {
+        noteQueue[i] = noteQueue[i + 1];
+    }
+    
+    // Add new note at the end (most recent position)
+    noteQueue[3].note = note;
+    noteQueue[3].velocity = velocity;
+    noteQueue[3].active = true;
+    
+    UpdateVoiceCascade();
+}
+
+void RemoveNoteFromQueue(int8_t note) {
+    // Find and remove the note from queue
+    for (int i = 0; i < 4; i++) {
+        if (noteQueue[i].active && noteQueue[i].note == note) {
+            noteQueue[i].active = false;
+            queueSize--;
+            
+            // Shift remaining notes down to fill gap
+            for (int j = i; j < 3; j++) {
+                if (noteQueue[j + 1].active) {
+                    noteQueue[j] = noteQueue[j + 1];
+                    noteQueue[j + 1].active = false;
+                } else {
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    UpdateVoiceCascade();
+}
+
+void UpdateVoiceCascade() {
+    // CORRECT CANON EFFECT: Each voice plays one note with proper delay
+    // noteQueue[0] = oldest note, noteQueue[3] = newest note
+    // Voice 0: plays newest note (noteQueue[3])
+    // Voice 1: plays 1-step delay (noteQueue[2])
+    // Voice 2: plays 2-step delay (noteQueue[1])
+    // Voice 3: plays 3-step delay (noteQueue[0])
+    
+    // Send note-offs for voices that will be reassigned
+    for (int i = 0; i < 4; i++) {
+        if (voices[i].note > 0) {
+            SendMidiMesssage(voices[i].note, i, "NOTE_OFF");
+        }
+    }
+    
+    // Clear all voices
+    for (int i = 0; i < 4; i++) {
+        voices[i].note = 0;
+        voices[i].velocity = 0;
+        envelopes[i].gate = false;
+    }
+    
+    // Assign notes to voices based on canon delay
+    for (int voiceIndex = 0; voiceIndex < 4; voiceIndex++) {
+        int noteIndex = 3 - voiceIndex; // Reverse mapping: voice 0 gets note 3, voice 1 gets note 2, etc.
+        
+        if (noteQueue[noteIndex].active) {
+            voices[voiceIndex].note = noteQueue[noteIndex].note;
+            voices[voiceIndex].velocity = noteQueue[noteIndex].velocity;
+            envelopes[voiceIndex].gate = true;
+            envelopes[voiceIndex].env.Retrigger(true);
+            
+            // Send MIDI note-on for this voice
+            SendMidiMesssage(noteQueue[noteIndex].note, voiceIndex, "NOTE_ON");
+        }
+    }
+}
+
+void ClearAllVoices() {
+    for (int i = 0; i < 4; i++) {
+        if (voices[i].note > 0) {
+            SendMidiMesssage(voices[i].note, i, "NOTE_OFF");
+        }
+        voices[i].note = 0;
+        voices[i].velocity = 0;
+        envelopes[i].gate = false;
     }
 }
