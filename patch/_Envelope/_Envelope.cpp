@@ -11,6 +11,7 @@ using namespace daisysp;
 DaisyPatch      hw;
 Fm2             osc1, osc2;
 Oscillator      pan, lfo1, lfo2, lfo3;
+Oscillator      voice1Osc, voice3Osc;  // Internal oscillators for voices 1 and 3
 SdmmcHandler    sdcard;
 FatFSInterface  fsi;
 WavPlayer       sampler;
@@ -26,6 +27,9 @@ int8_t lastLowestNote = 0;
 
 // Shift Register Mode
 bool shiftRegisterMode = false;
+
+// option to use internal oscillators for voices 1 and 3
+bool useInternalOscillators = true;
 
 namespace envelope_midi = envelope::midi;
 
@@ -239,6 +243,13 @@ float IncrementTowards(float value, float target)
     return value;
 }
 
+// Convert MIDI note number to frequency in Hz
+float MidiNoteToFrequency(int8_t note)
+{
+    if (note <= 0) return 0.0f;
+    return 440.0f * powf(2.0f, (note - 69) / 12.0f);
+}
+
 // Apply VCA to inputs based on envelope values
 void ApplyVCAs(float* data) {
     float envMax = 0.0f;
@@ -313,6 +324,23 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         {
             // results[j] = const_cast<float*>(&in[j][i]);
             results[j] = in[j][i];
+        }
+
+        // Use internal oscillators for voices 1 and 3 if enabled
+        if (useInternalOscillators) {
+            // Voice 1 (index 1) - use internal oscillator
+            if (envelopes[1].gate) {
+                results[1] = voice1Osc.Process();
+            } else {
+                results[1] = 0.0f;
+            }
+            
+            // Voice 3 (index 2) - use internal oscillator
+            if (envelopes[3].gate) {
+                results[3] = voice3Osc.Process();
+            } else {
+                results[3] = 0.0f;
+            }
         }
 
         // Panel 1
@@ -507,6 +535,16 @@ void HandleMidiMessage(MidiEvent m)
                 voices[p.channel - channelOffset].note = p.note;
                 voices[p.channel - channelOffset].velocity = p.velocity;
                 envelopes[p.channel - channelOffset].env.Retrigger(true);
+                
+                // Update internal oscillator frequencies for voices 1 and 3
+                if (useInternalOscillators) {
+                    float freq = MidiNoteToFrequency(p.note);
+                    if (p.channel - channelOffset == 1) {  // Voice 1
+                        voice1Osc.SetFreq(freq);
+                    } else if (p.channel - channelOffset == 3) {  // Voice 3
+                        voice3Osc.SetFreq(freq);
+                    }
+                }
             }
 
             // pass highest currently held note to Intellijel via channel 16 and CC
@@ -639,6 +677,18 @@ int main(void)
 
     // 
     InitPan(samplerate);
+    
+    // Initialize internal oscillators for voices 1 and 3
+    voice1Osc.Init(samplerate);
+    voice1Osc.SetFreq(440.0f);  // Default frequency
+    voice1Osc.SetAmp(1.0f);
+    voice1Osc.SetWaveform(Oscillator::WAVE_SIN);
+    
+    voice3Osc.Init(samplerate);
+    voice3Osc.SetFreq(440.0f);  // Default frequency
+    voice3Osc.SetAmp(1.0f);
+    voice3Osc.SetWaveform(Oscillator::WAVE_SIN);
+    
     // initOscillators(samplerate);
     // InitSampler();
 
@@ -1123,6 +1173,16 @@ static void ApplyShiftRegisterState()
             envelopes[i].gate  = state.gate_on;
             voices[i].note     = static_cast<int8_t>(state.note);
             voices[i].velocity = static_cast<int8_t>(state.velocity);
+            
+            // Update internal oscillator frequencies for voices 1 and 3
+            if (useInternalOscillators && state.gate_on) {
+                float freq = MidiNoteToFrequency(static_cast<int8_t>(state.note));
+                if (i == 1) {  // Voice 1
+                    voice1Osc.SetFreq(freq);
+                } else if (i == 3) {  // Voice 3
+                    voice3Osc.SetFreq(freq);
+                }
+            }
         }
         else
         {
