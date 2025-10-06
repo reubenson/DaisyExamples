@@ -431,31 +431,32 @@ void PassthroughMidiMessage(MidiEvent m)
 
 void SendMidiMesssage(uint8_t value, uint8_t channel, char* type)
 {
-    if (type == "NOTE_ON")
+    if (strcmp(type, "NOTE_ON") == 0)
     {
         uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + channel), value, 127};
         hw.midi.SendMessage(bytes, 3);
     }
-    else if (type == "NOTE_OFF")
+    else if (strcmp(type, "NOTE_OFF") == 0)
     {
         uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + channel), value, 0};
         hw.midi.SendMessage(bytes, 3);
     }
-    else if (type == "TRIGGER_ON")
+    else if (strcmp(type, "TRIGGER_ON") == 0)
     {
         uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + channel), value, 127};
         hw.midi.SendMessage(bytes, 3);
     }
-    else if (type == "TRIGGER_OFF")
+    else if (strcmp(type, "TRIGGER_OFF") == 0)
     {
         uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + channel), value, 0};
         hw.midi.SendMessage(bytes, 3);
     }
-    // else if (type == 'CC')
-    // {
-    //     uint8_t bytes[3] = {0xB0, , note};
-    //     hw.midi.SendMessage(bytes, 3);
-    // }
+    else if (strcmp(type, "CC") == 0)
+    {
+        uint8_t controller = 3; // this is configured in Intellijel 1U
+        uint8_t bytes[3] = {static_cast<uint8_t>(0xB0 + channel), controller, value};
+        hw.midi.SendMessage(bytes, 3);
+    }
 }
 
 int8_t getCurrentHighestNote() {
@@ -532,9 +533,13 @@ void HandleMidiMessage(MidiEvent m)
             }
             lastLowestNote = currentLowestNote;
 
+            // this voice is meant to be sent to Multigrain
             // pass current note and trigger to Intellijel via channel 13
             currentNote = p.note;
-            SendMidiMesssage(p.note, 13, "NOTE_ON");
+            SendMidiMesssage(p.note, 15, "NOTE_ON");
+            // note selection is handled by sending CC signal, scaled to 0-63
+            SendMidiMesssage(p.channel * 16 + 2, 15, "CC");
+            // also send 
             // SendMidiMesssage(1, 13, "TRIGGER_ON");
             
             // Set timer for trigger off after 10ms delay
