@@ -16,6 +16,71 @@ SdmmcHandler    sdcard;
 FatFSInterface  fsi;
 WavPlayer       sampler;
 
+// Custom oscillator class for waveform interpolation
+class InterpolatedOscillator {
+private:
+    float phase_;
+    float freq_;
+    float amp_;
+    float waveform_param_; // 0.0 = sine, 0.33 = triangle, 0.66 = square, 1.0 = saw
+    float sample_rate_;
+    
+public:
+    InterpolatedOscillator() : phase_(0.0f), freq_(440.0f), amp_(1.0f), waveform_param_(0.0f), sample_rate_(48000.0f) {}
+    
+    void Init(float sample_rate) {
+        sample_rate_ = sample_rate;
+        phase_ = 0.0f;
+    }
+    
+    void SetFreq(float freq) {
+        freq_ = freq;
+    }
+    
+    void SetAmp(float amp) {
+        amp_ = amp;
+    }
+    
+    void SetWaveformParam(float param) {
+        waveform_param_ = param;
+    }
+    
+    float Process() {
+        float output = 0.0f;
+        
+        // Generate base waveforms
+        float sine = sinf(phase_ * 2.0f * M_PI);
+        float triangle = 2.0f * (phase_ < 0.5f ? 2.0f * phase_ : 2.0f * (1.0f - phase_)) - 1.0f;
+        float square = phase_ < 0.5f ? 1.0f : -1.0f;
+        float saw = 2.0f * phase_ - 1.0f;
+        
+        // Interpolate between waveforms
+        if (waveform_param_ <= 0.33f) {
+            // Interpolate between sine and triangle
+            float t = waveform_param_ / 0.33f;
+            output = sine * (1.0f - t) + triangle * t;
+        } else if (waveform_param_ <= 0.66f) {
+            // Interpolate between triangle and square
+            float t = (waveform_param_ - 0.33f) / 0.33f;
+            output = triangle * (1.0f - t) + square * t;
+        } else {
+            // Interpolate between square and saw
+            float t = (waveform_param_ - 0.66f) / 0.34f;
+            output = square * (1.0f - t) + saw * t;
+        }
+        
+        // Update phase
+        phase_ += freq_ / sample_rate_;
+        if (phase_ >= 1.0f) {
+            phase_ -= 1.0f;
+        }
+        
+        return output * amp_;
+    }
+};
+
+InterpolatedOscillator voice1InterpOsc, voice3InterpOsc;
+
 int panelMode;
 float cvOut1;
 float cvOut2;
@@ -77,7 +142,7 @@ struct panelStruct
     std::string     input4Name;
     float           values[4];
 };
-panelStruct displayPanels[2] = {
+panelStruct displayPanels[3] = {
     { 
         name: "ADSR", 
         input1Name: "A", 
@@ -93,15 +158,15 @@ panelStruct displayPanels[2] = {
         input3Name: "",
         input4Name: "",
         values: {0.0f, 0.0f, 0.0f, 0.0f}
+    },
+    {
+        name: "Oscillators",
+        input1Name: "Waveform",
+        input2Name: "",
+        input3Name: "",
+        input4Name: "",
+        values: {0.0f, 0.0f, 0.0f, 0.0f}
     }
-    // ,
-    // { 
-    //     name: "Reverb", 
-    //     input1Name: "Wet/Dry",
-    //     input2Name: "Decay",
-    //     input3Name: "",
-    //     input4Name: ""
-    // }
 };
 int panelModesCount = sizeof(displayPanels) / sizeof(displayPanels[0]);
 panelStruct currentPanel;
@@ -328,16 +393,16 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
         // Use internal oscillators for voices 1 and 3 if enabled
         if (useInternalOscillators) {
-            // Voice 1 (index 1) - use internal oscillator
+            // Voice 1 (index 1) - use interpolated oscillator
             if (envelopes[1].gate) {
-                results[1] = voice1Osc.Process();
+                results[1] = voice1InterpOsc.Process();
             } else {
                 results[1] = 0.0f;
             }
             
-            // Voice 3 (index 2) - use internal oscillator
+            // Voice 3 (index 3) - use interpolated oscillator
             if (envelopes[3].gate) {
-                results[3] = voice3Osc.Process();
+                results[3] = voice3InterpOsc.Process();
             } else {
                 results[3] = 0.0f;
             }
@@ -540,9 +605,9 @@ void HandleMidiMessage(MidiEvent m)
                 if (useInternalOscillators) {
                     float freq = MidiNoteToFrequency(p.note);
                     if (p.channel - channelOffset == 1) {  // Voice 1
-                        voice1Osc.SetFreq(freq);
+                        voice1InterpOsc.SetFreq(freq);
                     } else if (p.channel - channelOffset == 3) {  // Voice 3
-                        voice3Osc.SetFreq(freq);
+                        voice3InterpOsc.SetFreq(freq);
                     }
                 }
             }
@@ -551,11 +616,11 @@ void HandleMidiMessage(MidiEvent m)
             // 8 on the Intellijel Xpander
             currentHighestNote = getCurrentHighestNote();
             if (currentHighestNote != lastHighestNote) {
-                SendMidiMesssage(currentHighestNote, 15, "NOTE_ON");
+                SendMidiMesssage(currentHighestNote, 14, "NOTE_ON");
             }
             // turn off previous note
             if (lastHighestNote != 0 && lastHighestNote != currentHighestNote) {
-                SendMidiMesssage(lastHighestNote, 15, "NOTE_OFF");
+                SendMidiMesssage(lastHighestNote, 14, "NOTE_OFF");
             }
             lastHighestNote = currentHighestNote;
 
@@ -563,11 +628,11 @@ void HandleMidiMessage(MidiEvent m)
             // 7 on the Intellijel Xpander
             currentLowestNote = getCurrentLowestNote();
             if (currentLowestNote != lastLowestNote) {
-                SendMidiMesssage(currentLowestNote, 14, "NOTE_ON");
+                SendMidiMesssage(currentLowestNote, 13, "NOTE_ON");
             }
             // turn off previous note
             if (lastLowestNote != 0 && lastLowestNote != currentLowestNote) {
-                SendMidiMesssage(lastLowestNote, 14, "NOTE_OFF");
+                SendMidiMesssage(lastLowestNote, 13, "NOTE_OFF");
             }
             lastLowestNote = currentLowestNote;
 
@@ -649,6 +714,8 @@ int main(void)
     for(int i = 0; i < 4; i++)
     {
         displayPanels[0].values[i] = hw.controls[i].Process();
+        displayPanels[1].values[i] = hw.controls[i].Process();
+        displayPanels[2].values[i] = hw.controls[i].Process();
     }
 
     panelMode = 0;
@@ -688,6 +755,17 @@ int main(void)
     voice3Osc.SetFreq(440.0f);  // Default frequency
     voice3Osc.SetAmp(1.0f);
     voice3Osc.SetWaveform(Oscillator::WAVE_SIN);
+    
+    // Initialize interpolated oscillators for voices 1 and 3
+    voice1InterpOsc.Init(samplerate);
+    voice1InterpOsc.SetFreq(440.0f);
+    voice1InterpOsc.SetAmp(1.0f);
+    voice1InterpOsc.SetWaveformParam(0.0f);  // Start with sine wave
+    
+    voice3InterpOsc.Init(samplerate);
+    voice3InterpOsc.SetFreq(440.0f);
+    voice3InterpOsc.SetAmp(1.0f);
+    voice3InterpOsc.SetWaveformParam(0.0f);  // Start with sine wave
     
     // initOscillators(samplerate);
     // InitSampler();
@@ -968,6 +1046,19 @@ void ProcessKnobs()
         // hw.controls[0].Process();
         // ProcessPluck();
     }
+    else if (currentPanel.name == "Oscillators")
+    {
+        switch(inputIndex)
+        {
+            case 0:
+                // Waveform control: 0.0 = sine, 0.33 = triangle, 0.66 = square, 1.0 = saw
+                voice1InterpOsc.SetWaveformParam(inputs[0]);
+                voice3InterpOsc.SetWaveformParam(inputs[0]);
+                break;
+            default:
+                break;
+        }
+    }
 
     for (int i = 0; i < 4; i++)
     {
@@ -1178,9 +1269,9 @@ static void ApplyShiftRegisterState()
             if (useInternalOscillators && state.gate_on) {
                 float freq = MidiNoteToFrequency(static_cast<int8_t>(state.note));
                 if (i == 1) {  // Voice 1
-                    voice1Osc.SetFreq(freq);
+                    voice1InterpOsc.SetFreq(freq);
                 } else if (i == 3) {  // Voice 3
-                    voice3Osc.SetFreq(freq);
+                    voice3InterpOsc.SetFreq(freq);
                 }
             }
         }
