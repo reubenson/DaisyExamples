@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <string>
 #include <cmath>
+#include <vector>
 #include "midi/ShiftRegisterMidi.h"
+#include "hid/parameter.h"
 
 using namespace daisy;
 using namespace daisysp;
@@ -148,6 +150,22 @@ uint32_t clockInterval = 0;  // Calculated interval between clock messages
 bool clockEnabled = true;
 int8_t encoderIncrement = 0;  // Track encoder rotation
 
+// Trigger Sequence Generator variables
+const uint8_t TRIGGER_SEQUENCE_LENGTH = 16;  // 16-step sequence
+bool triggerSequence[TRIGGER_SEQUENCE_LENGTH] = {false};  // Sequence pattern
+uint8_t currentSequenceStep = 0;  // Current step in sequence
+uint32_t lastSequenceStepTime = 0;  // Last time sequence step advanced
+uint32_t sequenceStepInterval = 0;  // Interval between sequence steps
+bool sequenceEnabled = true;  // Enable/disable sequence
+uint8_t triggerNote = 36;  // MIDI note for triggers (C2)
+
+// Trigger off timing for sequence
+uint32_t sequenceTriggerOffTime = 0;
+bool sequenceTriggerOffPending = false;
+
+// Parameter objects for trigger sequence controls
+Parameter densityParam, noteParam, enableParam, resetParam;
+
 struct panelStruct
 {
     std::string     name;
@@ -157,7 +175,7 @@ struct panelStruct
     std::string     input4Name;
     float           values[4];
 };
-panelStruct displayPanels[3] = {
+panelStruct displayPanels[4] = {
     { 
         name: "ADSR", 
         input1Name: "A", 
@@ -180,6 +198,14 @@ panelStruct displayPanels[3] = {
         input2Name: "",
         input3Name: "",
         input4Name: "",
+        values: {0.0f, 0.0f, 0.0f, 0.0f}
+    },
+    {
+        name: "TrigSeq",
+        input1Name: "Density",
+        input2Name: "Note",
+        input3Name: "Enable",
+        input4Name: "Reset",
         values: {0.0f, 0.0f, 0.0f, 0.0f}
     }
 };
@@ -231,6 +257,13 @@ void      ApplyPanning(float* data);
 void      UpdateOled();
 void      plucksApply();
 void      InitPan(float samplerate);
+
+// Trigger Sequence Generator functions
+void      InitTriggerSequence();
+void      UpdateTriggerSequence();
+void      AdvanceSequenceStep();
+void      GenerateEuclideanRhythm(int numTriggers, int numSteps, bool* pattern);
+void      BuildPattern(int level, std::vector<bool>& result, const std::vector<int>& count, const std::vector<int>& remainder);
 
 // Shift Register Mode functions
 void      AddNoteToQueue(int8_t note, int8_t velocity);
@@ -755,11 +788,20 @@ int main(void)
     clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
     lastClockTime = hw.seed.system.GetNow();
     
+    // Initialize trigger sequence
+    InitTriggerSequence();
+
+    // Initialize parameter objects for trigger sequence controls
+    densityParam.Init(hw.controls[0], 0.0f, 16.5f, Parameter::LINEAR); // maybe does not actually reach the maximum value
+    noteParam.Init(hw.controls[1], 36.0f, 84.0f, Parameter::LINEAR);
+    enableParam.Init(hw.controls[2], 0.0f, 1.0f, Parameter::LINEAR);
+    resetParam.Init(hw.controls[3], 0.0f, 1.0f, Parameter::LINEAR);
+
     UpdateOled();
-    
+
     // start MIDI handler
     hw.midi.StartReceive();
-    
+
     for (int i = 0; i < 4; i++)
     {
         voices[i].note = 60;
@@ -797,6 +839,13 @@ int main(void)
     
     // initOscillators(samplerate);
 
+    // Initialize parameters with linear scaling
+    Parameter densityParam, noteParam, enableParam, resetParam;
+    densityParam.Init(hw.controls[0], 0.0f, 16.0f, Parameter::LINEAR);
+    noteParam.Init(hw.controls[1], 36.0f, 84.0f, Parameter::LINEAR);
+    enableParam.Init(hw.controls[2], 0.0f, 1.0f, Parameter::LINEAR);
+    resetParam.Init(hw.controls[3], 0.0f, 1.0f, Parameter::LINEAR);
+
     // Start the ADC and Audio Peripherals on the Hardware
     hw.StartAdc();
     hw.SetAudioBlockSize(blocksize);
@@ -828,13 +877,23 @@ int main(void)
             triggerOffPending = false;
         }
         
+        // Check for sequence trigger off timing
+        if (sequenceTriggerOffPending && currentTime >= sequenceTriggerOffTime)
+        {
+            SendMidiMesssage(triggerNote, 9, "TRIGGER_OFF");
+            sequenceTriggerOffPending = false;
+        }
+
         // Check for MIDI clock timing
         if (clockEnabled && (currentTime - lastClockTime) >= clockInterval)
         {
             SendMidiClock();
             lastClockTime = currentTime;
         }
-        
+
+        // Update trigger sequence
+        UpdateTriggerSequence();
+
         // envelopes[p.channel].trig = true;
 
         // Prepare buffers for sampler as needed
@@ -888,6 +947,34 @@ void UpdateOled()
     snprintf(bpmStr, sizeof(bpmStr), "BPM:%3d", clockBpm); // Always 7 chars
     hw.display.WriteString(bpmStr, Font_6x8, true);
     
+    // Show trigger sequence pattern when in TrigSeq mode
+    if (currentPanel.name == "TrigSeq") {
+        hw.display.SetCursor(0, 50);
+        char seqStr[20];
+        snprintf(seqStr, sizeof(seqStr), "Step:%02d", currentSequenceStep);
+        hw.display.WriteString(seqStr, Font_6x8, true);
+
+        // Show density value
+        int numTriggers = 0;
+        for (int i = 0; i < TRIGGER_SEQUENCE_LENGTH; i++) {
+            if (triggerSequence[i]) numTriggers++;
+        }
+        hw.display.SetCursor(50, 50);
+        char densityStr[20];
+        snprintf(densityStr, sizeof(densityStr), "D:%02d", numTriggers);
+        hw.display.WriteString(densityStr, Font_6x8, true);
+        
+        // Show sequence pattern as dots
+        hw.display.SetCursor(0, 40);
+        for (int i = 0; i < TRIGGER_SEQUENCE_LENGTH; i++) {
+            if (triggerSequence[i]) {
+                hw.display.WriteString("*", Font_6x8, true);
+            } else {
+                hw.display.WriteString("-", Font_6x8, true);
+            }
+        }
+    }
+    
     // draw current knob values
     for (int i = 0; i < 4; i++)
     {
@@ -935,7 +1022,13 @@ void ProcessEncoder()
         // Recalculate clock interval
         // MIDI clock sends 24 pulses per quarter note
         // Interval = 60000ms / (BPM * 24)
-        clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));        
+        clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
+        
+        // Recalculate sequence step interval
+        // Each sequence step = 1/16th note = 6 MIDI clock pulses
+        // Interval = 60000ms / (BPM * 4) for 16th note timing
+        sequenceStepInterval = static_cast<uint32_t>(60000 / (clockBpm * 4));
+        
         knobChanged = true; // Trigger display update
 
     }
@@ -1091,6 +1184,29 @@ void ProcessKnobs()
                 break;
             default:
                 break;
+        }
+    }
+    else if (currentPanel.name == "TrigSeq")
+    {
+        // Process parameters continuously
+        triggerNote = static_cast<uint8_t>(noteParam.Process());
+        sequenceEnabled = (enableParam.Process() > 0.5f);
+        
+        // Reset sequence (when knob is turned to max and back)
+        if (resetParam.Process() > 0.9f) {
+            currentSequenceStep = 0;
+            lastSequenceStepTime = hw.seed.system.GetNow();
+        }
+        
+        // Only regenerate pattern when density knob changes
+        if (inputIndex == 0) {
+            // Round the parameter value to ensure we get exact integer values
+            int numTriggers = static_cast<int>(densityParam.Process() + 0.5f);
+            numTriggers = std::max(0, std::min(numTriggers, static_cast<int>(TRIGGER_SEQUENCE_LENGTH)));
+            
+            // Generate Euclidean rhythm pattern
+            GenerateEuclideanRhythm(numTriggers, TRIGGER_SEQUENCE_LENGTH, triggerSequence);
+            knobChanged = true;
         }
     }
 
@@ -1296,4 +1412,110 @@ void ClearAllVoices()
 {
     shift_register.Reset();
     ApplyShiftRegisterState();
+}
+
+// Trigger Sequence Generator Implementation
+void InitTriggerSequence()
+{
+    // Initialize sequence with Euclidean rhythm (4 triggers out of 16 steps)
+    GenerateEuclideanRhythm(4, TRIGGER_SEQUENCE_LENGTH, triggerSequence);
+
+    // Initialize timing
+    currentSequenceStep = 0;
+    lastSequenceStepTime = hw.seed.system.GetNow();
+    sequenceStepInterval = static_cast<uint32_t>(60000 / (clockBpm * 4));  // 16th note timing
+}
+
+void UpdateTriggerSequence()
+{
+    if (!sequenceEnabled) {
+        return;
+    }
+
+    uint32_t currentTime = hw.seed.system.GetNow();
+
+    // Check if it's time to advance to the next sequence step
+    if ((currentTime - lastSequenceStepTime) >= sequenceStepInterval) {
+        AdvanceSequenceStep();
+        lastSequenceStepTime = currentTime;
+    }
+}
+
+void AdvanceSequenceStep()
+{
+    // Check if current step should trigger
+    if (triggerSequence[currentSequenceStep]) {
+        // Send trigger on MIDI channel 10 (channel 9 in 0-based indexing)
+        SendMidiMesssage(triggerNote, 9, "TRIGGER_ON");
+
+        // Schedule trigger off after a short duration (50ms)
+        sequenceTriggerOffTime = hw.seed.system.GetNow() + 50;
+        sequenceTriggerOffPending = true;
+    }
+    
+    // Advance to next step
+    currentSequenceStep = (currentSequenceStep + 1) % TRIGGER_SEQUENCE_LENGTH;
+}
+
+void GenerateEuclideanRhythm(int numTriggers, int numSteps, bool* pattern)
+{
+    // Handle edge cases
+    if (numTriggers <= 0) {
+        // No triggers - fill with false
+        for (int i = 0; i < numSteps; i++) {
+            pattern[i] = false;
+        }
+        return;
+    }
+
+    if (numTriggers >= numSteps) {
+        // All steps are triggers - fill with true
+        for (int i = 0; i < numSteps; i++) {
+            pattern[i] = true;
+        }
+        return;
+    }
+
+    // Bjorklund algorithm implementation
+    std::vector<int> remainder;
+    std::vector<int> count;
+    
+    remainder.push_back(numTriggers);
+    int divisor = numSteps - numTriggers;
+    int level = 0;
+    
+    // Build the remainder and count arrays
+    do {
+        count.push_back(divisor / remainder[level]);
+        remainder.push_back(divisor % remainder[level]);
+        divisor = remainder[level];
+        level++;
+    } while (remainder[level] > 1);
+
+    count.push_back(divisor);
+
+    // Build the pattern using the Bjorklund algorithm
+    std::vector<bool> result;
+    BuildPattern(level, result, count, remainder);
+
+    // Copy result to pattern array
+    for (int i = 0; i < numSteps; i++) {
+        pattern[i] = result[i];
+    }
+}
+
+void BuildPattern(int level, std::vector<bool>& result, const std::vector<int>& count, const std::vector<int>& remainder)
+{
+    if (level == -1) {
+        result.insert(result.begin(), false);
+    } else if (level == -2) {
+        result.insert(result.begin(), true);
+    } else {
+        for (int i = 0; i < count[level]; i++) {
+            BuildPattern(level - 1, result, count, remainder);
+        }
+        if (remainder[level] != 0) {
+            BuildPattern(level - 2, result, count, remainder);
+        }
+    }
 }
