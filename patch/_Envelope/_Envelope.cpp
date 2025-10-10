@@ -11,7 +11,7 @@ using namespace daisysp;
 DaisyPatch      hw;
 Fm2             osc1, osc2;
 Oscillator      pan, lfo1, lfo2, lfo3;
-Oscillator      voice1Osc, voice3Osc;  // Internal oscillators for voices 1 and 3
+// Oscillator      voice1Osc, voice3Osc;  // Internal oscillators for voices 1 and 3
 SdmmcHandler    sdcard;
 FatFSInterface  fsi;
 WavPlayer       sampler;
@@ -79,9 +79,10 @@ public:
     }
 };
 
-InterpolatedOscillator voice1InterpOsc, voice3InterpOsc;
+InterpolatedOscillator voiceInterpOsc[4];  // Oscillators for all 4 voices
 
 int panelMode;
+float voicesMinLevel = 0.0f;
 float cvOut1;
 float cvOut2;
 float panOutput;
@@ -89,6 +90,8 @@ int8_t currentHighestNote = 0;
 int8_t lastHighestNote = 0;
 int8_t currentLowestNote = 0;
 int8_t lastLowestNote = 0;
+int8_t currentNote = 0;
+int8_t lastCurrentNote = 0;
 
 // Shift Register Mode
 bool shiftRegisterMode = false;
@@ -123,7 +126,7 @@ uint32_t lastDisplayUpdate = 0;
 const uint32_t DISPLAY_UPDATE_INTERVAL_MS = 100; // Update display every 100ms
 
 // Trigger off timing
-int8_t currentNote = 0;
+// int8_t currentNote = 0;
 uint32_t triggerOffTime = 0;
 const uint32_t TRIGGER_OFF_DELAY_MS = 50; // 10ms delay for trigger off
 bool triggerOffPending = false;
@@ -207,7 +210,6 @@ pluckStruct plucks[4];
 // #define MAX_DELAY ((size_t)(10.0f * 48000.0f))
 // 10 second delay line on the external SDRAM
 // DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS delay;
-ReverbSc  verb;
 
 envStruct envelopes[4];
 void      ProcessControls();
@@ -224,9 +226,7 @@ void      RemoveNoteFromQueue(int8_t note);
 void      ClearAllVoices();
 
 void      initOscillators(float samplerate);
-void      InitSampler();
 void      UpdateOscillators();
-void      UpdateSampler();
 
 bool      knobChanged = false;
 
@@ -309,39 +309,41 @@ float IncrementTowards(float value, float target)
 }
 
 // Convert MIDI note number to frequency in Hz
-float MidiNoteToFrequency(int8_t note)
+float MidiNoteToFrequency(int8_t note, int8_t channel)
 {
+    float baseFreq = 440.0f;
+    if (channel == 0) {
+        baseFreq = 220.0f;
+    }
+
     if (note <= 0) return 0.0f;
-    return 440.0f * powf(2.0f, (note - 69) / 12.0f);
+    return baseFreq * powf(2.0f, (note - 69) / 12.0f);
 }
 
 // Apply VCA to inputs based on envelope values
 void ApplyVCAs(float* data) {
     float envMax = 0.0f;
     float envVal = 0.0f;
-    float velOffset = 0.35; // needed to bias the Intellijel vactrol
+    // float vactrolOffset = 0.35f; // needed to bias the Intellijel vactrol
     for (size_t i = 0; i < 4; i++) {
         // char message[60];
         // snprintf(message, 60, "val: %d", voices[i].note);
-        data[i] = data[i] * envelopes[i].envSig;
-
-        // Safe velocity calculation - handle case where velocity might be 0 or invalid
         float velocityFactor = (voices[i].velocity > 0) ? voices[i].velocity / 127.0f : 0.0f;
-        envVal = envelopes[i].envSig * (velOffset + (1 - velOffset) * velocityFactor);
+        envVal = std::max(envelopes[i].envSig * velocityFactor, voicesMinLevel);
+        data[i] = data[i] * envVal;
 
         if (envVal > envMax)
         {
-            // TODO make velocity more responsive, not just on noteOn
-            // envMax = envelopes[i].envSig * (velOffset + (1 - velOffset) * voices[i].velocity / 127.0f);
             envMax = envVal;
         }
     }
 
-    cvOut1 = IncrementTowards(cvOut1, envMax);
-
-    // and LFO signal onto cvOut1
-    
-    hw.seed.dac.WriteValue(DacHandle::Channel::TWO, cvOut1 * 4095);
+    int16_t outputMaxEnvelope = envMax * 4095;
+    int16_t vactrolOffset = 300; // this is to bias the Intellijel vactrol
+    // int16_t output = std::min(outputMaxEnvelope + vactrolOffset, static_cast<int16_t>(4095));
+    hw.seed.dac.WriteValue(DacHandle::Channel::TWO, outputMaxEnvelope + vactrolOffset);
+    // cvOut1 = IncrementTowards(cvOut1 + vactrolOffset, envMax);
+    // hw.seed.dac.WriteValue(DacHandle::Channel::TWO, cvOut1 * 4095);
 }
 
 void AudioCallback(AudioHandle::InputBuffer  in,
@@ -351,10 +353,11 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     ProcessControls();
     
     // Process envelopes at audio rate for consistent timing
-    float ctrl4 = hw.controls[3].Process(); // the fourth control knob controls baseline level
+    // float ctrl4 = hw.controls[3].Process(); // the fourth control knob controls baseline level
+
     for(int j = 0; j < 4; j++)
     {
-        envelopes[j].envSig = std::max(envelopes[j].env.Process(envelopes[j].gate), ctrl4);
+        envelopes[j].envSig = envelopes[j].env.Process(envelopes[j].gate);
     }
 
     // float trig, nn, decay;       // Pluck Vars
@@ -377,7 +380,6 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     //     trig = 0.0f;
     // }
 
-    // UpdateSampler();
     // UpdateOscillators();
     
 
@@ -393,19 +395,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
         // Use internal oscillators for voices 1 and 3 if enabled
         if (useInternalOscillators) {
-            // Voice 1 (index 1) - use interpolated oscillator
-            if (envelopes[1].gate) {
-                results[1] = voice1InterpOsc.Process();
-            } else {
-                results[1] = 0.0f;
-            }
-            
-            // Voice 3 (index 3) - use interpolated oscillator
-            if (envelopes[3].gate) {
-                results[3] = voice3InterpOsc.Process();
-            } else {
-                results[3] = 0.0f;
-            }
+            results[1] = voiceInterpOsc[1].Process();
+            results[3] = voiceInterpOsc[3].Process();
         }
 
         // Panel 1
@@ -421,17 +412,29 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         // out[1][i] = sig;
         // }
          
-        // UpdateOscillators();
-
-        // output wav
-        // out[3][i] = s162f(sampler.Stream()) * 1.0f;
-        
-
-        // why does turning this on kill audio when the panel is on Reverb? makes no sense at all
-        // verb.Process(sendLeft, sendRight, &wetl, &wetr);
+        // UpdateOscillators();       
 
         out[0][i] = results[0];
         out[1][i] = results[1];
+        
+        // Output voices 0 and 2 oscillators to audio outputs 3 and 4 when enabled
+        if (useInternalOscillators) {
+            if (envelopes[0].gate) {
+                out[2][i] = voiceInterpOsc[0].Process();
+            } else {
+                out[2][i] = 0.0f;
+            }
+            
+            if (envelopes[2].gate) {
+                out[3][i] = voiceInterpOsc[2].Process();
+            } else {
+                out[3][i] = 0.0f;
+            }
+        } else {
+            // When internal oscillators are disabled, output silence on channels 3 and 4
+            out[2][i] = 0.0f;
+            out[3][i] = 0.0f;
+        }
     }
 
     // Note: Display updates moved to main loop to prevent audio dropouts
@@ -601,13 +604,12 @@ void HandleMidiMessage(MidiEvent m)
                 voices[p.channel - channelOffset].velocity = p.velocity;
                 envelopes[p.channel - channelOffset].env.Retrigger(true);
                 
-                // Update internal oscillator frequencies for voices 1 and 3
+                // Update internal oscillator frequencies for all voices
                 if (useInternalOscillators) {
-                    float freq = MidiNoteToFrequency(p.note);
-                    if (p.channel - channelOffset == 1) {  // Voice 1
-                        voice1InterpOsc.SetFreq(freq);
-                    } else if (p.channel - channelOffset == 3) {  // Voice 3
-                        voice3InterpOsc.SetFreq(freq);
+                    float freq = MidiNoteToFrequency(p.note, p.channel);
+                    int voiceIndex = p.channel - channelOffset;
+                    if (voiceIndex >= 0 && voiceIndex < 4) {
+                        voiceInterpOsc[voiceIndex].SetFreq(freq);
                     }
                 }
             }
@@ -636,9 +638,18 @@ void HandleMidiMessage(MidiEvent m)
             }
             lastLowestNote = currentLowestNote;
 
+            // Turn off the previously played note first
+            if (lastCurrentNote != 0) {
+                SendMidiMesssage(lastCurrentNote, 15, "NOTE_OFF");
+            }
+
             // this voice is meant to be sent to Multigrain
             // pass current note and trigger to Intellijel via channel 13
+            lastCurrentNote = currentNote;
             currentNote = p.note;
+            
+            
+            // Send the new note
             SendMidiMesssage(p.note, 15, "NOTE_ON");
             // note selection is handled by sending CC signal, scaled to 0-63
             SendMidiMesssage(p.channel * 16 + 2, 15, "CC");
@@ -735,10 +746,6 @@ int main(void)
         // plucks[i].synth.SetDecay(1.0);
         // plucks[i].synth.Init(samplerate);
 
-        // reverb init
-        // verb.Init(samplerate);
-        // verb.SetFeedback(0.85f);
-        // verb.SetLpFreq(2000.0f);
     }
     // synth.Init(samplerate);
 
@@ -746,29 +753,25 @@ int main(void)
     InitPan(samplerate);
     
     // Initialize internal oscillators for voices 1 and 3
-    voice1Osc.Init(samplerate);
-    voice1Osc.SetFreq(440.0f);  // Default frequency
-    voice1Osc.SetAmp(1.0f);
-    voice1Osc.SetWaveform(Oscillator::WAVE_SIN);
+    // voice1Osc.Init(samplerate);
+    // voice1Osc.SetFreq(440.0f);  // Default frequency
+    // voice1Osc.SetAmp(1.0f);
+    // voice1Osc.SetWaveform(Oscillator::WAVE_SIN);
     
-    voice3Osc.Init(samplerate);
-    voice3Osc.SetFreq(440.0f);  // Default frequency
-    voice3Osc.SetAmp(1.0f);
-    voice3Osc.SetWaveform(Oscillator::WAVE_SIN);
+    // voice3Osc.Init(samplerate);
+    // voice3Osc.SetFreq(440.0f);  // Default frequency
+    // voice3Osc.SetAmp(1.0f);
+    // voice3Osc.SetWaveform(Oscillator::WAVE_SIN);
     
-    // Initialize interpolated oscillators for voices 1 and 3
-    voice1InterpOsc.Init(samplerate);
-    voice1InterpOsc.SetFreq(440.0f);
-    voice1InterpOsc.SetAmp(1.0f);
-    voice1InterpOsc.SetWaveformParam(0.0f);  // Start with sine wave
-    
-    voice3InterpOsc.Init(samplerate);
-    voice3InterpOsc.SetFreq(440.0f);
-    voice3InterpOsc.SetAmp(1.0f);
-    voice3InterpOsc.SetWaveformParam(0.0f);  // Start with sine wave
+    // Initialize interpolated oscillators for all 4 voices
+    for (int i = 0; i < 4; i++) {
+        voiceInterpOsc[i].Init(samplerate);
+        voiceInterpOsc[i].SetFreq(440.0f);
+        voiceInterpOsc[i].SetAmp(1.0f);
+        voiceInterpOsc[i].SetWaveformParam(0.0f);  // Start with sine wave
+    }
     
     // initOscillators(samplerate);
-    // InitSampler();
 
     // Start the ADC and Audio Peripherals on the Hardware
     hw.StartAdc();
@@ -987,25 +990,12 @@ void ProcessKnobs()
                     break;
                 case 3:
                     // Minimum level (used in envelope processing)
+                    voicesMinLevel = inputs[3];
                     break;
                 default:
                     break;
             }
         }
-                // envelopes[i].env.SetTime(ADSR_SEG_ATTACK,
-                //                         hw.GetKnobValue(DaisyPatch::CTRL_1));
-                // envelopes[i].env.SetTime(ADSR_SEG_DECAY,
-                //                         hw.controls[1].Process());
-                // envelopes[i].env.SetTime(ADSR_SEG_RELEASE,
-                //                         hw.controls[1].Process());
-                // envelopes[i].env.SetSustainLevel(hw.controls[2].Process());                                 
-                // envelopes[i].env.SetTime(ADSR_SEG_ATTACK,
-                //                      envelopes[i].attackParam.Process());
-                // envelopes[i].env.SetTime(ADSR_SEG_DECAY,
-                //                         envelopes[i].decayParam.Process());
-                // envelopes[i].env.SetTime(ADSR_SEG_RELEASE,
-                //                         envelopes[i].decayParam.Process());
-            // }
     }
     else if (currentPanel.name == "Panning")
     {
@@ -1020,20 +1010,6 @@ void ProcessKnobs()
             default:
                 break;
         }
-    }
-    else if (currentPanel.name == "Reverb")
-    {
-        for (size_t j = 0; j < 4; j++)
-        {
-            // verb.Init(samplerate);
-            // verb.SetFeedback(inputs[1]);
-            // verb.SetLpFreq(2000.0f);
-            // plucks[j].wetDry = inputs[0];
-            // plucks[j].decay = inputs[1];
-        }
-        
-        // hw.controls[0].Process();
-        // ProcessPluck();
     }
     else if (currentPanel.name == "Pluck")
     {
@@ -1052,8 +1028,9 @@ void ProcessKnobs()
         {
             case 0:
                 // Waveform control: 0.0 = sine, 0.33 = triangle, 0.66 = square, 1.0 = saw
-                voice1InterpOsc.SetWaveformParam(inputs[0]);
-                voice3InterpOsc.SetWaveformParam(inputs[0]);
+                for (int i = 0; i < 4; i++) {
+                    voiceInterpOsc[i].SetWaveformParam(inputs[0]);
+                }
                 break;
             default:
                 break;
@@ -1081,7 +1058,7 @@ void ProcessControls()
 void InitPan(float samplerate)
 {
     pan.Init(samplerate);
-    pan.SetFreq(0.015f);
+    pan.SetFreq(0.03f);
     pan.SetAmp(1);
     pan.SetWaveform(Oscillator::WAVE_SIN);
 }
@@ -1118,54 +1095,6 @@ void ProcessGates()
             // envelopes[i].env.Retrigger(true);
         }
     }
-}
-
-void UpdateSampler()
-{
-    // handle wav selection
-    int32_t inc;
-    // Change file with encoder.
-    inc = hw.encoder.Increment();
-    // DisplayMessage((std::to_string(inc)).c_str());
-    if(inc > 0)
-    {
-        size_t fileCount = sampler.GetNumberFiles();
-        // DisplayMessage((std::to_string(fileCount)).c_str());
-        size_t curfile;
-        curfile = sampler.GetCurrentFile();
-        DisplayMessage((std::to_string(curfile + 1)).c_str());
-        if(curfile < sampler.GetNumberFiles() - 1)
-        {
-            sampler.Open(curfile + 1);
-            sampler.SetLooping(true);
-            sampler.Restart();
-        }
-    }
-    else if(inc < 0)
-    {
-        size_t curfile;
-        curfile = sampler.GetCurrentFile();
-        DisplayMessage((std::to_string(curfile - 1)).c_str());
-        if(curfile > 0)
-        {
-            sampler.Open(curfile - 1);
-            sampler.SetLooping(true);
-            sampler.Restart();
-        }
-    }
-}
-
-void InitSampler() {
-    SdmmcHandler::Config sd_cfg;
-    sd_cfg.Defaults();
-    sd_cfg.speed = SdmmcHandler::Speed::MEDIUM_SLOW;
-    sd_cfg.width = SdmmcHandler::BusWidth::BITS_1;
-    sdcard.Init(sd_cfg);
-    fsi.Init(FatFSInterface::Config::MEDIA_SD);
-    f_mount(&fsi.GetSDFileSystem(), "/", 1);
-
-    sampler.Init(fsi.GetSDPath());
-    sampler.SetLooping(true);
 }
 
 void UpdateOscillators() {
@@ -1265,14 +1194,10 @@ static void ApplyShiftRegisterState()
             voices[i].note     = static_cast<int8_t>(state.note);
             voices[i].velocity = static_cast<int8_t>(state.velocity);
             
-            // Update internal oscillator frequencies for voices 1 and 3
+            // Update internal oscillator frequencies for all voices
             if (useInternalOscillators && state.gate_on) {
-                float freq = MidiNoteToFrequency(static_cast<int8_t>(state.note));
-                if (i == 1) {  // Voice 1
-                    voice1InterpOsc.SetFreq(freq);
-                } else if (i == 3) {  // Voice 3
-                    voice3InterpOsc.SetFreq(freq);
-                }
+                float freq = MidiNoteToFrequency(static_cast<int8_t>(state.note), static_cast<int8_t>(i));
+                voiceInterpOsc[i].SetFreq(freq);
             }
         }
         else
