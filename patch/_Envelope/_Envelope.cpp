@@ -136,6 +136,18 @@ const float ENCODER_LONG_PRESS_MS = 1500.0f;
 bool encoderWasPressed = false;
 bool longPressHandled = false;
 
+// MIDI Clock variables
+const int32_t CLOCK_BPM_MIN = 10;     // Minimum BPM
+const int32_t CLOCK_BPM_MAX = 1000;   // Maximum BPM
+const int32_t CLOCK_BPM_DEFAULT = 120; // Default BPM
+const int32_t CLOCK_BPM_INCREMENT = 10; // BPM change per encoder tick
+
+int32_t clockBpm = CLOCK_BPM_DEFAULT;  // Current BPM
+uint32_t lastClockTime = 0;
+uint32_t clockInterval = 0;  // Calculated interval between clock messages
+bool clockEnabled = true;
+int8_t encoderIncrement = 0;  // Track encoder rotation
+
 struct panelStruct
 {
     std::string     name;
@@ -324,7 +336,6 @@ float MidiNoteToFrequency(int8_t note, int8_t channel)
 void ApplyVCAs(float* data) {
     float envMax = 0.0f;
     float envVal = 0.0f;
-    // float vactrolOffset = 0.35f; // needed to bias the Intellijel vactrol
     for (size_t i = 0; i < 4; i++) {
         // char message[60];
         // snprintf(message, 60, "val: %d", voices[i].note);
@@ -555,6 +566,13 @@ void SendMidiMesssage(uint8_t value, uint8_t channel, char* type)
     }
 }
 
+void SendMidiClock()
+{
+    // Send MIDI Clock message (0xF8)
+    uint8_t clockByte = 0xF8;
+    hw.midi.SendMessage(&clockByte, 1);
+}
+
 int8_t getCurrentHighestNote() {
     int8_t highestNote = voices[0].note;
     for (int i = 1; i < 4; i++)
@@ -662,7 +680,7 @@ void HandleMidiMessage(MidiEvent m)
 
             // probably move outside of audio callback
             char message[60];
-            snprintf(message, 60, "Note: %d Ch: %d", p.note, static_cast<int>(p.channel));
+            snprintf(message, 60, "Note:%d Ch:%d", p.note, static_cast<int>(p.channel));
             DisplayMessage(message);
             
             noteCount++;
@@ -731,6 +749,12 @@ int main(void)
 
     panelMode = 0;
     currentPanel = displayPanels[panelMode];
+
+    
+    // Initialize clock interval
+    clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
+    lastClockTime = hw.seed.system.GetNow();
+    
     UpdateOled();
     
     // start MIDI handler
@@ -804,6 +828,13 @@ int main(void)
             triggerOffPending = false;
         }
         
+        // Check for MIDI clock timing
+        if (clockEnabled && (currentTime - lastClockTime) >= clockInterval)
+        {
+            SendMidiClock();
+            lastClockTime = currentTime;
+        }
+        
         // envelopes[p.channel].trig = true;
 
         // Prepare buffers for sampler as needed
@@ -839,7 +870,7 @@ void UpdateOled()
     str = currentPanel.name;
     hw.display.WriteString(cstr, Font_7x10, true);
     
-    // Show shift register mode indicator
+    // Show shift register mode indicator and BPM
     if (shiftRegisterMode) {
         hw.display.SetCursor(0, 35);
         hw.display.WriteString("SHIFT", Font_6x8, true);
@@ -848,6 +879,14 @@ void UpdateOled()
         hw.display.SetCursor(0, 35);
         hw.display.WriteString("     ", Font_6x8, true);
     }
+    
+    // Show current BPM
+    hw.display.SetCursor(80, 50);
+    // Use a fixed-width format that always takes the same space
+    hw.display.SetCursor(80, 50);
+    char bpmStr[40];
+    snprintf(bpmStr, sizeof(bpmStr), "BPM:%3d", clockBpm); // Always 7 chars
+    hw.display.WriteString(bpmStr, Font_6x8, true);
     
     // draw current knob values
     for (int i = 0; i < 4; i++)
@@ -882,6 +921,24 @@ void ProcessEncoder()
 {
     bool encoderPressed = hw.encoder.Pressed();
     float timeHeld = hw.encoder.TimeHeldMs();
+    
+    // Check for encoder rotation (clockwise/counterclockwise)
+    int32_t encoderValue = hw.encoder.Increment();
+    if (encoderValue != 0) {
+        // Adjust BPM by configured increment for each encoder tick
+        clockBpm += encoderValue * CLOCK_BPM_INCREMENT;
+
+        // Clamp BPM to configured range
+        if (clockBpm < CLOCK_BPM_MIN) clockBpm = CLOCK_BPM_MIN;
+        if (clockBpm > CLOCK_BPM_MAX) clockBpm = CLOCK_BPM_MAX;
+
+        // Recalculate clock interval
+        // MIDI clock sends 24 pulses per quarter note
+        // Interval = 60000ms / (BPM * 24)
+        clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));        
+        knobChanged = true; // Trigger display update
+
+    }
     
     // Detect long press: trigger when held >= 3 seconds
     if(encoderPressed && timeHeld >= ENCODER_LONG_PRESS_MS && !longPressHandled)
