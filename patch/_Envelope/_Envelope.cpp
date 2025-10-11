@@ -6,6 +6,8 @@
 #include <vector>
 #include "midi/ShiftRegisterMidi.h"
 #include "hid/parameter.h"
+#include "tuning/ScalaTuning.h"
+#include "tuning/TuningCalculator.h"
 
 using namespace daisy;
 using namespace daisysp;
@@ -101,6 +103,14 @@ bool shiftRegisterMode = false;
 // option to use internal oscillators for voices 1 and 3
 bool useInternalOscillators = true;
 
+// Tuning system variables
+uint8_t currentTuningIndex = 0;  // Current tuning preset index
+// this value currently corresponds to the 2 semitone pitch bend range configured on Intellijel
+float pitchBendRange = 200.0f;    // Pitch bend range in cents (default ±200)
+bool sendPitchBendMidi = true;    // Enable/disable pitch bend MIDI output
+bool applyToInternalOsc = true;   // Enable/disable tuning for internal oscillators
+int16_t currentPitchBendValues[16]; // Track pitch bend per channel (8192 = center)
+
 namespace envelope_midi = envelope::midi;
 
 struct DaisyMidiOutput : public envelope_midi::MidiOutput
@@ -175,7 +185,7 @@ struct panelStruct
     std::string     input4Name;
     float           values[4];
 };
-panelStruct displayPanels[4] = {
+panelStruct displayPanels[5] = {
     { 
         name: "ADSR", 
         input1Name: "A", 
@@ -207,6 +217,14 @@ panelStruct displayPanels[4] = {
         input3Name: "Enable",
         input4Name: "Reset",
         values: {0.0f, 0.0f, 0.0f, 0.0f}
+    },
+    {
+        name: "Tuning",
+        input1Name: "Tuning",
+        input2Name: "Range",
+        input3Name: "MIDI",
+        input4Name: "Osc",
+        values: {0.0f, 0.0f, 1.0f, 1.0f}
     }
 };
 int panelModesCount = sizeof(displayPanels) / sizeof(displayPanels[0]);
@@ -257,6 +275,7 @@ void      ApplyPanning(float* data);
 void      UpdateOled();
 void      plucksApply();
 void      InitPan(float samplerate);
+void      SendPitchBend(uint8_t channel, int16_t bendValue);
 
 // Trigger Sequence Generator functions
 void      InitTriggerSequence();
@@ -362,7 +381,17 @@ float MidiNoteToFrequency(int8_t note, int8_t channel)
     }
 
     if (note <= 0) return 0.0f;
-    return baseFreq * powf(2.0f, (note - 69) / 12.0f);
+    
+    float frequency = baseFreq * powf(2.0f, (note - 69) / 12.0f);
+    
+    // Apply tuning adjustment for internal oscillators if enabled
+    if (applyToInternalOsc) {
+        const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+        float frequencyMultiplier = CalculateFrequencyMultiplier(note, tuning);
+        frequency *= frequencyMultiplier;
+    }
+    
+    return frequency;
 }
 
 // Apply VCA to inputs based on envelope values
@@ -514,6 +543,14 @@ void PassthroughMidiMessage(MidiEvent m)
         {
             NoteOnEvent p = m.AsNoteOn();
 
+            // Send pitch bend before note-on if tuning is enabled
+            if (sendPitchBendMidi) {
+                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                float centsDeviation = CalculateCentsDeviation(p.note, tuning);
+                int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
+                SendPitchBend(m.channel + channelOffset, pitchBendValue);
+            }
+
             uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + m.channel + channelOffset), p.note, p.velocity};
 
             // if (m.channel == 0)
@@ -606,6 +643,20 @@ void SendMidiClock()
     hw.midi.SendMessage(&clockByte, 1);
 }
 
+void SendPitchBend(uint8_t channel, int16_t bendValue)
+{
+    // Send MIDI Pitch Bend message
+    // Format: 0xE0 + channel, LSB, MSB
+    uint8_t lsb = bendValue & 0x7F;        // Lower 7 bits
+    uint8_t msb = (bendValue >> 7) & 0x7F;  // Upper 7 bits
+    uint8_t bytes[3] = {static_cast<uint8_t>(0xE0 + channel), lsb, msb};
+    
+    hw.midi.SendMessage(bytes, 3);
+    
+    // Store current pitch bend value for this channel
+    currentPitchBendValues[channel] = bendValue;
+}
+
 int8_t getCurrentHighestNote() {
     int8_t highestNote = voices[0].note;
     for (int i = 1; i < 4; i++)
@@ -648,6 +699,17 @@ void HandleMidiMessage(MidiEvent m)
             if (shiftRegisterMode)
             {
                 AddNoteToQueue(p.note, p.velocity);
+                
+                // Also send MIDI to external devices with tuning applied
+                if (sendPitchBendMidi) {
+                    const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                    float centsDeviation = CalculateCentsDeviation(p.note, tuning);
+                    int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
+                    SendPitchBend(m.channel + channelOffset, pitchBendValue);
+                }
+                
+                uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + m.channel + channelOffset), p.note, p.velocity};
+                hw.midi.SendMessage(bytes, 3);
             } else {
                 // Original behavior
                 envelopes[p.channel - channelOffset].gate = true;
@@ -726,6 +788,10 @@ void HandleMidiMessage(MidiEvent m)
             if (shiftRegisterMode)
             {
                 RemoveNoteFromQueue(p.note);
+                
+                // Also send note-off to external devices
+                uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + m.channel + channelOffset), p.note, p.velocity};
+                hw.midi.SendMessage(bytes, 3);
             } else {
                 // Original behavior
                 envelopes[p.channel - channelOffset].gate = false;
@@ -778,6 +844,19 @@ int main(void)
         displayPanels[0].values[i] = hw.controls[i].Process();
         displayPanels[1].values[i] = hw.controls[i].Process();
         displayPanels[2].values[i] = hw.controls[i].Process();
+        displayPanels[3].values[i] = hw.controls[i].Process();
+        displayPanels[4].values[i] = hw.controls[i].Process();
+    }
+    
+    // Initialize tuning panel with default values
+    displayPanels[4].values[0] = 0.0f;  // Tuning selector (12-TET)
+    displayPanels[4].values[1] = 0.09f;  // Pitch bend range (200 cents)
+    displayPanels[4].values[2] = 1.0f;  // MIDI output enabled
+    displayPanels[4].values[3] = 1.0f;  // Internal oscillators enabled
+    
+    // Initialize pitch bend values to center (no bend)
+    for (int i = 0; i < 16; i++) {
+        currentPitchBendValues[i] = 8192;
     }
 
     panelMode = 0;
@@ -973,6 +1052,27 @@ void UpdateOled()
                 hw.display.WriteString("-", Font_6x8, true);
             }
         }
+    }
+    // Show tuning information when in Tuning mode
+    else if (currentPanel.name == "Tuning") {
+        // Show current tuning name
+        const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+        hw.display.SetCursor(0, 35);
+        hw.display.WriteString(tuning->name, Font_6x8, true);
+        
+        // Show pitch bend range
+        hw.display.SetCursor(0, 50);
+        char rangeStr[20];
+        snprintf(rangeStr, sizeof(rangeStr), "Range:%3.0fc", pitchBendRange);
+        hw.display.WriteString(rangeStr, Font_6x8, true);
+        
+        // Show MIDI and Osc status
+        hw.display.SetCursor(70, 50);
+        char statusStr[20];
+        snprintf(statusStr, sizeof(statusStr), "%s%s", 
+                sendPitchBendMidi ? "M" : "-", 
+                applyToInternalOsc ? "O" : "-");
+        hw.display.WriteString(statusStr, Font_6x8, true);
     }
     
     // draw current knob values
@@ -1209,6 +1309,56 @@ void ProcessKnobs()
             knobChanged = true;
         }
     }
+    else if (currentPanel.name == "Tuning")
+    {
+        switch(inputIndex)
+        {
+            case 0:
+                // Tuning selector: map knob value to tuning index
+                {
+                    float tuningValue = inputs[0];
+                    uint8_t newTuningIndex = static_cast<uint8_t>(tuningValue * (NUM_TUNING_PRESETS - 1) + 0.5f);
+                    if (newTuningIndex != currentTuningIndex) {
+                        currentTuningIndex = newTuningIndex;
+                        knobChanged = true;
+                    }
+                }
+                break;
+            case 1:
+                // Pitch bend range: ±100 to ±1200 cents
+                {
+                    float rangeValue = inputs[1];
+                    float newRange = 100.0f + rangeValue * 1100.0f; // 100 to 1200 cents
+                    if (fabs(newRange - pitchBendRange) > 1.0f) {
+                        pitchBendRange = newRange;
+                        knobChanged = true;
+                    }
+                }
+                break;
+            case 2:
+                // Enable/disable pitch bend MIDI output
+                {
+                    bool newSendMidi = inputs[2] > 0.5f;
+                    if (newSendMidi != sendPitchBendMidi) {
+                        sendPitchBendMidi = newSendMidi;
+                        knobChanged = true;
+                    }
+                }
+                break;
+            case 3:
+                // Enable/disable internal oscillator tuning
+                {
+                    bool newApplyOsc = inputs[3] > 0.5f;
+                    if (newApplyOsc != applyToInternalOsc) {
+                        applyToInternalOsc = newApplyOsc;
+                        knobChanged = true;
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+    }
 
     for (int i = 0; i < 4; i++)
     {
@@ -1371,6 +1521,14 @@ static void ApplyShiftRegisterState()
             if (useInternalOscillators && state.gate_on) {
                 float freq = MidiNoteToFrequency(static_cast<int8_t>(state.note), static_cast<int8_t>(i));
                 voiceInterpOsc[i].SetFreq(freq);
+            }
+            
+            // Send pitch bend for shift register mode if tuning is enabled
+            if (sendPitchBendMidi && state.gate_on) {
+                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                float centsDeviation = CalculateCentsDeviation(static_cast<uint8_t>(state.note), tuning);
+                int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
+                SendPitchBend(static_cast<uint8_t>(i), pitchBendValue);
             }
         }
         else
