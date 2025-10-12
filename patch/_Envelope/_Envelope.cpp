@@ -96,6 +96,8 @@ int8_t currentLowestNote = 0;
 int8_t lastLowestNote = 0;
 int8_t currentNote = 0;
 int8_t lastCurrentNote = 0;
+int8_t nextVoiceIndex = 0;  // Round-robin voice allocator (0-3)
+uint32_t voiceAllocationCounter = 0;  // Counter to track voice allocation order
 
 // Shift Register Mode
 bool shiftRegisterMode = false;
@@ -237,6 +239,7 @@ struct voiceStruct
 {
     int8_t note;
     int8_t velocity;
+    uint32_t allocationOrder;  // Track when this voice was last allocated (for voice stealing)
     // float freq;
     // float amp;
     // float decay;
@@ -677,11 +680,9 @@ int8_t getCurrentLowestNote() {
 
 void HandleMidiMessage(MidiEvent m)
 {   
-    // Only passthrough MIDI when not in shift register mode
-    if (!shiftRegisterMode) {
-        PassthroughMidiMessage(m);
-    }
-
+    // Note: MIDI passthrough is now handled directly in voice allocation code
+    // to send on the correct allocated voice channels
+    
     // to handle round robin properly, may need to handle it here in Daisy, instead of using the setting
     // on MIDI 1U
     // int8_t channel = noteCount % 4;
@@ -711,19 +712,64 @@ void HandleMidiMessage(MidiEvent m)
                 uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + m.channel + channelOffset), p.note, p.velocity};
                 hw.midi.SendMessage(bytes, 3);
             } else {
-                // Original behavior
-                envelopes[p.channel - channelOffset].gate = true;
-                voices[p.channel - channelOffset].note = p.note;
-                voices[p.channel - channelOffset].velocity = p.velocity;
-                envelopes[p.channel - channelOffset].env.Retrigger(true);
+                // Voice allocation: distribute incoming channel 1 notes across voices 0-3
+                // First try to find a free voice, otherwise steal the oldest voice
+                int8_t voiceIndex = -1;
                 
-                // Update internal oscillator frequencies for all voices
-                if (useInternalOscillators) {
-                    float freq = MidiNoteToFrequency(p.note, p.channel);
-                    int voiceIndex = p.channel - channelOffset;
-                    if (voiceIndex >= 0 && voiceIndex < 4) {
-                        voiceInterpOsc[voiceIndex].SetFreq(freq);
+                // Step 1: Look for a free voice (gate is off)
+                for (int i = 0; i < 4; i++) {
+                    if (!envelopes[i].gate) {
+                        voiceIndex = i;
+                        break;
                     }
+                }
+                
+                // Step 2: If no free voice, steal the oldest one (lowest allocationOrder)
+                if (voiceIndex == -1) {
+                    uint32_t oldestAllocation = voices[0].allocationOrder;
+                    voiceIndex = 0;
+                    for (int i = 1; i < 4; i++) {
+                        if (voices[i].allocationOrder < oldestAllocation) {
+                            oldestAllocation = voices[i].allocationOrder;
+                            voiceIndex = i;
+                        }
+                    }
+                    
+                    // Send note-off for the stolen voice
+                    if (voices[voiceIndex].note > 0) {
+                        uint8_t noteOffBytes[3] = {
+                            static_cast<uint8_t>(0x80 + voiceIndex + channelOffset), 
+                            static_cast<uint8_t>(voices[voiceIndex].note), 
+                            0
+                        };
+                        hw.midi.SendMessage(noteOffBytes, 3);
+                    }
+                }
+                
+                // Send pitch bend before note-on if tuning is enabled
+                // Send on the allocated voice channel (voiceIndex)
+                if (sendPitchBendMidi) {
+                    const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                    float centsDeviation = CalculateCentsDeviation(p.note, tuning);
+                    int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
+                    SendPitchBend(voiceIndex + channelOffset, pitchBendValue);
+                }
+                
+                // Send MIDI note-on to external devices on the allocated voice channel
+                uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + voiceIndex + channelOffset), p.note, p.velocity};
+                hw.midi.SendMessage(bytes, 3);
+                
+                // Update voice state
+                envelopes[voiceIndex].gate = true;
+                voices[voiceIndex].note = p.note;
+                voices[voiceIndex].velocity = p.velocity;
+                voices[voiceIndex].allocationOrder = voiceAllocationCounter++;
+                envelopes[voiceIndex].env.Retrigger(true);
+                
+                // Update internal oscillator frequencies
+                if (useInternalOscillators) {
+                    float freq = MidiNoteToFrequency(p.note, voiceIndex);
+                    voiceInterpOsc[voiceIndex].SetFreq(freq);
                 }
             }
 
@@ -793,12 +839,21 @@ void HandleMidiMessage(MidiEvent m)
                 uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + m.channel + channelOffset), p.note, p.velocity};
                 hw.midi.SendMessage(bytes, 3);
             } else {
-                // Original behavior
-                envelopes[p.channel - channelOffset].gate = false;
-                
-                // Clear voice data when note is released
-                voices[p.channel - channelOffset].note = 0;
-                voices[p.channel - channelOffset].velocity = 0;
+                // Voice allocation: turn off all voices playing this note
+                for (int i = 0; i < 4; i++) {
+                    if (voices[i].note == p.note) {
+                        // Send MIDI note-off to external devices on this voice's channel
+                        uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + i + channelOffset), p.note, p.velocity};
+                        hw.midi.SendMessage(bytes, 3);
+                        
+                        envelopes[i].gate = false;
+                        
+                        // Clear voice data when note is released
+                        voices[i].note = 0;
+                        voices[i].velocity = 0;
+                        voices[i].allocationOrder = 0;
+                    }
+                }
             }
             
             // update highest and lowest notes when a note is released
@@ -884,6 +939,8 @@ int main(void)
     for (int i = 0; i < 4; i++)
     {
         voices[i].note = 60;
+        voices[i].velocity = 0;
+        voices[i].allocationOrder = 0;
 
         // pluck init
         // plucks[i].decay = 1.0;
@@ -1150,6 +1207,7 @@ void ProcessEncoder()
         {
             voices[i].note = 0;
             voices[i].velocity = 0;
+            voices[i].allocationOrder = 0;
             envelopes[i].gate = false;
         }
         
