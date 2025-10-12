@@ -759,18 +759,18 @@ void HandleMidiMessage(MidiEvent m)
                 uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + voiceIndex + channelOffset), p.note, p.velocity};
                 hw.midi.SendMessage(bytes, 3);
                 
+                // Update internal oscillator frequencies BEFORE setting gate to avoid clicks
+                if (useInternalOscillators) {
+                    float freq = MidiNoteToFrequency(p.note, voiceIndex);
+                    voiceInterpOsc[voiceIndex].SetFreq(freq);
+                }
+                
                 // Update voice state
                 envelopes[voiceIndex].gate = true;
                 voices[voiceIndex].note = p.note;
                 voices[voiceIndex].velocity = p.velocity;
                 voices[voiceIndex].allocationOrder = voiceAllocationCounter++;
                 envelopes[voiceIndex].env.Retrigger(true);
-                
-                // Update internal oscillator frequencies
-                if (useInternalOscillators) {
-                    float freq = MidiNoteToFrequency(p.note, voiceIndex);
-                    voiceInterpOsc[voiceIndex].SetFreq(freq);
-                }
             }
 
             // pass highest currently held note to Intellijel via channel 16 and CC
@@ -1566,17 +1566,8 @@ static void ApplyShiftRegisterState()
         const auto& state = voice_states[i];
         if(state.active)
         {
-            if(state.needs_retrigger)
-            {
-                envelopes[i].env.Retrigger(true);
-            }
-            // Use gate_on state from the library (tracks note-on/off)
-            envelopes[i].gate  = state.gate_on;
-            voices[i].note     = static_cast<int8_t>(state.note);
-            voices[i].velocity = static_cast<int8_t>(state.velocity);
-            
-            // Update internal oscillator frequencies for all voices
-            if (useInternalOscillators && state.gate_on) {
+            // Update internal oscillator frequencies BEFORE setting gate to avoid clicks
+            if (useInternalOscillators) {
                 float freq = MidiNoteToFrequency(static_cast<int8_t>(state.note), static_cast<int8_t>(i));
                 voiceInterpOsc[i].SetFreq(freq);
             }
@@ -1588,6 +1579,15 @@ static void ApplyShiftRegisterState()
                 int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
                 SendPitchBend(static_cast<uint8_t>(i), pitchBendValue);
             }
+            
+            if(state.needs_retrigger)
+            {
+                envelopes[i].env.Retrigger(true);
+            }
+            // Use gate_on state from the library (tracks note-on/off)
+            envelopes[i].gate  = state.gate_on;
+            voices[i].note     = static_cast<int8_t>(state.note);
+            voices[i].velocity = static_cast<int8_t>(state.velocity);
         }
         else
         {
