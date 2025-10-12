@@ -8,6 +8,7 @@
 #include "hid/parameter.h"
 #include "tuning/ScalaTuning.h"
 #include "tuning/TuningCalculator.h"
+#include "ScreenUtils.h"
 
 using namespace daisy;
 using namespace daisysp;
@@ -299,9 +300,8 @@ bool      knobChanged = false;
 
 void DisplayMessage(const char* str)
 {
-    // hw.display.Fill(false);
-    hw.display.SetCursor(0, 50);
-    hw.display.WriteString(str, Font_6x8, true);
+    // Use fixed-width format to prevent overlap (21 chars fills display width with Font_6x8)
+    WriteFixedString(hw, 0, 50, 21, Font_6x8, str);
     hw.display.Update();
 }
 
@@ -1043,93 +1043,54 @@ void UpdateOled()
 {
     // hw.display.Fill(false);
 
-    hw.display.SetCursor(0, 0);
-    std::string str  = currentPanel.input1Name;
-    char*      cstr = &str[0];
-    hw.display.WriteString(cstr, Font_6x8, true);
-
-    hw.display.SetCursor(35, 0);
-    str = currentPanel.input2Name;
-    hw.display.WriteString(cstr, Font_6x8, true);
-
-    hw.display.SetCursor(70, 0);
-    str = currentPanel.input3Name;
-    hw.display.WriteString(cstr, Font_6x8, true);
-
-    hw.display.SetCursor(105, 0);
-    str = currentPanel.input4Name;
-    hw.display.WriteString(cstr, Font_6x8, true);
-
-    hw.display.SetCursor(0, 20);
-
-    str = currentPanel.name;
-    hw.display.WriteString(cstr, Font_7x10, true);
+    // Display panel input names with fixed widths to prevent overlap
+    WriteFixedString(hw, 0, 0, 5, Font_6x8, currentPanel.input1Name.c_str());
+    WriteFixedString(hw, 35, 0, 5, Font_6x8, currentPanel.input2Name.c_str());
+    WriteFixedString(hw, 70, 0, 5, Font_6x8, currentPanel.input3Name.c_str());
+    WriteFixedString(hw, 105, 0, 3, Font_6x8, currentPanel.input4Name.c_str());
     
-    // Show shift register mode indicator and BPM
-    if (shiftRegisterMode) {
-        hw.display.SetCursor(0, 35);
-        hw.display.WriteString("SHIFT", Font_6x8, true);
-    } else {
-        // erase shift text
-        hw.display.SetCursor(0, 35);
-        hw.display.WriteString("     ", Font_6x8, true);
-    }
+    // Display panel name with fixed width
+    WriteFixedString(hw, 0, 20, 12, Font_7x10, currentPanel.name.c_str());
     
-    // Show current BPM
-    hw.display.SetCursor(80, 50);
-    // Use a fixed-width format that always takes the same space
-    hw.display.SetCursor(80, 50);
-    char bpmStr[40];
-    snprintf(bpmStr, sizeof(bpmStr), "BPM:%3d", clockBpm); // Always 7 chars
-    hw.display.WriteString(bpmStr, Font_6x8, true);
+    // Show shift register mode indicator with fixed width
+    WriteFixedString(hw, 0, 35, 5, Font_6x8, shiftRegisterMode ? "SHIFT" : "");
+    
+    // Show current BPM with fixed width
+    WriteFixedStringF(hw, 80, 50, 7, Font_6x8, "BPM:%3d", clockBpm);
     
     // Show trigger sequence pattern when in TrigSeq mode
     if (currentPanel.name == "TrigSeq") {
-        hw.display.SetCursor(0, 50);
-        char seqStr[20];
-        snprintf(seqStr, sizeof(seqStr), "Step:%02d", currentSequenceStep);
-        hw.display.WriteString(seqStr, Font_6x8, true);
+        // Show step counter with fixed width
+        WriteFixedStringF(hw, 0, 50, 8, Font_6x8, "Step:%02d", currentSequenceStep);
 
-        // Show density value
+        // Show density value with fixed width
         int numTriggers = 0;
         for (int i = 0; i < TRIGGER_SEQUENCE_LENGTH; i++) {
             if (triggerSequence[i]) numTriggers++;
         }
-        hw.display.SetCursor(50, 50);
-        char densityStr[20];
-        snprintf(densityStr, sizeof(densityStr), "D:%02d", numTriggers);
-        hw.display.WriteString(densityStr, Font_6x8, true);
+        WriteFixedStringF(hw, 50, 50, 5, Font_6x8, "D:%02d", numTriggers);
         
-        // Show sequence pattern as dots
-        hw.display.SetCursor(0, 40);
+        // Show sequence pattern as dots in one fixed-width string
+        char patternStr[TRIGGER_SEQUENCE_LENGTH + 1];
         for (int i = 0; i < TRIGGER_SEQUENCE_LENGTH; i++) {
-            if (triggerSequence[i]) {
-                hw.display.WriteString("*", Font_6x8, true);
-            } else {
-                hw.display.WriteString("-", Font_6x8, true);
-            }
+            patternStr[i] = triggerSequence[i] ? '*' : '-';
         }
+        patternStr[TRIGGER_SEQUENCE_LENGTH] = '\0';
+        WriteFixedString(hw, 0, 40, TRIGGER_SEQUENCE_LENGTH, Font_6x8, patternStr);
     }
     // Show tuning information when in Tuning mode
     else if (currentPanel.name == "Tuning") {
-        // Show current tuning name
+        // Show current tuning name with fixed width (21 chars to fill display width)
         const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
-        hw.display.SetCursor(0, 35);
-        hw.display.WriteString(tuning->name, Font_6x8, true);
+        WriteFixedString(hw, 0, 35, 21, Font_6x8, tuning->name);
         
-        // Show pitch bend range
-        hw.display.SetCursor(0, 50);
-        char rangeStr[20];
-        snprintf(rangeStr, sizeof(rangeStr), "Range:%3.0fc", pitchBendRange);
-        hw.display.WriteString(rangeStr, Font_6x8, true);
+        // Show pitch bend range with fixed width
+        WriteFixedStringF(hw, 0, 50, 10, Font_6x8, "Rng:%4.0fc", pitchBendRange);
         
-        // Show MIDI and Osc status
-        hw.display.SetCursor(70, 50);
-        char statusStr[20];
-        snprintf(statusStr, sizeof(statusStr), "%s%s", 
-                sendPitchBendMidi ? "M" : "-", 
-                applyToInternalOsc ? "O" : "-");
-        hw.display.WriteString(statusStr, Font_6x8, true);
+        // Show MIDI and Osc status with fixed width
+        WriteFixedStringF(hw, 70, 50, 2, Font_6x8, "%s%s", 
+                         sendPitchBendMidi ? "M" : "-", 
+                         applyToInternalOsc ? "O" : "-");
     }
     
     // draw current knob values
