@@ -5,6 +5,7 @@
 #include <cmath>
 #include <vector>
 #include "midi/ShiftRegisterMidi.h"
+#include "midi/MidiFileWriter.h"
 #include "hid/parameter.h"
 #include "tuning/ScalaTuning.h"
 #include "tuning/TuningCalculator.h"
@@ -117,6 +118,13 @@ bool sendPitchBendMidi = true;    // Enable/disable pitch bend MIDI output
 bool applyToInternalOsc = true;   // Enable/disable tuning for internal oscillators
 int16_t currentPitchBendValues[16]; // Track pitch bend per channel (8192 = center)
 
+// SD Card and Storage variables
+bool sdCardAvailable = false;
+#define MAX_MIDI_FILES 10
+char midiFiles[MAX_MIDI_FILES][32];  // Store up to 10 MIDI filenames, max 32 chars each
+int midiFileCount = 0;
+int selectedFileIndex = 0;
+
 namespace envelope_midi = envelope::midi;
 
 struct DaisyMidiOutput : public envelope_midi::MidiOutput
@@ -191,7 +199,7 @@ struct panelStruct
     std::string     input4Name;
     float           values[4];
 };
-panelStruct displayPanels[5] = {
+panelStruct displayPanels[6] = {
     { 
         name: "ADSR", 
         input1Name: "A", 
@@ -231,6 +239,14 @@ panelStruct displayPanels[5] = {
         input3Name: "MIDI",
         input4Name: "Osc",
         values: {0.0f, 0.0f, 1.0f, 1.0f}
+    },
+    {
+        name: "Storage",
+        input1Name: "File",
+        input2Name: "",
+        input3Name: "",
+        input4Name: "",
+        values: {0.0f, 0.0f, 0.0f, 0.0f}
     }
 };
 int panelModesCount = sizeof(displayPanels) / sizeof(displayPanels[0]);
@@ -889,6 +905,44 @@ void HandleMidiMessage(MidiEvent m)
     }
 }
 
+// Function to scan SD card for .mid files
+void ScanForMidiFiles()
+{
+    midiFileCount = 0;
+    selectedFileIndex = 0;
+    
+    if(!sdCardAvailable)
+    {
+        return;
+    }
+    
+    DIR dir;
+    FILINFO fno;
+    
+    // Open root directory
+    if(f_opendir(&dir, "/") == FR_OK)
+    {
+        // Read directory entries
+        while(f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != 0)
+        {
+            // Check if this is a .mid file
+            size_t len = strlen(fno.fname);
+            if(len > 4 && midiFileCount < MAX_MIDI_FILES)
+            {
+                const char* ext = &fno.fname[len - 4];
+                if(strcmp(ext, ".mid") == 0 || strcmp(ext, ".MID") == 0)
+                {
+                    // Copy filename to our list
+                    strncpy(midiFiles[midiFileCount], fno.fname, 31);
+                    midiFiles[midiFileCount][31] = '\0';  // Ensure null termination
+                    midiFileCount++;
+                }
+            }
+        }
+        f_closedir(&dir);
+    }
+}
+
 int main(void)
 {
     float samplerate;
@@ -896,6 +950,76 @@ int main(void)
     hw.Init();
 
     samplerate = hw.AudioSampleRate();
+
+    // Initialize SD Card (with error handling for incompatible cards)
+    sdCardAvailable = false;
+    bool sd_init_attempted = false;
+    
+    // Try SD card initialization with timeout protection
+    SdmmcHandler::Config sd_cfg;
+    sd_cfg.Defaults();
+    sd_cfg.speed = SdmmcHandler::Speed::SLOW;  // Use slow speed for better compatibility
+    
+    // Only attempt if we can initialize the handler
+    SdmmcHandler::Result sd_result = sdcard.Init(sd_cfg);
+    
+    if(sd_result == SdmmcHandler::Result::OK)
+    {
+        sd_init_attempted = true;
+        FatFSInterface::Config fsi_config;
+        fsi_config.media = FatFSInterface::Config::MEDIA_SD;
+        fsi.Init(fsi_config);
+        
+        // Delay to ensure SD card is ready
+        System::Delay(200);
+        
+        // Try to mount with immediate mode (don't force mount)
+        FATFS& fs = fsi.GetSDFileSystem();
+        FRESULT mount_result = f_mount(&fs, "/", 0);  // 0 = don't mount immediately
+        
+        if(mount_result == FR_OK)
+        {
+            // Now try immediate mount
+            mount_result = f_mount(&fs, "/", 1);
+            
+            if(mount_result == FR_OK)
+            {
+                sdCardAvailable = true;
+                // LED blink: 1 long pulse = SD card mounted successfully
+                hw.seed.SetLed(true);
+                System::Delay(300);
+                hw.seed.SetLed(false);
+                
+                // Scan for MIDI files
+                ScanForMidiFiles();
+                
+                // LED blink: 2 quick pulses = files scanned (X files found)
+                if(midiFileCount > 0)
+                {
+                    for(int i = 0; i < 2; i++)
+                    {
+                        System::Delay(100);
+                        hw.seed.SetLed(true);
+                        System::Delay(100);
+                        hw.seed.SetLed(false);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Only blink error if we attempted but failed
+    if(sd_init_attempted && !sdCardAvailable)
+    {
+        // LED blink: 3 quick pulses = mount failed (incompatible card?)
+        for(int i = 0; i < 3; i++)
+        {
+            hw.seed.SetLed(true);
+            System::Delay(100);
+            hw.seed.SetLed(false);
+            System::Delay(100);
+        }
+    }
 
     InitEnvelopes(samplerate);
 
@@ -907,6 +1031,7 @@ int main(void)
         displayPanels[2].values[i] = hw.controls[i].Process();
         displayPanels[3].values[i] = hw.controls[i].Process();
         displayPanels[4].values[i] = hw.controls[i].Process();
+        displayPanels[5].values[i] = hw.controls[i].Process();
     }
     
     // Initialize panning panel with default values
@@ -1101,6 +1226,22 @@ void UpdateOled()
         WriteFixedStringF(hw, 70, 50, 2, Font_6x8, "%s%s", 
                          sendPitchBendMidi ? "M" : "-", 
                          applyToInternalOsc ? "O" : "-");
+    }
+    else if (currentPanel.name == "Storage") {
+        // Show SD card status
+        if(!sdCardAvailable) {
+            WriteFixedString(hw, 0, 35, 21, Font_7x10, "No SD Card");
+        }
+        else if(midiFileCount == 0) {
+            WriteFixedString(hw, 0, 35, 21, Font_7x10, "No MIDI files");
+        }
+        else {
+            // Show current file with fixed width
+            WriteFixedStringF(hw, 0, 35, 21, Font_7x10, "%d/%d", selectedFileIndex + 1, midiFileCount);
+            
+            // Show filename on next line with fixed width
+            WriteFixedString(hw, 0, 50, 21, Font_6x8, midiFiles[selectedFileIndex]);
+        }
     }
     
     // draw current knob values
@@ -1388,6 +1529,19 @@ void ProcessKnobs()
                 break;
             default:
                 break;
+        }
+    }
+    else if (currentPanel.name == "Storage")
+    {
+        // File selector knob
+        if(inputIndex == 0 && midiFileCount > 0)
+        {
+            int newFileIndex = static_cast<int>(inputs[0] * (midiFileCount - 1) + 0.5f);
+            if(newFileIndex != selectedFileIndex)
+            {
+                selectedFileIndex = newFileIndex;
+                knobChanged = true;
+            }
         }
     }
 
