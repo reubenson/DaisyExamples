@@ -91,6 +91,9 @@ float voicesMinLevel = 0.0f;
 float cvOut1;
 float cvOut2;
 float panOutput;
+float panPhase = 0.0f;  // Manual phase tracking for quadrature panning
+float panFreq = 0.2f;   // Pan LFO frequency (0-10Hz range)
+float panAmp = 1.0f;    // Pan amplitude (0 = centered, 1 = full panning)
 int8_t currentHighestNote = 0;
 int8_t lastHighestNote = 0;
 int8_t currentLowestNote = 0;
@@ -315,37 +318,40 @@ void DisplayMessage(const char* str)
 
 void PanEqualPowerStereo(float pan, float value, float* left, float* right)
 {
-    float angle = 0.25 * M_PI + pan * 0.5f * M_PI;
-    *left       = 0.5 * value * abs(cosf(angle));
-    *right      = 0.5 * value * abs(sinf(angle));
+    // Equal power panning: pan goes from -1 (full left) to +1 (full right)
+    // Angle goes from 0 to π/2 as pan goes from -1 to +1
+    float angle = (pan + 1.0f) * M_PI * 0.25f;
+    *left       = value * cosf(angle);
+    *right      = value * sinf(angle);
 }
 
 void ApplyPanning(float* data) {
     float L1, R1, L2, R2, L3, R3, L4, R4;
-    panOutput = pan.Process();
-    // float dryl, dryr, sendLeft, sendRight, wetl, wetr; // Effects Vars
-    //     dryl  = results[0] * 0.5 + results[2] * 0.5;
-    //     dryr = results[1] * 0.5 + results[3] * 0.5;
-    //     sendLeft = dryl * 0.8;
-    //     sendRight = dryr * 0.8;
-    PanEqualPowerStereo(panOutput, data[0], &L1, &R1);
-    pan.PhaseAdd(0.25f);
-    PanEqualPowerStereo(pan.Process(), data[1], &L2, &R2);
-    pan.PhaseAdd(0.25f);
-    PanEqualPowerStereo(pan.Process(), data[2], &L3, &R3);
-    pan.PhaseAdd(0.25f);
-    PanEqualPowerStereo(pan.Process(), data[3], &L4, &R4);
-    pan.PhaseAdd(0.25f);
+    
+    // Update pan phase manually to maintain control
+    panPhase += 2.0f * M_PI * panFreq / hw.AudioSampleRate();
+    if (panPhase >= 2.0f * M_PI) {
+        panPhase -= 2.0f * M_PI;
+    }
+    
+    // Calculate pan positions for each voice with fixed phase offsets
+    // Voices are evenly distributed: 0°, 90°, 180°, 270°
+    // This ensures voices 0 and 2 are opposite (hard left/right at some point in LFO cycle)
+    // and voices 1 and 3 are also opposite
+    // Scale by panAmp: 0 = all centered, 1 = full panning effect
+    float pan0 = sinf(panPhase) * panAmp;                      // Voice 0: 0° (base phase)
+    float pan1 = sinf(panPhase + M_PI * 0.5f) * panAmp;       // Voice 1: +90° = cos(phase)
+    float pan2 = sinf(panPhase + M_PI) * panAmp;              // Voice 2: +180° = -sin(phase)
+    float pan3 = sinf(panPhase + M_PI * 1.5f) * panAmp;       // Voice 3: +270° = -cos(phase)
+    
+    // Store base output for CV output
+    panOutput = pan0;
+    
+    PanEqualPowerStereo(pan0, data[0], &L1, &R1);
+    PanEqualPowerStereo(pan1, data[1], &L2, &R2);
+    PanEqualPowerStereo(pan2, data[2], &L3, &R3);
+    PanEqualPowerStereo(pan3, data[3], &L4, &R4);
 
-    // for (size_t i = 0; i < 4; i++)
-    // {
-
-        // pan.SetFreq(hw.GetKnobValue(DaisyPatch::CTRL_1) * 1000.0f);
-        // pan.SetAmp(hw.GetKnobValue(DaisyPatch::CTRL_2));
-        // pan.SetWaveform(Oscillator::WAVE_SIN);
-        // panOutput = pan.Process();
-        // data[i] = data[i] * panOutput;
-    // }
     data[0] = L1 + L2 + L3 + L4;
     data[1] = R1 + R2 + R3 + R4;
     hw.seed.dac.WriteValue(DacHandle::Channel::ONE, ((panOutput + 1.0f) / 2.0f) * 4095);
@@ -903,6 +909,10 @@ int main(void)
         displayPanels[4].values[i] = hw.controls[i].Process();
     }
     
+    // Initialize panning panel with default values
+    displayPanels[1].values[0] = 0.02f;  // Frequency (0.2Hz / 10Hz max = 0.02)
+    displayPanels[1].values[1] = 1.0f;   // Amplitude (full effect)
+    
     // Initialize tuning panel with default values
     displayPanels[4].values[0] = 0.0f;  // Tuning selector (12-TET)
     displayPanels[4].values[1] = 0.09f;  // Pitch bend range (200 cents)
@@ -1271,10 +1281,12 @@ void ProcessKnobs()
         switch(inputIndex)
         {
             case 0:
-                pan.SetFreq(inputs[0] * 1.0f);
+                // Update manual pan frequency: 0 to 10Hz range
+                panFreq = inputs[0] * 10.0f;
                 break;
             case 1:
-                pan.SetAmp(inputs[1]);
+                // Pan amplitude control: 0 = all voices centered, 1 = full panning effect
+                panAmp = inputs[1];
                 break;
             default:
                 break;
@@ -1399,8 +1411,14 @@ void ProcessControls()
 
 void InitPan(float samplerate)
 {
+    // Initialize manual pan phase tracking
+    panPhase = 0.0f;
+    panFreq = 0.2f;  // Default panning frequency (0-10Hz range via knob control)
+    panAmp = 1.0f;   // Default full amplitude (0-1 range via knob control)
+    
+    // Keep old pan oscillator initialization for potential future use
     pan.Init(samplerate);
-    pan.SetFreq(0.03f);
+    pan.SetFreq(panFreq);
     pan.SetAmp(1);
     pan.SetWaveform(Oscillator::WAVE_SIN);
 }
