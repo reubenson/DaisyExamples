@@ -149,6 +149,12 @@ uint32_t triggerOffTime = 0;
 const uint32_t TRIGGER_OFF_DELAY_MS = 50; // 10ms delay for trigger off
 bool triggerOffPending = false;
 
+// CC reset timing - for channel assignment on channel 16
+uint32_t ccResetTime = 0;
+const uint32_t CC_RESET_DELAY_MS = 500; // 500ms delay before resetting CC to lowest value
+bool ccResetPending = false;
+uint8_t lastCCValue = 2; // Track the last CC value sent (default is 2, the lowest value)
+
 // Encoder long press timing
 const float ENCODER_LONG_PRESS_MS = 1500.0f;
 bool encoderWasPressed = false;
@@ -816,8 +822,22 @@ void HandleMidiMessage(MidiEvent m)
             
             // Send the new note
             SendMidiMesssage(p.note, 15, "NOTE_ON");
+            
             // note selection is handled by sending CC signal, scaled to 0-63
-            SendMidiMesssage(p.channel * 16 + 2, 15, "CC");
+            // Calculate the CC value based on channel
+            uint8_t ccValue = p.channel * 32 + 2;
+            
+            // Only send CC if it's different from the last value sent
+            if (ccValue != lastCCValue) {
+                SendMidiMesssage(ccValue, 15, "CC");
+                lastCCValue = ccValue;
+                
+                // If the CC value is not the lowest (2), set a timer to reset it
+                if (ccValue != 2) {
+                    ccResetTime = hw.seed.system.GetNow() + CC_RESET_DELAY_MS;
+                    ccResetPending = true;
+                }
+            }
             // also send 
             // SendMidiMesssage(1, 13, "TRIGGER_ON");
             
@@ -1021,6 +1041,14 @@ int main(void)
             SendMidiMesssage(currentNote, 13, "NOTE_OFF"); // might be a bug here in currentNote changing while trigger off is pending
             // SendMidiMesssage(0, 13, "TRIGGER_OFF");
             triggerOffPending = false;
+        }
+        
+        // Check for CC reset timing - reset channel assignment CC back to lowest value (2)
+        if (ccResetPending && currentTime >= ccResetTime)
+        {
+            SendMidiMesssage(2, 15, "CC");
+            lastCCValue = 2;
+            ccResetPending = false;
         }
         
         // Check for sequence trigger off timing
