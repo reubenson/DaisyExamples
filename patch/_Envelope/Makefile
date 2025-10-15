@@ -4,7 +4,7 @@ TARGET = _Envelope
 USE_DAISYSP_LGPL = 1
 
 # Sources
-CPP_SOURCES = _Envelope.cpp ScreenUtils.cpp midi/ShiftRegisterMidi.cpp midi/MidiFileWriter.cpp tuning/ScalaTuning.cpp tuning/TuningCalculator.cpp
+CPP_SOURCES = _Envelope.cpp ScreenUtils.cpp midi/ShiftRegisterMidi.cpp midi/MidiFileWriter.cpp midi/MidiFileReader.cpp tuning/ScalaTuning.cpp tuning/TuningCalculator.cpp
 
 # Library Locations
 LIBDAISY_DIR = ../../libDaisy

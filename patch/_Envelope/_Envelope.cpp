@@ -6,6 +6,7 @@
 #include <vector>
 #include "midi/ShiftRegisterMidi.h"
 #include "midi/MidiFileWriter.h"
+#include "midi/MidiFileReader.h"
 #include "hid/parameter.h"
 #include "tuning/ScalaTuning.h"
 #include "tuning/TuningCalculator.h"
@@ -124,6 +125,18 @@ bool sdCardAvailable = false;
 char midiFiles[MAX_MIDI_FILES][32];  // Store up to 10 MIDI filenames, max 32 chars each
 int midiFileCount = 0;
 int selectedFileIndex = 0;
+
+// MIDI File Playback variables
+bool midiPlaybackEnabled = false;
+uint32_t midiPlaybackTick = 0;
+uint32_t lastMidiEventTime = 0;
+MidiFileReader midiReader;
+uint32_t midiTickInterval = 0;  // Microseconds per tick
+bool midiFileLoaded = false;  // Track if file has been loaded for this session
+
+// Debug variables for MIDI event tracking
+char lastMidiEvent[32] = "None";
+uint32_t lastMidiEventTick = 0;
 
 namespace envelope_midi = envelope::midi;
 
@@ -245,7 +258,7 @@ panelStruct displayPanels[6] = {
         input1Name: "File",
         input2Name: "",
         input3Name: "",
-        input4Name: "",
+        input4Name: "Play",
         values: {0.0f, 0.0f, 0.0f, 0.0f}
     }
 };
@@ -306,6 +319,12 @@ void      UpdateTriggerSequence();
 void      AdvanceSequenceStep();
 void      GenerateEuclideanRhythm(int numTriggers, int numSteps, bool* pattern);
 void      BuildPattern(int level, std::vector<bool>& result, const std::vector<int>& count, const std::vector<int>& remainder);
+
+// MIDI File Playback functions
+void      UpdateMidiPlayback();
+void      StartMidiPlayback();
+void      StopMidiPlayback();
+bool      TestMidiFileRead();
 
 // Shift Register Mode functions
 void      AddNoteToQueue(int8_t note, int8_t velocity);
@@ -1165,6 +1184,9 @@ int main(void)
         // Update trigger sequence
         UpdateTriggerSequence();
 
+        // Update MIDI file playback
+        UpdateMidiPlayback();
+
         // envelopes[p.channel].trig = true;
 
         // Prepare buffers for sampler as needed
@@ -1228,7 +1250,20 @@ void UpdateOled()
                          applyToInternalOsc ? "O" : "-");
     }
     else if (currentPanel.name == "Storage") {
-        // Show SD card status
+        // Show playback status and debug info at the top
+        if(midiPlaybackEnabled) {
+            WriteFixedString(hw, 0, 0, 21, Font_7x10, "Playing");
+            // Show debug info
+            WriteFixedStringF(hw, 0, 15, 21, Font_6x8, "Tick:%ld", midiPlaybackTick);
+            // Show last MIDI event
+            WriteFixedStringF(hw, 0, 25, 21, Font_6x8, "%s@%ld", lastMidiEvent, lastMidiEventTick);
+        } else {
+            WriteFixedString(hw, 0, 0, 21, Font_7x10, "Stopped");
+            // Show knob 4 value for debugging
+            WriteFixedStringF(hw, 0, 15, 21, Font_6x8, "Knob4:%.2f", currentPanel.values[3]);
+        }
+        
+        // Show SD card status below
         if(!sdCardAvailable) {
             WriteFixedString(hw, 0, 35, 21, Font_7x10, "No SD Card");
         }
@@ -1541,6 +1576,33 @@ void ProcessKnobs()
             {
                 selectedFileIndex = newFileIndex;
                 knobChanged = true;
+            }
+        }
+        
+        // Playback control knob (knob 4)
+        if(inputIndex == 3)
+        {
+            bool shouldPlay = inputs[3] >= 0.5f;
+            
+            // Debug: show knob value and file count
+            char debugMsg[64];
+            snprintf(debugMsg, sizeof(debugMsg), "Knob4:%.2f Files:%d", inputs[3], midiFileCount);
+            DisplayMessage(debugMsg);
+            
+            if(shouldPlay && !midiPlaybackEnabled)
+            {
+                if(midiFileCount > 0)
+                {
+                    StartMidiPlayback();
+                }
+                else
+                {
+                    DisplayMessage("No MIDI files found!");
+                }
+            }
+            else if(!shouldPlay && midiPlaybackEnabled)
+            {
+                StopMidiPlayback();
             }
         }
     }
@@ -1865,6 +1927,219 @@ void BuildPattern(int level, std::vector<bool>& result, const std::vector<int>& 
         }
         if (remainder[level] != 0) {
             BuildPattern(level - 2, result, count, remainder);
+        }
+    }
+}
+
+// MIDI File Playback Implementation
+bool TestMidiFileRead()
+{
+    if(midiFileCount == 0 || selectedFileIndex >= midiFileCount)
+    {
+        DisplayMessage("No files available");
+        return false;
+    }
+    
+    DisplayMessage("Testing file open...");
+    
+    // Use exact same pattern as MidiFileReader::LoadFile()
+    FIL file;
+    FRESULT res = f_open(&file, midiFiles[selectedFileIndex], FA_READ);
+    
+    if(res != FR_OK)
+    {
+        char errorMsg[32];
+        snprintf(errorMsg, sizeof(errorMsg), "Open failed: %d", res);
+        DisplayMessage(errorMsg);
+        return false;
+    }
+    
+    DisplayMessage("File opened!");
+    
+    // Try to read just 1 byte
+    uint8_t buffer[1];
+    UINT bytesRead;
+    
+    res = f_read(&file, buffer, 1, &bytesRead);
+    f_close(&file);
+    
+    if(res != FR_OK)
+    {
+        char errorMsg[32];
+        snprintf(errorMsg, sizeof(errorMsg), "Read failed: %d", res);
+        DisplayMessage(errorMsg);
+        return false;
+    }
+    
+    char successMsg[32];
+    snprintf(successMsg, sizeof(successMsg), "Read: %d bytes", bytesRead);
+    DisplayMessage(successMsg);
+    
+    return true;
+}
+
+void StartMidiPlayback()
+{
+    DisplayMessage("Starting MIDI playback...");
+    midiPlaybackEnabled = true;  // Enable flag to trigger test in main loop
+}
+
+void StopMidiPlayback()
+{
+    if(midiPlaybackEnabled)
+    {
+        midiPlaybackEnabled = false;
+
+        // Send all notes off on all channels
+        for(int channel = 0; channel < 16; channel++)
+        {
+            uint8_t allNotesOff[3] = {static_cast<uint8_t>(0xB0 + channel), 123, 0}; // CC 123 = All Notes Off
+            hw.midi.SendMessage(allNotesOff, 3);
+        }
+
+        DisplayMessage("MIDI Playback Stopped");
+    }
+    
+    // Reset the file loaded flag so file loading can happen again
+    midiFileLoaded = false;
+}
+
+void UpdateMidiPlayback()
+{
+    if(!midiPlaybackEnabled)
+    {
+        return;
+    }
+    
+    // If we just enabled playback, initialize the test sequence
+    if(!midiFileLoaded)
+    {
+        midiFileLoaded = true;
+        
+        // Initialize playback variables for test sequence
+        midiPlaybackTick = 0;
+        lastMidiEventTime = hw.seed.system.GetNow();
+        
+        // Calculate tick interval based on current BPM (120 BPM default)
+        uint32_t microsecondsPerQuarterNote = 60000000 / clockBpm;
+        midiTickInterval = microsecondsPerQuarterNote / 480; // 480 ticks per quarter note
+        
+        // Initialize debug tracking
+        snprintf(lastMidiEvent, sizeof(lastMidiEvent), "BPM:%ld Int:%ld", clockBpm, midiTickInterval);
+        lastMidiEventTick = 0;
+        
+        return; // Don't do playback yet, just initialize
+    }
+    
+    // Now do actual playback - using test sequence since SD card reading hangs
+    uint32_t currentTime = hw.seed.system.GetNow();
+    
+    // Calculate how many ticks have elapsed since last update
+    uint32_t elapsedMicroseconds = currentTime - lastMidiEventTime;
+    uint32_t ticksElapsed = elapsedMicroseconds / midiTickInterval;
+    
+    // Debug: show timing info every update for now
+    static uint32_t debugCounter = 0;
+    debugCounter++;
+    if(debugCounter % 100 == 0) // Every 100 updates
+    {
+        snprintf(lastMidiEvent, sizeof(lastMidiEvent), "Elapsed:%ld Ticks:%ld", elapsedMicroseconds, ticksElapsed);
+        lastMidiEventTick = midiPlaybackTick;
+    }
+    
+    // Debug: show we're in playback mode
+    static uint32_t lastDebugTick = 0;
+    if(midiPlaybackTick - lastDebugTick >= 960) // Every half note
+    {
+        char debugMsg[32];
+        snprintf(debugMsg, sizeof(debugMsg), "Playback: %d", midiPlaybackTick);
+        DisplayMessage(debugMsg);
+        lastDebugTick = midiPlaybackTick;
+    }
+    
+    // Debug: show when we check ticksElapsed
+    static uint32_t lastTickCheckDebug = 0;
+    if(midiPlaybackTick - lastTickCheckDebug >= 60) // Every sixteenth note
+    {
+        snprintf(lastMidiEvent, sizeof(lastMidiEvent), "TickCheck:%ld", ticksElapsed);
+        lastMidiEventTick = midiPlaybackTick;
+        lastTickCheckDebug = midiPlaybackTick;
+    }
+    
+    if(ticksElapsed > 0)
+    {
+        midiPlaybackTick += ticksElapsed;
+        lastMidiEventTime = currentTime;
+        
+        // Debug: show when ticks are processed
+        static uint32_t lastTickDebug = 0;
+        if(midiPlaybackTick - lastTickDebug >= 240) // Every eighth note
+        {
+            snprintf(lastMidiEvent, sizeof(lastMidiEvent), "Ticks:%ld", ticksElapsed);
+            lastMidiEventTick = midiPlaybackTick;
+            lastTickDebug = midiPlaybackTick;
+        }
+        
+        // Simple test sequence: play a note every 480 ticks (quarter note)
+        static uint32_t lastNoteTick = 0;
+        static bool noteOn = false;
+        
+        // Debug: show when we enter the note generation section
+        static uint32_t lastNoteSectionDebug = 0;
+        if(midiPlaybackTick - lastNoteSectionDebug >= 60) // Every sixteenth note
+        {
+            snprintf(lastMidiEvent, sizeof(lastMidiEvent), "InNoteSection:%ld", midiPlaybackTick);
+            lastMidiEventTick = midiPlaybackTick;
+            lastNoteSectionDebug = midiPlaybackTick;
+        }
+        
+        if(midiPlaybackTick - lastNoteTick >= 480)
+        {
+            lastNoteTick = midiPlaybackTick;
+            
+            if(!noteOn)
+            {
+                // Create a MIDI NoteOn event
+                MidiEvent testEvent;
+                testEvent.type = NoteOn;
+                testEvent.channel = 0;
+                testEvent.data[0] = 60; // Middle C
+                testEvent.data[1] = 100; // Velocity
+                
+                // Route through existing MIDI handling infrastructure
+                HandleMidiMessage(testEvent);
+                
+                // Store debug info for persistent display
+                snprintf(lastMidiEvent, sizeof(lastMidiEvent), "NoteOn:60");
+                lastMidiEventTick = midiPlaybackTick;
+                
+                noteOn = true;
+            }
+            else
+            {
+                // Create a MIDI NoteOff event
+                MidiEvent testEvent;
+                testEvent.type = NoteOff;
+                testEvent.channel = 0;
+                testEvent.data[0] = 60; // Middle C
+                testEvent.data[1] = 0; // Velocity (should be 0 for NoteOff)
+                
+                // Route through existing MIDI handling infrastructure
+                HandleMidiMessage(testEvent);
+                
+                // Store debug info for persistent display
+                snprintf(lastMidiEvent, sizeof(lastMidiEvent), "NoteOff:60");
+                lastMidiEventTick = midiPlaybackTick;
+                
+                noteOn = false;
+            }
+        }
+        
+        // Loop every 4 quarter notes (1920 ticks)
+        if(midiPlaybackTick >= 1920)
+        {
+            midiPlaybackTick = 0;
+            lastNoteTick = 0;
         }
     }
 }
