@@ -151,9 +151,10 @@ bool triggerOffPending = false;
 
 // CC reset timing - for channel assignment on channel 16
 uint32_t ccResetTime = 0;
-const uint32_t CC_RESET_DELAY_MS = 500; // 500ms delay before resetting CC to lowest value
+const uint32_t CC_RESET_DELAY_MS = 100; // delay before resetting CC to lowest value
 bool ccResetPending = false;
-uint8_t lastCCValue = 2; // Track the last CC value sent (default is 2, the lowest value)
+uint8_t lowestCCValue = 4; // Lowest CC value (for voice 0)
+uint8_t lastCCValue = 4; // Track the last CC value sent (default is 4, the lowest value for channel 0)
 
 // Encoder long press timing
 const float ENCODER_LONG_PRESS_MS = 1500.0f;
@@ -535,6 +536,9 @@ void InitEnvelopes(float samplerate)
         // Initialize envelope objects
         envelopes[i].env.Init(samplerate);
         
+        // Initialize gate state to false (no notes playing initially)
+        envelopes[i].gate = false;
+        
         // Set initial ADSR values - these will be updated by ProcessKnobs based on current panel
         // for some reason this is currently not working
         envelopes[i].env.SetTime(ADSR_SEG_ATTACK, 0.0001f);    // 1ms attack
@@ -724,39 +728,44 @@ void HandleMidiMessage(MidiEvent m)
                 uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + m.channel + channelOffset), p.note, p.velocity};
                 hw.midi.SendMessage(bytes, 3);
             } else {
-                // Voice allocation: distribute incoming channel 1 notes across voices 0-3
-                // First try to find a free voice, otherwise steal the oldest voice
+                // Voice allocation: Round-robin distribution across voices 0-3
                 int8_t voiceIndex = -1;
                 
-                // Step 1: Look for a free voice (gate is off)
-                for (int i = 0; i < 4; i++) {
-                    if (!envelopes[i].gate) {
-                        voiceIndex = i;
-                        break;
-                    }
-                }
-                
-                // Step 2: If no free voice, steal the oldest one (lowest allocationOrder)
-                if (voiceIndex == -1) {
-                    uint32_t oldestAllocation = voices[0].allocationOrder;
-                    voiceIndex = 0;
-                    for (int i = 1; i < 4; i++) {
-                        if (voices[i].allocationOrder < oldestAllocation) {
-                            oldestAllocation = voices[i].allocationOrder;
+                // Step 1: Try the next voice in round-robin sequence if it's free
+                if (!envelopes[nextVoiceIndex].gate) {
+                    voiceIndex = nextVoiceIndex;
+                } else {
+                    // Step 2: If next voice is busy, search for any free voice
+                    bool foundFree = false;
+                    for (int i = 0; i < 4; i++) {
+                        if (!envelopes[i].gate) {
                             voiceIndex = i;
+                            foundFree = true;
+                            break;
                         }
                     }
                     
-                    // Send note-off for the stolen voice
-                    if (voices[voiceIndex].note > 0) {
-                        uint8_t noteOffBytes[3] = {
-                            static_cast<uint8_t>(0x80 + voiceIndex + channelOffset), 
-                            static_cast<uint8_t>(voices[voiceIndex].note), 
-                            0
-                        };
-                        hw.midi.SendMessage(noteOffBytes, 3);
+                    // Step 3: If no free voice, use the next voice in round-robin (voice stealing)
+                    if (!foundFree) {
+                        voiceIndex = nextVoiceIndex;
+                        
+                        // Send note-off for the stolen voice
+                        if (voices[voiceIndex].note > 0) {
+                            uint8_t noteOffBytes[3] = {
+                                static_cast<uint8_t>(0x80 + voiceIndex + channelOffset), 
+                                static_cast<uint8_t>(voices[voiceIndex].note), 
+                                0
+                            };
+                            hw.midi.SendMessage(noteOffBytes, 3);
+                        }
                     }
                 }
+                
+                // Store the allocated voice channel
+                p.channel = voiceIndex;
+                
+                // Advance round-robin index for next note
+                nextVoiceIndex = (voiceIndex + 1) % 4;
                 
                 // Send pitch bend before note-on if tuning is enabled
                 // Send on the allocated voice channel (voiceIndex)
@@ -823,23 +832,26 @@ void HandleMidiMessage(MidiEvent m)
             // Send the new note
             SendMidiMesssage(p.note, 15, "NOTE_ON");
             
-            // note selection is handled by sending CC signal, scaled to 0-63
-            // Calculate the CC value based on channel
-            uint8_t ccValue = p.channel * 32 + 2;
+            // note selection is handled by sending CC signal
+            // Calculate the CC value based on allocated voice channel (0-3)
+            // Channels 0-3 map to CC values: 4, 20, 36, 52 (all within MIDI range 0-127)
+            uint8_t ccValue = p.channel * 16 + lowestCCValue;
             
             // Only send CC if it's different from the last value sent
             if (ccValue != lastCCValue) {
                 SendMidiMesssage(ccValue, 15, "CC");
                 lastCCValue = ccValue;
                 
-                // If the CC value is not the lowest (2), set a timer to reset it
-                if (ccValue != 2) {
+                // If the CC value is not the lowest (160), set a timer to reset it
+                if (ccValue != lowestCCValue) {
                     ccResetTime = hw.seed.system.GetNow() + CC_RESET_DELAY_MS;
                     ccResetPending = true;
                 }
             }
-            // also send 
-            // SendMidiMesssage(1, 13, "TRIGGER_ON");
+            
+            // Send trigger on channel 15 after CC to ensure consumer sees updated CC value
+            // Using a fixed trigger note (e.g., C3 = 60) for triggering
+            SendMidiMesssage(60, 15, "TRIGGER_ON");
             
             // Set timer for trigger off after 10ms delay
             triggerOffTime = hw.seed.system.GetNow() + TRIGGER_OFF_DELAY_MS;
@@ -1038,23 +1050,23 @@ int main(void)
         // Check for trigger off timing
         if (triggerOffPending && currentTime >= triggerOffTime)
         {
-            SendMidiMesssage(currentNote, 13, "NOTE_OFF"); // might be a bug here in currentNote changing while trigger off is pending
-            // SendMidiMesssage(0, 13, "TRIGGER_OFF");
+            // Send trigger off on channel 15 (matches the trigger on sent earlier)
+            SendMidiMesssage(60, 15, "TRIGGER_OFF");
             triggerOffPending = false;
         }
         
-        // Check for CC reset timing - reset channel assignment CC back to lowest value (2)
+        // Check for CC reset timing - reset channel assignment CC back to lowest value (4)
         if (ccResetPending && currentTime >= ccResetTime)
         {
-            SendMidiMesssage(2, 15, "CC");
-            lastCCValue = 2;
+            SendMidiMesssage(lowestCCValue, 15, "CC");
+            lastCCValue = lowestCCValue;
             ccResetPending = false;
         }
         
         // Check for sequence trigger off timing
         if (sequenceTriggerOffPending && currentTime >= sequenceTriggerOffTime)
         {
-            SendMidiMesssage(triggerNote, 9, "TRIGGER_OFF");
+            SendMidiMesssage(triggerNote, 15, "TRIGGER_OFF");
             sequenceTriggerOffPending = false;
         }
 
@@ -1669,7 +1681,8 @@ void AdvanceSequenceStep()
     // Check if current step should trigger
     if (triggerSequence[currentSequenceStep]) {
         // Send trigger on MIDI channel 10 (channel 9 in 0-based indexing)
-        SendMidiMesssage(triggerNote, 9, "TRIGGER_ON");
+        SendMidiMesssage(127, 15, "CC");
+        SendMidiMesssage(triggerNote, 15, "TRIGGER_ON");
 
         // Schedule trigger off after a short duration (50ms)
         sequenceTriggerOffTime = hw.seed.system.GetNow() + 50;
