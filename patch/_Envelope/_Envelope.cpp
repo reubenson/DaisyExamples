@@ -417,8 +417,8 @@ void ApplyVCAs(float* data) {
     for (size_t i = 0; i < 4; i++) {
         // char message[60];
         // snprintf(message, 60, "val: %d", voices[i].note);
-        float velocityFactor = (voices[i].velocity > 0) ? voices[i].velocity / 127.0f : 0.0f;
-        envVal = std::max(envelopes[i].envSig * velocityFactor, voicesMinLevel);
+        // Use envelope signal directly - velocity scaling is handled by sustain level
+        envVal = std::max(envelopes[i].envSig, voicesMinLevel);
         data[i] = data[i] * envVal;
 
         if (envVal > envMax)
@@ -542,8 +542,8 @@ void InitEnvelopes(float samplerate)
         // Set initial ADSR values - these will be updated by ProcessKnobs based on current panel
         // for some reason this is currently not working
         envelopes[i].env.SetTime(ADSR_SEG_ATTACK, 0.0001f);    // 1ms attack
-        envelopes[i].env.SetTime(ADSR_SEG_DECAY, 0.5f);        // 500ms decay
-        envelopes[i].env.SetTime(ADSR_SEG_RELEASE, 0.5f);       // 200ms release
+        envelopes[i].env.SetTime(ADSR_SEG_DECAY, 2.5f);        // 500ms decay
+        envelopes[i].env.SetTime(ADSR_SEG_RELEASE, 2.5f);       // 200ms release
         envelopes[i].env.SetSustainLevel(1.0f);                 // 100% sustain
     }
 }
@@ -791,6 +791,14 @@ void HandleMidiMessage(MidiEvent m)
                 voices[voiceIndex].note = p.note;
                 voices[voiceIndex].velocity = p.velocity;
                 voices[voiceIndex].allocationOrder = voiceAllocationCounter++;
+                
+                // Set velocity-scaled sustain level before retriggering
+                float sustainKnobValue = hw.controls[2].Process(); // Read sustain knob directly
+                float baseSustainLevel = 0.01f * powf(100.0f, sustainKnobValue);
+                float velocityFactor = p.velocity / 127.0f;
+                float velocityScaledSustain = baseSustainLevel * velocityFactor;
+                envelopes[voiceIndex].env.SetSustainLevel(velocityScaledSustain);
+                
                 envelopes[voiceIndex].env.Retrigger(true);
             }
 
@@ -934,11 +942,11 @@ int main(void)
     // Initialize display panel values with current knob positions
     for(int i = 0; i < 4; i++)
     {
-        displayPanels[0].values[i] = hw.controls[i].Process();
-        displayPanels[1].values[i] = hw.controls[i].Process();
-        displayPanels[2].values[i] = hw.controls[i].Process();
-        displayPanels[3].values[i] = hw.controls[i].Process();
-        displayPanels[4].values[i] = hw.controls[i].Process();
+        // displayPanels[0].values[i] = hw.controls[i].Process();
+        // displayPanels[1].values[i] = hw.controls[i].Process();
+        // displayPanels[2].values[i] = hw.controls[i].Process();
+        // displayPanels[3].values[i] = hw.controls[i].Process();
+        // displayPanels[4].values[i] = hw.controls[i].Process();
     }
     
     // Initialize panning panel with default values
@@ -1099,6 +1107,26 @@ void UpdateOled()
     WriteFixedString(hw, 70, 0, 5, Font_6x8, currentPanel.input3Name.c_str());
     WriteFixedString(hw, 105, 0, 3, Font_6x8, currentPanel.input4Name.c_str());
     
+    // Draw horizontal meters for each knob (1 pixel high, 0-20 pixels wide)
+    int meterY = 9;  // Position just below the label text (Font_6x8 is 8 pixels high)
+    int meterPositions[4] = {0, 35, 70, 105};  // Match label x positions
+    int maxMeterWidth = 20;  // Maximum meter width in pixels
+
+    for (int i = 0; i < 4; i++)
+    {
+        // Clear the meter area first (draw black line to erase previous meter)
+        hw.display.DrawLine(meterPositions[i], meterY, meterPositions[i] + maxMeterWidth, meterY, false);
+        
+        // Draw the stored panel value (not current knob position)
+        float val = displayPanels[panelMode].values[i];
+        int meterWidth = static_cast<int>(val * maxMeterWidth);  // Scale 0.0-1.0 to 0-20 pixels
+        meterWidth = std::max(0, std::min(meterWidth, maxMeterWidth));  // Clamp to 0-20 range
+        
+        if (meterWidth > 0) {
+            hw.display.DrawLine(meterPositions[i], meterY, meterPositions[i] + meterWidth, meterY, true);
+        }
+    }
+    
     // Display panel name with fixed width
     WriteFixedString(hw, 0, 20, 12, Font_7x10, currentPanel.name.c_str());
     
@@ -1233,6 +1261,13 @@ void ProcessEncoder()
             // Short press - cycle through panel modes
             panelMode = (panelMode + 1) % panelModesCount;
             currentPanel = displayPanels[panelMode];
+            
+            // Update current panel values to reflect current knob positions
+            for (int i = 0; i < 4; i++)
+            {
+                currentPanel.values[i] = hw.controls[i].Process();
+            }
+            
             UpdateOled();
         }
         
@@ -1255,10 +1290,11 @@ void ProcessKnobs()
         if (fabs(inputs[i] - previousKnobState[i]) > knobThreshold)
         {
             inputIndex = i;
-            if (inputs[i] > 0.1f) {
+            // if (inputs[i] > 0.1f) {
                 currentPanel.values[i] = inputs[i];
+                displayPanels[panelMode].values[i] = inputs[i]; // Also update stored panel values
                 knobChanged = true;
-            }
+            // }
         }
     }
 
@@ -1295,7 +1331,7 @@ void ProcessKnobs()
                 case 1:
                     // Decay/Release: logarithmic scaling 0.001s to 5.0s
                     {
-                        float decayTime = 0.001f * powf(5000.0f, inputs[1]);
+                        float decayTime = 0.001f * powf(3000.0f, inputs[1]);
                         envelopes[i].env.SetTime(ADSR_SEG_DECAY, decayTime);
                         envelopes[i].env.SetTime(ADSR_SEG_RELEASE, decayTime);
                     }
@@ -1601,6 +1637,13 @@ static void ApplyShiftRegisterState()
             
             if(state.needs_retrigger)
             {
+                // Set velocity-scaled sustain level before retriggering
+                float sustainKnobValue = hw.controls[2].Process(); // Read sustain knob directly
+                float baseSustainLevel = 0.01f * powf(100.0f, sustainKnobValue);
+                float velocityFactor = state.velocity / 127.0f;
+                float velocityScaledSustain = baseSustainLevel * velocityFactor;
+                envelopes[i].env.SetSustainLevel(velocityScaledSustain);
+                
                 envelopes[i].env.Retrigger(true);
             }
             // Use gate_on state from the library (tracks note-on/off)
