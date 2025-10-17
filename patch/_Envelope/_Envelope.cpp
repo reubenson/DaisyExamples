@@ -105,6 +105,14 @@ uint32_t voiceAllocationCounter = 0;  // Counter to track voice allocation order
 // Shift Register Mode
 bool shiftRegisterMode = false;
 
+// Sequencer Mode
+enum SequencerMode { KEYBOARD_MODE, SEQUENCER_MODE };
+SequencerMode currentSequencerMode = KEYBOARD_MODE;
+std::vector<uint8_t> sequencerNotes;  // Array of held notes for sequencer
+bool sequencerNotesAscending = true;  // Note ordering direction
+uint8_t sequencerNoteIndex = 0;  // Current index in sequencer notes array
+float sequencerNoteLengthPercent = 0.5f;  // Note length as percentage of step (10%-90%)
+
 // option to use internal oscillators for voices 1 and 3
 bool useInternalOscillators = true;
 
@@ -185,8 +193,14 @@ uint8_t triggerNote = 36;  // MIDI note for triggers (C2)
 uint32_t sequenceTriggerOffTime = 0;
 bool sequenceTriggerOffPending = false;
 
+// Sequencer note-off timing
+uint32_t sequencerNoteOffTime = 0;
+bool sequencerNoteOffPending = false;
+uint8_t sequencerNoteToTurnOff = 0;
+int8_t sequencerVoiceToTurnOff = -1;
+
 // Parameter objects for trigger sequence controls
-Parameter densityParam, noteParam, enableParam, resetParam;
+Parameter densityParam, noteParam, enableParam;
 
 struct panelStruct
 {
@@ -225,10 +239,10 @@ panelStruct displayPanels[5] = {
     {
         name: "TrigSeq",
         input1Name: "Density",
-        input2Name: "Note",
+        input2Name: "Order",
         input3Name: "Enable",
-        input4Name: "Reset",
-        values: {0.0f, 0.0f, 0.0f, 0.0f}
+        input4Name: "Length",
+        values: {0.0f, 0.0f, 0.0f, 0.5f}
     },
     {
         name: "Tuning",
@@ -302,6 +316,12 @@ void      BuildPattern(int level, std::vector<bool>& result, const std::vector<i
 void      AddNoteToQueue(int8_t note, int8_t velocity);
 void      RemoveNoteFromQueue(int8_t note);
 void      ClearAllVoices();
+
+// Sequencer Mode functions
+void      AddNoteToSequencer(uint8_t note);
+void      RemoveNoteFromSequencer(uint8_t note);
+void      SortSequencerNotes();
+void      ClearSequencerNotes();
 
 bool      knobChanged = false;
 
@@ -719,6 +739,15 @@ void HandleMidiMessage(MidiEvent m)
                 
                 uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + m.channel + channelOffset), p.note, p.velocity};
                 hw.midi.SendMessage(bytes, 3);
+            } else if (currentSequencerMode == SEQUENCER_MODE) {
+                // Sequencer mode: Add note to sequencer notes array
+                AddNoteToSequencer(p.note);
+                
+                // Don't immediately allocate voices - sequencer will trigger them
+                // Just update display
+                char message[60];
+                snprintf(message, 60, "Seq:%d Notes:%d", p.note, static_cast<int>(sequencerNotes.size()));
+                DisplayMessage(message);
             } else {
                 // Voice allocation: Round-robin distribution across voices 0-3
                 int8_t voiceIndex = -1;
@@ -876,6 +905,14 @@ void HandleMidiMessage(MidiEvent m)
                 // Also send note-off to external devices
                 uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + m.channel + channelOffset), p.note, p.velocity};
                 hw.midi.SendMessage(bytes, 3);
+            } else if (currentSequencerMode == SEQUENCER_MODE) {
+                // Sequencer mode: Remove note from sequencer notes array
+                RemoveNoteFromSequencer(p.note);
+                
+                // Update display
+                char message[60];
+                snprintf(message, 60, "Seq Off:%d Notes:%d", p.note, static_cast<int>(sequencerNotes.size()));
+                DisplayMessage(message);
             } else {
                 // Voice allocation: turn off all voices playing this note
                 for (int i = 0; i < 4; i++) {
@@ -967,11 +1004,16 @@ int main(void)
     // Initialize trigger sequence
     InitTriggerSequence();
 
+    // Initialize sequencer mode
+    sequencerNotes.clear();
+    sequencerNoteIndex = 0;
+    sequencerNotesAscending = true;
+    sequencerNoteLengthPercent = 0.5f; // Default to 50%
+
     // Initialize parameter objects for trigger sequence controls
     densityParam.Init(hw.controls[0], 0.0f, 16.5f, Parameter::LINEAR); // maybe does not actually reach the maximum value
     noteParam.Init(hw.controls[1], 36.0f, 84.0f, Parameter::LINEAR);
     enableParam.Init(hw.controls[2], 0.0f, 1.0f, Parameter::LINEAR);
-    resetParam.Init(hw.controls[3], 0.0f, 1.0f, Parameter::LINEAR);
 
     UpdateOled();
 
@@ -1005,11 +1047,10 @@ int main(void)
     }
 
     // Initialize parameters with linear scaling
-    Parameter densityParam, noteParam, enableParam, resetParam;
+    Parameter densityParam, noteParam, enableParam;
     densityParam.Init(hw.controls[0], 0.0f, 16.0f, Parameter::LINEAR);
     noteParam.Init(hw.controls[1], 36.0f, 84.0f, Parameter::LINEAR);
     enableParam.Init(hw.controls[2], 0.0f, 1.0f, Parameter::LINEAR);
-    resetParam.Init(hw.controls[3], 0.0f, 1.0f, Parameter::LINEAR);
 
     // Start the ADC and Audio Peripherals on the Hardware
     hw.StartAdc();
@@ -1055,6 +1096,28 @@ int main(void)
         {
             SendMidiMesssage(triggerNote, 15, "TRIGGER_OFF");
             sequenceTriggerOffPending = false;
+        }
+        
+        // Check for sequencer note-off timing
+        if (sequencerNoteOffPending && currentTime >= sequencerNoteOffTime)
+        {
+            if (sequencerVoiceToTurnOff >= 0) {
+                // Send MIDI note-off to external devices
+                uint8_t bytes[3] = {
+                    static_cast<uint8_t>(0x80 + sequencerVoiceToTurnOff), 
+                    sequencerNoteToTurnOff, 
+                    0
+                };
+                hw.midi.SendMessage(bytes, 3);
+                
+                // Turn off the envelope gate
+                envelopes[sequencerVoiceToTurnOff].gate = false;
+                
+                // Clear voice data
+                voices[sequencerVoiceToTurnOff].note = 0;
+                voices[sequencerVoiceToTurnOff].velocity = 0;
+            }
+            sequencerNoteOffPending = false;
         }
 
         // Check for MIDI clock timing
@@ -1110,6 +1173,9 @@ void UpdateOled()
     
     // Show trigger sequence pattern when in TrigSeq mode
     if (currentPanel.name == "TrigSeq") {
+        // Show current mode
+        WriteFixedString(hw, 0, 30, 8, Font_6x8, currentSequencerMode == KEYBOARD_MODE ? "KEYBOARD" : "SEQUENCER");
+        
         // Show step counter with fixed width
         WriteFixedStringF(hw, 0, 50, 8, Font_6x8, "Step:%02d", currentSequenceStep);
 
@@ -1127,6 +1193,23 @@ void UpdateOled()
         }
         patternStr[TRIGGER_SEQUENCE_LENGTH] = '\0';
         WriteFixedString(hw, 0, 40, TRIGGER_SEQUENCE_LENGTH, Font_6x8, patternStr);
+        
+        // Show sequencer-specific information
+        if (currentSequencerMode == SEQUENCER_MODE) {
+            // Show note ordering direction
+            WriteFixedString(hw, 80, 30, 4, Font_6x8, sequencerNotesAscending ? "ASC" : "DESC");
+            
+            // Show number of held notes
+            WriteFixedStringF(hw, 100, 30, 4, Font_6x8, "N:%d", static_cast<int>(sequencerNotes.size()));
+            
+            // Show note length percentage (10%-80% range)
+            WriteFixedStringF(hw, 0, 60, 6, Font_6x8, "Len:%d%%", static_cast<int>(sequencerNoteLengthPercent * 100));
+            
+            // Show current sequencer note index if there are notes
+            if (!sequencerNotes.empty()) {
+                WriteFixedStringF(hw, 50, 60, 6, Font_6x8, "Idx:%d", sequencerNoteIndex);
+            }
+        }
     }
     // Show tuning information when in Tuning mode
     else if (currentPanel.name == "Tuning") {
@@ -1238,6 +1321,16 @@ void ProcessEncoder()
             for (int i = 0; i < 4; i++)
             {
                 currentPanel.values[i] = hw.controls[i].Process();
+            }
+            
+            // If switching to TrigSeq panel, toggle sequencer mode
+            if (currentPanel.name == "TrigSeq") {
+                currentSequencerMode = (currentSequencerMode == KEYBOARD_MODE) ? SEQUENCER_MODE : KEYBOARD_MODE;
+                
+                // Clear sequencer notes when switching modes to prevent artifacts
+                if (currentSequencerMode == KEYBOARD_MODE) {
+                    ClearSequencerNotes();
+                }
             }
             
             UpdateOled();
@@ -1374,14 +1467,7 @@ void ProcessKnobs()
     else if (currentPanel.name == "TrigSeq")
     {
         // Process parameters continuously
-        triggerNote = static_cast<uint8_t>(noteParam.Process());
         sequenceEnabled = (enableParam.Process() > 0.5f);
-        
-        // Reset sequence (when knob is turned to max and back)
-        if (resetParam.Process() > 0.9f) {
-            currentSequenceStep = 0;
-            lastSequenceStepTime = hw.seed.system.GetNow();
-        }
         
         // Only regenerate pattern when density knob changes
         if (inputIndex == 0) {
@@ -1392,6 +1478,25 @@ void ProcessKnobs()
             // Generate Euclidean rhythm pattern
             GenerateEuclideanRhythm(numTriggers, TRIGGER_SEQUENCE_LENGTH, triggerSequence);
             knobChanged = true;
+        }
+        
+        // Handle knob 2: Note ordering control
+        if (inputIndex == 1) {
+            bool newAscending = inputs[1] < 0.5f;
+            if (newAscending != sequencerNotesAscending) {
+                sequencerNotesAscending = newAscending;
+                SortSequencerNotes(); // Re-sort existing notes
+                knobChanged = true;
+            }
+        }
+        
+        // Handle knob 4: Note length control (10% to 80% of step duration)
+        if (inputIndex == 3) {
+            float newLengthPercent = 0.1f + inputs[3] * 0.8f; // Map 0-1 to 0.1-0.8
+            if (fabs(newLengthPercent - sequencerNoteLengthPercent) > 0.01f) {
+                sequencerNoteLengthPercent = newLengthPercent;
+                knobChanged = true;
+            }
         }
     }
     else if (currentPanel.name == "Tuning")
@@ -1611,6 +1716,57 @@ void ClearAllVoices()
     ApplyShiftRegisterState();
 }
 
+// Sequencer Mode Implementation
+void AddNoteToSequencer(uint8_t note)
+{
+    // Check if note already exists
+    for (size_t i = 0; i < sequencerNotes.size(); i++) {
+        if (sequencerNotes[i] == note) {
+            return; // Note already exists, don't add duplicate
+        }
+    }
+    
+    // Add note to array
+    sequencerNotes.push_back(note);
+    
+    // Sort notes based on current ordering preference
+    SortSequencerNotes();
+    
+    // Reset sequencer note index when new notes are added
+    sequencerNoteIndex = 0;
+}
+
+void RemoveNoteFromSequencer(uint8_t note)
+{
+    // Find and remove the note
+    for (auto it = sequencerNotes.begin(); it != sequencerNotes.end(); ++it) {
+        if (*it == note) {
+            sequencerNotes.erase(it);
+            break;
+        }
+    }
+    
+    // Adjust sequencer note index if needed
+    if (!sequencerNotes.empty() && sequencerNoteIndex >= sequencerNotes.size()) {
+        sequencerNoteIndex = 0;
+    }
+}
+
+void SortSequencerNotes()
+{
+    if (sequencerNotesAscending) {
+        std::sort(sequencerNotes.begin(), sequencerNotes.end());
+    } else {
+        std::sort(sequencerNotes.begin(), sequencerNotes.end(), std::greater<uint8_t>());
+    }
+}
+
+void ClearSequencerNotes()
+{
+    sequencerNotes.clear();
+    sequencerNoteIndex = 0;
+}
+
 // Trigger Sequence Generator Implementation
 void InitTriggerSequence()
 {
@@ -1642,13 +1798,110 @@ void AdvanceSequenceStep()
 {
     // Check if current step should trigger
     if (triggerSequence[currentSequenceStep]) {
-        // Send trigger on MIDI channel 10 (channel 9 in 0-based indexing)
-        SendMidiMesssage(127, 15, "CC");
-        SendMidiMesssage(triggerNote, 15, "TRIGGER_ON");
+        if (currentSequencerMode == SEQUENCER_MODE && !sequencerNotes.empty()) {
+            // Sequencer mode: trigger next note from sequencer notes array
+            uint8_t noteToTrigger = sequencerNotes[sequencerNoteIndex];
+            
+            // Voice allocation: Round-robin distribution across voices 0-3
+            int8_t voiceIndex = -1;
+            
+            // Step 1: Try the next voice in round-robin sequence if it's free
+            if (!envelopes[nextVoiceIndex].gate) {
+                voiceIndex = nextVoiceIndex;
+            } else {
+                // Step 2: If next voice is busy, search for any free voice
+                bool foundFree = false;
+                for (int i = 0; i < 4; i++) {
+                    if (!envelopes[i].gate) {
+                        voiceIndex = i;
+                        foundFree = true;
+                        break;
+                    }
+                }
+                
+                // Step 3: If no free voice, use the next voice in round-robin (voice stealing)
+                if (!foundFree) {
+                    voiceIndex = nextVoiceIndex;
+                    
+                    // Send note-off for the stolen voice
+                    if (voices[voiceIndex].note > 0) {
+                        uint8_t noteOffBytes[3] = {
+                            static_cast<uint8_t>(0x80 + voiceIndex), 
+                            static_cast<uint8_t>(voices[voiceIndex].note), 
+                            0
+                        };
+                        hw.midi.SendMessage(noteOffBytes, 3);
+                    }
+                }
+            }
+            
+            // Advance round-robin index for next note
+            nextVoiceIndex = (voiceIndex + 1) % 4;
+            
+            // Send pitch bend before note-on if tuning is enabled
+            if (sendPitchBendMidi) {
+                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                float centsDeviation = CalculateCentsDeviation(noteToTrigger, tuning);
+                int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
+                SendPitchBend(voiceIndex, pitchBendValue);
+            }
+            
+            // Send MIDI note-on to external devices on the allocated voice channel
+            uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + voiceIndex), noteToTrigger, 127};
+            hw.midi.SendMessage(bytes, 3);
+            
+            // Update internal oscillator frequencies BEFORE setting gate to avoid clicks
+            if (useInternalOscillators) {
+                float freq = MidiNoteToFrequency(noteToTrigger, voiceIndex);
+                voiceInterpOsc[voiceIndex].SetFreq(freq);
+            }
+            
+            // Update voice state
+            envelopes[voiceIndex].gate = true;
+            voices[voiceIndex].note = noteToTrigger;
+            voices[voiceIndex].velocity = 127;
+            voices[voiceIndex].allocationOrder = voiceAllocationCounter++;
+            
+            // Set velocity-scaled sustain level before retriggering
+            float sustainKnobValue = hw.controls[2].Process(); // Read sustain knob directly
+            float baseSustainLevel = 0.01f * powf(100.0f, sustainKnobValue);
+            float velocityScaledSustain = baseSustainLevel; // Use full velocity for sequencer
+            envelopes[voiceIndex].env.SetSustainLevel(velocityScaledSustain);
+            
+            envelopes[voiceIndex].env.Retrigger(true);
+            
+            // Advance to next note in sequencer array
+            sequencerNoteIndex = (sequencerNoteIndex + 1) % sequencerNotes.size();
+            
+            // Send trigger on channel 15 after CC to ensure consumer sees updated CC value
+            SendMidiMesssage(60, 15, "TRIGGER_ON");
+            
+            // Set timer for trigger off after 10ms delay
+            triggerOffTime = hw.seed.system.GetNow() + TRIGGER_OFF_DELAY_MS;
+            triggerOffPending = true;
+            
+            // Schedule note-off based on note length percentage
+            // Ensure note-off happens well before next step to avoid timing conflicts
+            uint32_t noteOffDelay = static_cast<uint32_t>(sequenceStepInterval * sequencerNoteLengthPercent);
+            noteOffDelay = std::min(noteOffDelay, sequenceStepInterval - 10); // Leave at least 10ms before next step
+            sequencerNoteOffTime = hw.seed.system.GetNow() + noteOffDelay;
+            sequencerNoteOffPending = true;
+            sequencerNoteToTurnOff = noteToTrigger;
+            sequencerVoiceToTurnOff = voiceIndex;
+            
+            // Display current sequencer note
+            char message[60];
+            snprintf(message, 60, "Seq:%d Ch:%d", noteToTrigger, voiceIndex);
+            DisplayMessage(message);
+        } else {
+            // Original trigger behavior for keyboard mode or when no sequencer notes
+            SendMidiMesssage(127, 15, "CC");
+            SendMidiMesssage(triggerNote, 15, "TRIGGER_ON");
 
-        // Schedule trigger off after a short duration (50ms)
-        sequenceTriggerOffTime = hw.seed.system.GetNow() + 50;
-        sequenceTriggerOffPending = true;
+            // Schedule trigger off after a short duration (50ms)
+            sequenceTriggerOffTime = hw.seed.system.GetNow() + 50;
+            sequenceTriggerOffPending = true;
+        }
     }
     
     // Advance to next step
