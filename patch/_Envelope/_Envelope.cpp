@@ -1870,6 +1870,22 @@ void AdvanceSequenceStep()
             
             envelopes[voiceIndex].env.Retrigger(true);
             
+            // Calculate the CC value based on allocated voice channel (0-3)
+            // Channels 0-3 map to CC values: 4, 20, 36, 52 (all within MIDI range 0-127)
+            uint8_t ccValue = voiceIndex * 16 + lowestCCValue;
+            
+            // Only send CC if it's different from the last value sent
+            if (ccValue != lastCCValue) {
+                SendMidiMesssage(ccValue, 15, "CC");
+                lastCCValue = ccValue;
+                
+                // If the CC value is not the lowest (4), set a timer to reset it
+                if (ccValue != lowestCCValue) {
+                    ccResetTime = hw.seed.system.GetNow() + CC_RESET_DELAY_MS;
+                    ccResetPending = true;
+                }
+            }
+            
             // Advance to next note in sequencer array
             sequencerNoteIndex = (sequencerNoteIndex + 1) % sequencerNotes.size();
             
