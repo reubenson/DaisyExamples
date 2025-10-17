@@ -304,9 +304,6 @@ void      AddNoteToQueue(int8_t note, int8_t velocity);
 void      RemoveNoteFromQueue(int8_t note);
 void      ClearAllVoices();
 
-void      initOscillators(float samplerate);
-void      UpdateOscillators();
-
 bool      knobChanged = false;
 
 void DisplayMessage(const char* str)
@@ -469,8 +466,6 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // {
     //     trig = 0.0f;
     // }
-
-    // UpdateOscillators();
     
 
     float results[4];
@@ -501,9 +496,6 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         // out[0][i] = sig;
         // out[1][i] = sig;
         // }
-         
-        // UpdateOscillators();       
-
         out[0][i] = results[0];
         out[1][i] = results[1];
         
@@ -1005,17 +997,6 @@ int main(void)
     // 
     InitPan(samplerate);
     
-    // Initialize internal oscillators for voices 1 and 3
-    // voice1Osc.Init(samplerate);
-    // voice1Osc.SetFreq(440.0f);  // Default frequency
-    // voice1Osc.SetAmp(1.0f);
-    // voice1Osc.SetWaveform(Oscillator::WAVE_SIN);
-    
-    // voice3Osc.Init(samplerate);
-    // voice3Osc.SetFreq(440.0f);  // Default frequency
-    // voice3Osc.SetAmp(1.0f);
-    // voice3Osc.SetWaveform(Oscillator::WAVE_SIN);
-    
     // Initialize interpolated oscillators for all 4 voices
     for (int i = 0; i < 4; i++) {
         voiceInterpOsc[i].Init(samplerate);
@@ -1023,8 +1004,6 @@ int main(void)
         voiceInterpOsc[i].SetAmp(1.0f);
         voiceInterpOsc[i].SetWaveformParam(0.0f);  // Start with sine wave
     }
-    
-    // initOscillators(samplerate);
 
     // Initialize parameters with linear scaling
     Parameter densityParam, noteParam, enableParam, resetParam;
@@ -1489,7 +1468,6 @@ void ProcessControls()
 
     ProcessEncoder();
     ProcessKnobs();
-    // ProcessGates(); // not using this for now in 4-voice mode
 }
 
 void InitPan(float samplerate)
@@ -1504,64 +1482,6 @@ void InitPan(float samplerate)
     pan.SetFreq(panFreq);
     pan.SetAmp(1);
     pan.SetWaveform(Oscillator::WAVE_SIN);
-}
-
-// ---------------------------------------------------------------
-// more like a scratchpad below
-
-void initOscillators(float samplerate) {
-    osc1.Init(samplerate);
-    osc2.Init(samplerate);
-    lfo1.Init(samplerate);
-    lfo2.Init(samplerate);
-    lfo3.Init(samplerate);
-
-    lfo1.SetFreq(5.0f);
-    lfo1.SetAmp(1);
-    lfo1.SetWaveform(Oscillator::WAVE_SIN);
-
-    lfo2.SetFreq(5.0f);
-    lfo2.SetAmp(1);
-    lfo2.SetWaveform(Oscillator::WAVE_SIN);
-
-    lfo3.SetFreq(1.5f);
-    lfo3.SetAmp(1);
-    lfo3.SetWaveform(Oscillator::WAVE_SIN);
-}
-
-void ProcessGates()
-{
-    for(int i = 0; i < 4; i++)
-    {
-        if(hw.gate_input[i].Trig())
-        {
-            // envelopes[i].env.Retrigger(true);
-        }
-    }
-}
-
-void UpdateOscillators() {
-    float lfo1out = lfo1.Process();
-    float lfo2out = lfo2.Process();
-    float lfo3out = lfo3.Process();
-    osc1.SetIndex(0);
-    osc1.SetRatio(lfo2out + 3);
-    osc2.SetIndex(0);
-    osc2.SetRatio(lfo2out + 3);
-
-    // testing LFO out
-    hw.seed.dac.WriteValue(DacHandle::Channel::ONE,
-                    (lfo1out) * 4095);
-    hw.seed.dac.WriteValue(DacHandle::Channel::TWO,
-                    (lfo2out) * 4095);
-
-    // FM synthesis with internal oscillators doesn't seem to track well with MIDI conversion on MIDI 1U, leaving out for now
-    // revisit this when implementing note to frequency conversion
-    // float output;
-    // output = osc1.Process() * envelopes[0].envSig;
-    // out[1][i] = output;
-    // output = osc2.Process() * envelopes[1].envSig;
-    // out[3][i] = output;
 }
 
 // seems like there isn't enough processing power to run 4 ouf these in parallel
