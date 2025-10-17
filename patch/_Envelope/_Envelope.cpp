@@ -10,6 +10,11 @@
 #include "tuning/TuningCalculator.h"
 #include "ScreenUtils.h"
 
+// Font aliases for cleaner code
+#define font_s Font_6x8    // 6x8 pixels - small, good for labels and compact info
+#define font_m Font_7x10   // 7x10 pixels - medium, good for panel names
+#define font_l Font_11x18  // 11x18 pixels - large, good for emphasis
+
 using namespace daisy;
 using namespace daisysp;
 
@@ -157,11 +162,30 @@ const uint32_t TRIGGER_OFF_DELAY_MS = 50; // 10ms delay for trigger off
 bool triggerOffPending = false;
 
 // CC reset timing - for channel assignment on channel 16
-uint32_t ccResetTime = 0;
-const uint32_t CC_RESET_DELAY_MS = 100; // delay before resetting CC to lowest value
-bool ccResetPending = false;
-uint8_t lowestCCValue = 4; // Lowest CC value (for voice 0)
-uint8_t lastCCValue = 4; // Track the last CC value sent (default is 4, the lowest value for channel 0)
+const uint32_t CC_RESET_DELAY_MS = 200; // delay before resetting CC to lowest value
+uint8_t lastCCValue = 0; // Track the last CC value sent (start with lowest CC value)
+
+// CC Subdivision System variables
+uint8_t ccSlotValues[8] = {0, 18, 36, 54, 73, 91, 109, 127}; // Equally distributed CC values 0-127
+uint8_t ccSlotSubdivisions[8] = {1, 1, 1, 1, 1, 1, 1, 1}; // Default all subdivisions to 1
+uint8_t ccSlotCounters[8] = {0, 0, 0, 0, 0, 0, 0, 0}; // Track note count for each slot
+uint32_t globalNoteCounter = 0; // Increments on every note-on
+
+// CC Queue System
+struct CCQueueItem {
+    uint8_t ccValue;
+    uint32_t sendTime;
+    uint32_t holdUntil; // Time when this CC should be released
+    bool isReset; // true if this is a reset to lowest value
+};
+
+const size_t CC_QUEUE_SIZE = 16; // Maximum queue size
+CCQueueItem ccQueue[CC_QUEUE_SIZE];
+size_t ccQueueHead = 0;
+size_t ccQueueTail = 0;
+size_t ccQueueCount = 0;
+uint32_t ccLatchTime = 0; // Time when CC was last sent
+bool ccIsLatched = false; // Whether CC is currently latched to a value
 
 // Encoder long press timing
 const float ENCODER_LONG_PRESS_MS = 1500.0f;
@@ -211,7 +235,7 @@ struct panelStruct
     std::string     input4Name;
     float           values[4];
 };
-panelStruct displayPanels[5] = {
+panelStruct displayPanels[6] = {
     { 
         name: "ADSR", 
         input1Name: "A", 
@@ -251,6 +275,14 @@ panelStruct displayPanels[5] = {
         input3Name: "MIDI",
         input4Name: "Osc",
         values: {0.0f, 0.0f, 1.0f, 1.0f}
+    },
+    {
+        name: "CC Slots",
+        input1Name: "CC1-2",
+        input2Name: "CC3-4",
+        input3Name: "CC5-6",
+        input4Name: "CC7-8",
+        values: {0.0f, 0.0f, 0.0f, 0.0f}
     }
 };
 int panelModesCount = sizeof(displayPanels) / sizeof(displayPanels[0]);
@@ -304,6 +336,9 @@ void      UpdateOled();
 void      plucksApply();
 void      InitPan(float samplerate);
 void      SendPitchBend(uint8_t channel, int16_t bendValue);
+void      ProcessCCSlots();
+void      AddCCToQueue(uint8_t ccValue, bool isReset = false);
+void      ProcessCCQueue();
 
 // Trigger Sequence Generator functions
 void      InitTriggerSequence();
@@ -327,9 +362,18 @@ bool      knobChanged = false;
 
 void DisplayMessage(const char* str)
 {
-    // Use fixed-width format to prevent overlap (21 chars fills display width with Font_6x8)
-    WriteFixedString(hw, 0, 50, 21, Font_6x8, str);
+    // Use fixed-width format to prevent overlap - avoid bottom row (y=56-63) reserved for general parameters
+    // Position at y=48 to stay above bottom row
+    WriteFixedString(hw, 0, 48, 11, font_s, str);  // Reduced width to 11 chars to stay left
     hw.display.Update();
+}
+
+void ClearPanelArea()
+{
+    // Clear the panel-specific area (y=24-55) to prevent overlap when switching panels
+    // Reserve bottom row (y=56-63) for general parameters
+    // Draw black rectangles to clear the area (false = black fill)
+    hw.display.DrawRect(0, 24, 127, 55, false, true);  // Fill with black (false = black)
 }
 
 // void UpdateEnvelopes() {
@@ -745,9 +789,9 @@ void HandleMidiMessage(MidiEvent m)
                 
                 // Don't immediately allocate voices - sequencer will trigger them
                 // Just update display
-                char message[60];
-                snprintf(message, 60, "Seq:%d Notes:%d", p.note, static_cast<int>(sequencerNotes.size()));
-                DisplayMessage(message);
+                // char message[60];
+                // snprintf(message, 60, "Seq:%d Notes:%d", p.note, static_cast<int>(sequencerNotes.size()));
+                // DisplayMessage(message);
             } else {
                 // Voice allocation: Round-robin distribution across voices 0-3
                 int8_t voiceIndex = -1;
@@ -861,22 +905,8 @@ void HandleMidiMessage(MidiEvent m)
             // Send the new note
             SendMidiMesssage(p.note, 15, "NOTE_ON");
             
-            // note selection is handled by sending CC signal
-            // Calculate the CC value based on allocated voice channel (0-3)
-            // Channels 0-3 map to CC values: 4, 20, 36, 52 (all within MIDI range 0-127)
-            uint8_t ccValue = p.channel * 16 + lowestCCValue;
-            
-            // Only send CC if it's different from the last value sent
-            if (ccValue != lastCCValue) {
-                SendMidiMesssage(ccValue, 15, "CC");
-                lastCCValue = ccValue;
-                
-                // If the CC value is not the lowest (160), set a timer to reset it
-                if (ccValue != lowestCCValue) {
-                    ccResetTime = hw.seed.system.GetNow() + CC_RESET_DELAY_MS;
-                    ccResetPending = true;
-                }
-            }
+            // Process CC slots based on subdivision logic
+            ProcessCCSlots();
             
             // Send trigger on channel 15 after CC to ensure consumer sees updated CC value
             // Using a fixed trigger note (e.g., C3 = 60) for triggering
@@ -887,9 +917,9 @@ void HandleMidiMessage(MidiEvent m)
             triggerOffPending = true;
 
             // probably move outside of audio callback
-            char message[60];
-            snprintf(message, 60, "Note:%d Ch:%d", p.note, static_cast<int>(p.channel));
-            DisplayMessage(message);
+            // char message[60];
+            // snprintf(message, 60, "Note:%d Ch:%d", p.note, static_cast<int>(p.channel));
+            // DisplayMessage(message);
             
             noteCount++;
         }
@@ -910,9 +940,9 @@ void HandleMidiMessage(MidiEvent m)
                 RemoveNoteFromSequencer(p.note);
                 
                 // Update display
-                char message[60];
-                snprintf(message, 60, "Seq Off:%d Notes:%d", p.note, static_cast<int>(sequencerNotes.size()));
-                DisplayMessage(message);
+                // char message[60];
+                // snprintf(message, 60, "Seq Off:%d Notes:%d", p.note, static_cast<int>(sequencerNotes.size()));
+                // DisplayMessage(message);
             } else {
                 // Voice allocation: turn off all voices playing this note
                 for (int i = 0; i < 4; i++) {
@@ -1083,13 +1113,8 @@ int main(void)
             triggerOffPending = false;
         }
         
-        // Check for CC reset timing - reset channel assignment CC back to lowest value (4)
-        if (ccResetPending && currentTime >= ccResetTime)
-        {
-            SendMidiMesssage(lowestCCValue, 15, "CC");
-            lastCCValue = lowestCCValue;
-            ccResetPending = false;
-        }
+        // Process CC queue
+        ProcessCCQueue();
         
         // Check for sequence trigger off timing
         if (sequenceTriggerOffPending && currentTime >= sequenceTriggerOffTime)
@@ -1136,15 +1161,9 @@ void UpdateOled()
 {
     // hw.display.Fill(false);
 
-    // Display panel input names with fixed widths to prevent overlap
-    WriteFixedString(hw, 0, 0, 5, Font_6x8, currentPanel.input1Name.c_str());
-    WriteFixedString(hw, 35, 0, 5, Font_6x8, currentPanel.input2Name.c_str());
-    WriteFixedString(hw, 70, 0, 5, Font_6x8, currentPanel.input3Name.c_str());
-    WriteFixedString(hw, 105, 0, 3, Font_6x8, currentPanel.input4Name.c_str());
-    
-    // Draw horizontal meters for each knob (1 pixel high, 0-20 pixels wide)
-    int meterY = 9;  // Position just below the label text (Font_6x8 is 8 pixels high)
-    int meterPositions[4] = {0, 35, 70, 105};  // Match label x positions
+    // Draw horizontal meters for each knob (1 pixel high, 0-20 pixels wide) - MOVED TO TOP
+    int meterY = 0;  // Position at very top
+    int meterPositions[4] = {0, 32, 64, 96};  // Equal 32-pixel spacing
     int maxMeterWidth = 20;  // Maximum meter width in pixels
 
     for (int i = 0; i < 4; i++)
@@ -1162,29 +1181,28 @@ void UpdateOled()
         }
     }
     
-    // Display panel name with fixed width
-    WriteFixedString(hw, 0, 20, 12, Font_7x10, currentPanel.name.c_str());
+    // knob input labels
+    WriteFixedString(hw, 0, 2, 5, font_s, currentPanel.input1Name.c_str());
+    WriteFixedString(hw, 32, 2, 5, font_s, currentPanel.input2Name.c_str());
+    WriteFixedString(hw, 64, 2, 5, font_s, currentPanel.input3Name.c_str());
+    WriteFixedString(hw, 96, 2, 3, font_s, currentPanel.input4Name.c_str());
     
-    // Show shift register mode indicator with fixed width
-    WriteFixedString(hw, 0, 35, 5, Font_6x8, shiftRegisterMode ? "SHIFT" : "");
-    
-    // Show current BPM with fixed width
-    WriteFixedStringF(hw, 80, 50, 7, Font_6x8, "BPM:%3d", clockBpm);
+    // panel name
+    WriteFixedString(hw, 0, 12, 12, font_m, currentPanel.name.c_str());
     
     // Show trigger sequence pattern when in TrigSeq mode
     if (currentPanel.name == "TrigSeq") {
-        // Show current mode
-        WriteFixedString(hw, 0, 30, 8, Font_6x8, currentSequencerMode == KEYBOARD_MODE ? "KEYBOARD" : "SEQUENCER");
+        // Show current mode - REMOVE (now in bottom row)
         
-        // Show step counter with fixed width
-        WriteFixedStringF(hw, 0, 50, 8, Font_6x8, "Step:%02d", currentSequenceStep);
+        // Show step counter with fixed width - move to avoid bottom-right area
+        WriteFixedStringF(hw, 0, 40, 8, font_s, "Step:%02d", currentSequenceStep);
 
-        // Show density value with fixed width
+        // Show density value with fixed width - move to avoid bottom-right area
         int numTriggers = 0;
         for (int i = 0; i < TRIGGER_SEQUENCE_LENGTH; i++) {
             if (triggerSequence[i]) numTriggers++;
         }
-        WriteFixedStringF(hw, 50, 50, 5, Font_6x8, "D:%02d", numTriggers);
+        WriteFixedStringF(hw, 50, 40, 5, font_s, "D:%02d", numTriggers);
         
         // Show sequence pattern as dots in one fixed-width string
         char patternStr[TRIGGER_SEQUENCE_LENGTH + 1];
@@ -1192,38 +1210,68 @@ void UpdateOled()
             patternStr[i] = triggerSequence[i] ? '*' : '-';
         }
         patternStr[TRIGGER_SEQUENCE_LENGTH] = '\0';
-        WriteFixedString(hw, 0, 40, TRIGGER_SEQUENCE_LENGTH, Font_6x8, patternStr);
+        WriteFixedString(hw, 0, 32, TRIGGER_SEQUENCE_LENGTH, font_s, patternStr);
         
         // Show sequencer-specific information
         if (currentSequencerMode == SEQUENCER_MODE) {
-            // Show note ordering direction
-            WriteFixedString(hw, 80, 30, 4, Font_6x8, sequencerNotesAscending ? "ASC" : "DESC");
+            // Show note ordering direction - move to avoid conflicts
+            WriteFixedString(hw, 80, 32, 4, font_s, sequencerNotesAscending ? "ASC" : "DESC");
             
-            // Show number of held notes
-            WriteFixedStringF(hw, 100, 30, 4, Font_6x8, "N:%d", static_cast<int>(sequencerNotes.size()));
+            // Show number of held notes - move to avoid conflicts
+            WriteFixedStringF(hw, 100, 32, 4, font_s, "N:%d", static_cast<int>(sequencerNotes.size()));
             
-            // Show note length percentage (10%-80% range)
-            WriteFixedStringF(hw, 0, 60, 6, Font_6x8, "Len:%d%%", static_cast<int>(sequencerNoteLengthPercent * 100));
+            // Show note length percentage (10%-80% range) - REMOVE (conflicts with bottom-right)
             
-            // Show current sequencer note index if there are notes
-            if (!sequencerNotes.empty()) {
-                WriteFixedStringF(hw, 50, 60, 6, Font_6x8, "Idx:%d", sequencerNoteIndex);
-            }
+            // Show current sequencer note index if there are notes - REMOVE (conflicts with bottom-right)
         }
     }
     // Show tuning information when in Tuning mode
     else if (currentPanel.name == "Tuning") {
         // Show current tuning name with fixed width (21 chars to fill display width)
         const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
-        WriteFixedString(hw, 0, 35, 21, Font_6x8, tuning->name);
+        WriteFixedString(hw, 0, 24, 21, font_s, tuning->name);
         
         // Show pitch bend range with fixed width
-        WriteFixedStringF(hw, 0, 50, 10, Font_6x8, "Rng:%4.0fc", pitchBendRange);
+        WriteFixedStringF(hw, 0, 32, 10, font_s, "Rng:%4.0fc", pitchBendRange);
         
         // Show MIDI and Osc status with fixed width
-        WriteFixedStringF(hw, 70, 50, 2, Font_6x8, "%s%s", 
+        WriteFixedStringF(hw, 70, 40, 2, font_s, "%s%s", 
                          sendPitchBendMidi ? "M" : "-", 
                          applyToInternalOsc ? "O" : "-");
+    }
+    // Show CC Slots information when in CC Slots mode
+    else if (currentPanel.name == "CC Slots") {
+        // Show current subdivisions for each pair
+        WriteFixedStringF(hw, 0, 24, 6, font_s, "1-2:%s", ccSlotSubdivisions[0] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[0]).c_str());
+        WriteFixedStringF(hw, 40, 24, 6, font_s, "3-4:%s", ccSlotSubdivisions[2] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[2]).c_str());
+        WriteFixedStringF(hw, 80, 24, 6, font_s, "5-6:%s", ccSlotSubdivisions[4] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[4]).c_str());
+        WriteFixedStringF(hw, 0, 32, 6, font_s, "7-8:%s", ccSlotSubdivisions[6] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[6]).c_str());
+        
+        // Show global note counter and queue status - move to avoid bottom-right area
+        WriteFixedStringF(hw, 0, 40, 8, font_s, "Note:%d", globalNoteCounter);
+        WriteFixedStringF(hw, 50, 40, 4, font_s, "Q:%d", ccQueueCount);
+    }
+    
+    // === BOTTOM ROW: General State Info (always visible) ===
+    // Use entire bottom row (y=56-63) for general parameters
+    
+    // Display current note and BPM in compact format: "60|120" - left side
+    WriteFixedStringF(hw, 0, 56, 10, font_s, "%3d|%3d", currentNote, clockBpm);
+
+    // Display mode indicators - right side with proper spacing
+    // Both modes can be active simultaneously
+    if (shiftRegisterMode && currentSequencerMode == SEQUENCER_MODE) {
+        // Both modes active: show "SR SQ" with space between
+        WriteFixedString(hw, 100, 56, 5, font_s, "SR SQ");
+    } else if (shiftRegisterMode) {
+        // Only shift register mode active
+        WriteFixedString(hw, 100, 56, 2, font_s, "SR");
+    } else if (currentSequencerMode == SEQUENCER_MODE) {
+        // Only sequencer mode active
+        WriteFixedString(hw, 100, 56, 2, font_s, "SQ");
+    } else {
+        // Neither mode active - clear the area
+        WriteFixedString(hw, 100, 56, 5, font_s, "     ");  // 5 spaces to clear "SR SQ"
     }
     
     // draw current knob values
@@ -1316,6 +1364,9 @@ void ProcessEncoder()
             // Short press - cycle through panel modes
             panelMode = (panelMode + 1) % panelModesCount;
             currentPanel = displayPanels[panelMode];
+            
+            // Clear panel area to prevent overlap when switching panels
+            ClearPanelArea();
             
             // Update current panel values to reflect current knob positions
             for (int i = 0; i < 4; i++)
@@ -1543,6 +1594,66 @@ void ProcessKnobs()
                         applyToInternalOsc = newApplyOsc;
                         knobChanged = true;
                     }
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    else if (currentPanel.name == "CC Slots")
+    {
+        switch(inputIndex)
+        {
+            case 0:
+                // CC1-2 subdivision control: 0 = never (255), 1 = always (1)
+                {
+                    float knobValue = inputs[0];
+                    uint8_t subdivision;
+                    if (knobValue < 0.01f) subdivision = 255; // Never send (infinity)
+                    else subdivision = static_cast<uint8_t>(1.0f / knobValue); // Map 0.01-1.0 to 100-1
+                    
+                    ccSlotSubdivisions[0] = subdivision;
+                    ccSlotSubdivisions[1] = subdivision;
+                    knobChanged = true;
+                }
+                break;
+            case 1:
+                // CC3-4 subdivision control: 0 = never (255), 1 = always (1)
+                {
+                    float knobValue = inputs[1];
+                    uint8_t subdivision;
+                    if (knobValue < 0.01f) subdivision = 255; // Never send (infinity)
+                    else subdivision = static_cast<uint8_t>(1.0f / knobValue); // Map 0.01-1.0 to 100-1
+                    
+                    ccSlotSubdivisions[2] = subdivision;
+                    ccSlotSubdivisions[3] = subdivision;
+                    knobChanged = true;
+                }
+                break;
+            case 2:
+                // CC5-6 subdivision control: 0 = never (255), 1 = always (1)
+                {
+                    float knobValue = inputs[2];
+                    uint8_t subdivision;
+                    if (knobValue < 0.01f) subdivision = 255; // Never send (infinity)
+                    else subdivision = static_cast<uint8_t>(1.0f / knobValue); // Map 0.01-1.0 to 100-1
+                    
+                    ccSlotSubdivisions[4] = subdivision;
+                    ccSlotSubdivisions[5] = subdivision;
+                    knobChanged = true;
+                }
+                break;
+            case 3:
+                // CC7-8 subdivision control: 0 = never (255), 1 = always (1)
+                {
+                    float knobValue = inputs[3];
+                    uint8_t subdivision;
+                    if (knobValue < 0.01f) subdivision = 255; // Never send (infinity)
+                    else subdivision = static_cast<uint8_t>(1.0f / knobValue); // Map 0.01-1.0 to 100-1
+                    
+                    ccSlotSubdivisions[6] = subdivision;
+                    ccSlotSubdivisions[7] = subdivision;
+                    knobChanged = true;
                 }
                 break;
             default:
@@ -1781,6 +1892,11 @@ void InitTriggerSequence()
 
 void UpdateTriggerSequence()
 {
+    // Only run sequencer when sequencer mode is enabled
+    if (currentSequencerMode != SEQUENCER_MODE) {
+        return;
+    }
+    
     if (!sequenceEnabled) {
         return;
     }
@@ -1870,21 +1986,8 @@ void AdvanceSequenceStep()
             
             envelopes[voiceIndex].env.Retrigger(true);
             
-            // Calculate the CC value based on allocated voice channel (0-3)
-            // Channels 0-3 map to CC values: 4, 20, 36, 52 (all within MIDI range 0-127)
-            uint8_t ccValue = voiceIndex * 16 + lowestCCValue;
-            
-            // Only send CC if it's different from the last value sent
-            if (ccValue != lastCCValue) {
-                SendMidiMesssage(ccValue, 15, "CC");
-                lastCCValue = ccValue;
-                
-                // If the CC value is not the lowest (4), set a timer to reset it
-                if (ccValue != lowestCCValue) {
-                    ccResetTime = hw.seed.system.GetNow() + CC_RESET_DELAY_MS;
-                    ccResetPending = true;
-                }
-            }
+            // Process CC slots based on subdivision logic
+            ProcessCCSlots();
             
             // Advance to next note in sequencer array
             sequencerNoteIndex = (sequencerNoteIndex + 1) % sequencerNotes.size();
@@ -1906,9 +2009,9 @@ void AdvanceSequenceStep()
             sequencerVoiceToTurnOff = voiceIndex;
             
             // Display current sequencer note
-            char message[60];
-            snprintf(message, 60, "Seq:%d Ch:%d", noteToTrigger, voiceIndex);
-            DisplayMessage(message);
+            // char message[60];
+            // snprintf(message, 60, "Seq:%d Ch:%d", noteToTrigger, voiceIndex);
+            // DisplayMessage(message);
         } else {
             // Original trigger behavior for keyboard mode or when no sequencer notes
             SendMidiMesssage(127, 15, "CC");
@@ -1922,6 +2025,94 @@ void AdvanceSequenceStep()
     
     // Advance to next step
     currentSequenceStep = (currentSequenceStep + 1) % TRIGGER_SEQUENCE_LENGTH;
+}
+
+void AddCCToQueue(uint8_t ccValue, bool isReset)
+{
+    // Check if queue is full
+    if (ccQueueCount >= CC_QUEUE_SIZE) {
+        return; // Queue is full, drop the CC
+    }
+    
+    // Calculate send time based on current time and delay
+    uint32_t sendTime = hw.seed.system.GetNow();
+    if (!isReset) {
+        // For regular CC, send immediately
+        sendTime += 10; // Small delay to ensure ordering
+    } else {
+        // For reset CC, use the configured delay
+        sendTime += CC_RESET_DELAY_MS;
+    }
+    
+    // Calculate hold duration - each CC is held for CC_RESET_DELAY_MS
+    uint32_t holdUntil = sendTime + CC_RESET_DELAY_MS;
+    
+    // Add to queue
+    ccQueue[ccQueueTail].ccValue = ccValue;
+    ccQueue[ccQueueTail].sendTime = sendTime;
+    ccQueue[ccQueueTail].holdUntil = holdUntil;
+    ccQueue[ccQueueTail].isReset = isReset;
+    
+    ccQueueTail = (ccQueueTail + 1) % CC_QUEUE_SIZE;
+    ccQueueCount++;
+}
+
+void ProcessCCQueue()
+{
+    uint32_t currentTime = hw.seed.system.GetNow();
+    
+    // Process all ready items in the queue
+    while (ccQueueCount > 0) {
+        CCQueueItem& item = ccQueue[ccQueueHead];
+        
+        // Check if it's time to send this CC
+        if (currentTime >= item.sendTime) {
+            // Send the CC
+            SendMidiMesssage(item.ccValue, 15, "CC");
+            lastCCValue = item.ccValue;
+            ccLatchTime = currentTime;
+            ccIsLatched = true;
+            
+            // Remove from queue
+            ccQueueHead = (ccQueueHead + 1) % CC_QUEUE_SIZE;
+            ccQueueCount--;
+        } else {
+            // Not time yet, stop processing
+            break;
+        }
+    }
+    
+    // Check if CC should be latched down to lowest value
+    if (ccIsLatched && ccQueueCount == 0) {
+        // No more CCs in queue, check if we should latch down
+        uint32_t timeSinceLastCC = currentTime - ccLatchTime;
+        if (timeSinceLastCC >= CC_RESET_DELAY_MS) {
+            // Latch down to lowest value (0)
+            SendMidiMesssage(ccSlotValues[0], 15, "CC");
+            lastCCValue = ccSlotValues[0];
+            ccIsLatched = false;
+        }
+    }
+}
+
+void ProcessCCSlots()
+{
+    // Increment global note counter
+    globalNoteCounter++;
+    
+    // Check all 8 CC slots and queue all matching ones
+    for (int i = 0; i < 8; i++) {
+        // Skip slots with subdivision 255 (never send)
+        if (ccSlotSubdivisions[i] == 255) continue;
+        
+        // Check if this slot should trigger based on subdivision
+        if (globalNoteCounter % ccSlotSubdivisions[i] == 0) {
+            uint8_t ccValue = ccSlotValues[i];
+            
+            // Queue CC for all matching subdivisions
+            AddCCToQueue(ccValue, false);
+        }
+    }
 }
 
 void GenerateEuclideanRhythm(int numTriggers, int numSteps, bool* pattern)
