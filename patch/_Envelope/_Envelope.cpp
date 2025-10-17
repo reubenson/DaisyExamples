@@ -19,7 +19,6 @@ Oscillator      pan, lfo1, lfo2, lfo3;
 // Oscillator      voice1Osc, voice3Osc;  // Internal oscillators for voices 1 and 3
 SdmmcHandler    sdcard;
 FatFSInterface  fsi;
-WavPlayer       sampler;
 
 // Custom oscillator class for waveform interpolation
 class InterpolatedOscillator {
@@ -1067,13 +1066,6 @@ int main(void)
 
         // Update trigger sequence
         UpdateTriggerSequence();
-
-        // envelopes[p.channel].trig = true;
-
-        // Prepare buffers for sampler as needed
-        // sampler.Prepare();
-
-        // hw.DelayMs(1);
     }
 }
 
