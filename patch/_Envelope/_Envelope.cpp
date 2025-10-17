@@ -245,6 +245,7 @@ panelStruct currentPanel;
 int noteCount = 0;
 
 float previousKnobState [4];
+float smoothedKnobState[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
 struct voiceStruct
 {
@@ -1282,12 +1283,18 @@ void ProcessKnobs()
 {
     float inputs[4];
     int8_t inputIndex = -1; // assuming only one knob changes at a time
-    float knobThreshold = 0.0003; // emperically derived, lower values produce jitter
+    float knobThreshold = 0.0001; // lower values for slower movement
+    float alpha = 0.25; // higher value for less smoothing
 
     for (int i = 0; i < 4; i++)
     {
         inputs[i] = hw.controls[i].Process();
-        if (fabs(inputs[i] - previousKnobState[i]) > knobThreshold)
+        
+        // Apply exponential moving average filter
+        smoothedKnobState[i] = (alpha * inputs[i]) + ((1.0f - alpha) * smoothedKnobState[i]);
+        
+        // Compare smoothed values against threshold
+        if (fabs(smoothedKnobState[i] - previousKnobState[i]) > knobThreshold)
         {
             inputIndex = i;
             // if (inputs[i] > 0.1f) {
@@ -1322,16 +1329,16 @@ void ProcessKnobs()
             switch(inputIndex)
             {
                 case 0:
-                    // Attack: logarithmic scaling 0.001s to 1.0s
+                    // Attack: logarithmic scaling 0.0001s to 5.0s
                     {
-                        float attackTime = 0.001f * powf(1000.0f, inputs[0]);
+                        float attackTime = 0.0001f * powf(5000.0f, inputs[0]);
                         envelopes[i].env.SetTime(ADSR_SEG_ATTACK, attackTime);
                     }
                     break;
                 case 1:
-                    // Decay/Release: logarithmic scaling 0.001s to 5.0s
+                    // Decay/Release: logarithmic scaling 0.0001s to 3.0s
                     {
-                        float decayTime = 0.001f * powf(3000.0f, inputs[1]);
+                        float decayTime = 0.0001f * powf(3000.0f, inputs[1]);
                         envelopes[i].env.SetTime(ADSR_SEG_DECAY, decayTime);
                         envelopes[i].env.SetTime(ADSR_SEG_RELEASE, decayTime);
                     }
@@ -1469,7 +1476,7 @@ void ProcessKnobs()
 
     for (int i = 0; i < 4; i++)
     {
-        previousKnobState[i] = inputs[i];
+        previousKnobState[i] = smoothedKnobState[i]; // Update with smoothed values for next comparison
     }
 }
 
