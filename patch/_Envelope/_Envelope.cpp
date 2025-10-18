@@ -2049,36 +2049,19 @@ void AdvanceSequenceStep()
             uint8_t noteToTrigger = sequencerNotes[sequencerNoteIndex];
             
             // Voice allocation: Round-robin distribution across voices 0-3
-            int8_t voiceIndex = -1;
+            // In sequencer mode, we always use round-robin regardless of gate state
+            // because note-offs are scheduled with delays and gates may still be true
+            // This ensures proper voice distribution instead of always stealing the same voice
+            int8_t voiceIndex = nextVoiceIndex;
             
-            // Step 1: Try the next voice in round-robin sequence if it's free
-            if (!envelopes[nextVoiceIndex].gate) {
-                voiceIndex = nextVoiceIndex;
-            } else {
-                // Step 2: If next voice is busy, search for any free voice
-                bool foundFree = false;
-                for (int i = 0; i < 4; i++) {
-                    if (!envelopes[i].gate) {
-                        voiceIndex = i;
-                        foundFree = true;
-                        break;
-                    }
-                }
-                
-                // Step 3: If no free voice, use the next voice in round-robin (voice stealing)
-                if (!foundFree) {
-                    voiceIndex = nextVoiceIndex;
-                    
-                    // Send note-off for the stolen voice
-                    if (voices[voiceIndex].note > 0) {
-                        uint8_t noteOffBytes[3] = {
-                            static_cast<uint8_t>(0x80 + voiceIndex), 
-                            static_cast<uint8_t>(voices[voiceIndex].note), 
-                            0
-                        };
-                        hw.midi.SendMessage(noteOffBytes, 3);
-                    }
-                }
+            // Send note-off for the voice we're about to steal (if it's playing a note)
+            if (voices[voiceIndex].note > 0) {
+                uint8_t noteOffBytes[3] = {
+                    static_cast<uint8_t>(0x80 + voiceIndex), 
+                    static_cast<uint8_t>(voices[voiceIndex].note), 
+                    0
+                };
+                hw.midi.SendMessage(noteOffBytes, 3);
             }
             
             // Advance round-robin index for next note
