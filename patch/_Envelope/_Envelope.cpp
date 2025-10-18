@@ -4,6 +4,7 @@
 #include <string>
 #include <cmath>
 #include <vector>
+#include <cstdarg>
 #include "midi/ShiftRegisterMidi.h"
 #include "hid/parameter.h"
 #include "tuning/ScalaTuning.h"
@@ -155,14 +156,26 @@ static void ApplyShiftRegisterState();
 uint32_t lastDisplayUpdate = 0;
 const uint32_t DISPLAY_UPDATE_INTERVAL_MS = 100; // Update display every 100ms
 
+// Debug message system
+const size_t DEBUG_MESSAGE_SIZE = 32;  // Standard debug message buffer size
+char debugMessage[DEBUG_MESSAGE_SIZE] = "";  // Buffer for debug message
+bool debugMessageActive = false;  // Whether debug message should be displayed
+uint32_t debugMessageTime = 0;  // When debug message was set
+const uint32_t DEBUG_MESSAGE_DURATION_MS = 2000;  // How long to show debug message (2 seconds)
+
 // Trigger off timing
 // int8_t currentNote = 0;
 uint32_t triggerOffTime = 0;
 const uint32_t TRIGGER_OFF_DELAY_MS = 50; // 10ms delay for trigger off
 bool triggerOffPending = false;
 
+// CC-triggered trigger timing (separate from note-triggered triggers)
+uint32_t ccTriggerOffTime = 0;
+bool ccTriggerOffPending = false;
+
 // CC reset timing - for channel assignment on channel 16
-const uint32_t CC_RESET_DELAY_MS = 200; // delay before resetting CC to lowest value
+// to experimentally test for value - send trig to next input and confirm 8 pulses
+const uint32_t CC_RESET_DELAY_MS = 55; // drops values sometimes at 50
 uint8_t lastCCValue = 0; // Track the last CC value sent (start with lowest CC value)
 
 // CC Subdivision System variables
@@ -340,6 +353,12 @@ void      ProcessCCSlots();
 void      AddCCToQueue(uint8_t ccValue, bool isReset = false);
 void      ProcessCCQueue();
 
+// Debug message functions
+void      SetDebugMessage(const char* message);
+void      SetDebugMessageF(const char* format, ...);
+void      ClearDebugMessage();
+bool      IsDebugMessageExpired();
+
 // Trigger Sequence Generator functions
 void      InitTriggerSequence();
 void      UpdateTriggerSequence();
@@ -368,6 +387,56 @@ void DisplayMessage(const char* str)
     // Position at y=48 to stay above bottom row
     WriteFixedString(hw, 0, 48, 11, font_s, str);  // Reduced width to 11 chars to stay left
     hw.display.Update();
+}
+
+// send simple debug string
+void SetDebugMessage(const char* message)
+{
+    // Copy message to debug buffer (limit to DEBUG_MESSAGE_SIZE - 1 chars to leave room for null terminator)
+    strncpy(debugMessage, message, DEBUG_MESSAGE_SIZE - 1);
+    debugMessage[DEBUG_MESSAGE_SIZE - 1] = '\0';  // Ensure null termination
+    
+    // Set debug message as active and record timestamp
+    debugMessageActive = true;
+    debugMessageTime = hw.seed.system.GetNow();
+}
+
+// send formatted debug string
+void SetDebugMessageF(const char* format, ...)
+{
+    // Use a temporary buffer for formatting
+    char tempBuffer[DEBUG_MESSAGE_SIZE];
+    
+    // Format the message using va_list
+    va_list args;
+    va_start(args, format);
+    vsnprintf(tempBuffer, DEBUG_MESSAGE_SIZE, format, args);
+    va_end(args);
+    
+    // Ensure null termination
+    tempBuffer[DEBUG_MESSAGE_SIZE - 1] = '\0';
+    
+    // Copy to debug buffer
+    strncpy(debugMessage, tempBuffer, DEBUG_MESSAGE_SIZE - 1);
+    debugMessage[DEBUG_MESSAGE_SIZE - 1] = '\0';
+    
+    // Set debug message as active and record timestamp
+    debugMessageActive = true;
+    debugMessageTime = hw.seed.system.GetNow();
+}
+
+void ClearDebugMessage()
+{
+    debugMessageActive = false;
+    debugMessage[0] = '\0';
+}
+
+bool IsDebugMessageExpired()
+{
+    if (!debugMessageActive) return true;
+    
+    uint32_t currentTime = hw.seed.system.GetNow();
+    return (currentTime - debugMessageTime) >= DEBUG_MESSAGE_DURATION_MS;
 }
 
 void ClearPanelArea()
@@ -710,6 +779,9 @@ void SendMidiMesssage(uint8_t value, uint8_t channel, char* type)
         uint8_t controller = 3; // this is configured in Intellijel 1U
         uint8_t bytes[3] = {static_cast<uint8_t>(0xB0 + channel), controller, value};
         hw.midi.SendMessage(bytes, 3);
+        
+        // Debug: Show CC message being sent
+        // SetDebugMessageF("Send CC:%d Ch:%d", value, channel);
     }
 }
 
@@ -910,13 +982,8 @@ void HandleMidiMessage(MidiEvent m)
             // Process CC slots based on subdivision logic
             ProcessCCSlots();
             
-            // Send trigger on channel 15 after CC to ensure consumer sees updated CC value
-            // Using a fixed trigger note (e.g., C3 = 60) for triggering
-            SendMidiMesssage(60, 15, "TRIGGER_ON");
-            
-            // Set timer for trigger off after 10ms delay
-            triggerOffTime = hw.seed.system.GetNow() + TRIGGER_OFF_DELAY_MS;
-            triggerOffPending = true;
+            // Note: Triggers are now sent individually for each CC in ProcessCCQueue()
+            // This ensures each CC gets its own trigger, which is needed for CC pairs
 
             // probably move outside of audio callback
             // char message[60];
@@ -1110,6 +1177,14 @@ int main(void)
             // Send trigger off on channel 15 (matches the trigger on sent earlier)
             SendMidiMesssage(60, 15, "TRIGGER_OFF");
             triggerOffPending = false;
+        }
+        
+        // Check for CC-triggered trigger off timing
+        if (ccTriggerOffPending && currentTime >= ccTriggerOffTime)
+        {
+            // Send CC-triggered trigger off on channel 15
+            SendMidiMesssage(60, 15, "TRIGGER_OFF");
+            ccTriggerOffPending = false;
         }
         
         // Process CC queue
@@ -1375,16 +1450,27 @@ void UpdateOled()
     // === BOTTOM ROW: General State Info (always visible) ===
     // Use entire bottom row (y=56-63) for general parameters
     
-    // Display current note and BPM in compact format: "60|120" - left side
-    WriteFixedStringF(hw, knobPositions[0], 56, 10, font_s, "%3d|%3d", currentNote, clockBpm);
-
-    // Display mode indicators - right side with proper spacing
-    if (sequencerMode) {
-        // Sequencer mode active
-        WriteFixedString(hw, knobPositions[3], 56, 2, font_s, "SQ");
+    // Check if debug message should be displayed
+    if (debugMessageActive && !IsDebugMessageExpired()) {
+        // Display debug message across the entire bottom row
+        WriteFixedString(hw, knobPositions[0], 56, 31, font_s, debugMessage);
+        
+        // Clear debug message if it has expired
+        if (IsDebugMessageExpired()) {
+            ClearDebugMessage();
+        }
     } else {
-        // Sequencer mode inactive - clear the area
-        WriteFixedString(hw, knobPositions[3], 56, 5, font_s, "     ");  // 5 spaces to clear
+        // Display current note and BPM in compact format: "60|120" - left side
+        WriteFixedStringF(hw, knobPositions[0], 56, 10, font_s, "%3d|%3d", currentNote, clockBpm);
+
+        // Display mode indicators - right side with proper spacing
+        if (sequencerMode) {
+            // Sequencer mode active
+            WriteFixedString(hw, knobPositions[3], 56, 2, font_s, "SQ");
+        } else {
+            // Sequencer mode inactive - clear the area
+            WriteFixedString(hw, knobPositions[3], 56, 5, font_s, "     ");  // 5 spaces to clear
+        }
     }
     
     // draw current knob values
@@ -2149,12 +2235,8 @@ void AdvanceSequenceStep()
             // Advance to next note in sequencer array
             sequencerNoteIndex = (sequencerNoteIndex + 1) % sequencerNotes.size();
             
-            // Send trigger on channel 15 after CC to ensure consumer sees updated CC value
-            SendMidiMesssage(60, 15, "TRIGGER_ON");
-            
-            // Set timer for trigger off after 10ms delay
-            triggerOffTime = hw.seed.system.GetNow() + TRIGGER_OFF_DELAY_MS;
-            triggerOffPending = true;
+            // Note: Triggers are now sent individually for each CC in ProcessCCQueue()
+            // This ensures each CC gets its own trigger, which is needed for CC pairs
             
             // Schedule note-off based on note length percentage
             // Ensure note-off happens well before next step to avoid timing conflicts
@@ -2188,17 +2270,29 @@ void AddCCToQueue(uint8_t ccValue, bool isReset)
 {
     // Check if queue is full
     if (ccQueueCount >= CC_QUEUE_SIZE) {
+        // Debug: Show queue full error
+        SetDebugMessage("CC Queue Full!");
         return; // Queue is full, drop the CC
     }
     
     // Calculate send time based on current time and delay
-    uint32_t sendTime = hw.seed.system.GetNow();
+    uint32_t currentTime = hw.seed.system.GetNow();
+    uint32_t sendTime;
+    
     if (!isReset) {
-        // For regular CC, send immediately
-        sendTime += 10; // Small delay to ensure ordering
+        // For regular CC, space them out by CC_RESET_DELAY_MS
+        // Each CC waits for the previous one to complete
+        if (ccQueueCount == 0) {
+            // First CC in queue - send immediately
+            sendTime = currentTime + 10; // Small delay to ensure ordering
+        } else {
+            // Subsequent CCs - wait for previous CC to complete
+            // Calculate based on queue position and CC_RESET_DELAY_MS
+            sendTime = currentTime + (ccQueueCount * CC_RESET_DELAY_MS) + 10;
+        }
     } else {
         // For reset CC, use the configured delay
-        sendTime += CC_RESET_DELAY_MS;
+        sendTime = currentTime + CC_RESET_DELAY_MS;
     }
     
     // Calculate hold duration - each CC is held for CC_RESET_DELAY_MS
@@ -2212,6 +2306,10 @@ void AddCCToQueue(uint8_t ccValue, bool isReset)
     
     ccQueueTail = (ccQueueTail + 1) % CC_QUEUE_SIZE;
     ccQueueCount++;
+    
+    // Debug: Show CC added to queue with timing info
+    // uint32_t delayMs = (sendTime - currentTime);
+    // SetDebugMessageF("Add CC:%d Q:%d +%dms", ccValue, ccQueueCount, delayMs);
 }
 
 void ProcessCCQueue()
@@ -2229,6 +2327,14 @@ void ProcessCCQueue()
             lastCCValue = item.ccValue;
             ccLatchTime = currentTime;
             ccIsLatched = true;
+            
+            // Send trigger immediately after CC to ensure consumer sees updated CC value
+            SendMidiMesssage(60, 15, "TRIGGER_ON");
+            
+            // Set timer for CC-triggered trigger off
+            ccTriggerOffTime = currentTime + TRIGGER_OFF_DELAY_MS;
+            ccTriggerOffPending = true;
+        
             
             // Remove from queue
             ccQueueHead = (ccQueueHead + 1) % CC_QUEUE_SIZE;
@@ -2257,18 +2363,27 @@ void ProcessCCSlots()
     // Increment global note counter
     globalNoteCounter++;
     
-    // Check all 8 CC slots and queue all matching ones
+    // Count how many slots will trigger this note
+    int triggeredSlots = 0;
+    uint8_t triggeredValues[8];
+    int triggeredIndices[8];
+    
+    // First pass: identify all slots that will trigger
     for (int i = 0; i < 8; i++) {
         // Skip slots with subdivision 255 (never send)
         if (ccSlotSubdivisions[i] == 255) continue;
         
         // Check if this slot should trigger based on subdivision
         if (globalNoteCounter % ccSlotSubdivisions[i] == 0) {
-            uint8_t ccValue = ccSlotValues[i];
-            
-            // Queue CC for all matching subdivisions
-            AddCCToQueue(ccValue, false);
+            triggeredValues[triggeredSlots] = ccSlotValues[i];
+            triggeredIndices[triggeredSlots] = i;
+            triggeredSlots++;
         }
+    }
+    
+    // Second pass: queue all triggered CCs
+    for (int i = 0; i < triggeredSlots; i++) {
+        AddCCToQueue(triggeredValues[i], false);
     }
 }
 
