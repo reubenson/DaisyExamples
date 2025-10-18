@@ -107,12 +107,11 @@ int8_t lastCurrentNote = 0;
 int8_t nextVoiceIndex = 0;  // Round-robin voice allocator (0-3)
 uint32_t voiceAllocationCounter = 0;  // Counter to track voice allocation order
 
-// Shift Register Mode
+// Shift Register Mode (disabled)
 bool shiftRegisterMode = false;
 
 // Sequencer Mode
-enum SequencerMode { KEYBOARD_MODE, SEQUENCER_MODE };
-SequencerMode currentSequencerMode = KEYBOARD_MODE;
+bool sequencerMode = false;
 std::vector<uint8_t> sequencerNotes;  // Array of held notes for sequencer
 bool sequencerNotesAscending = true;  // Note ordering direction
 uint8_t sequencerNoteIndex = 0;  // Current index in sequencer notes array
@@ -188,7 +187,7 @@ uint32_t ccLatchTime = 0; // Time when CC was last sent
 bool ccIsLatched = false; // Whether CC is currently latched to a value
 
 // Encoder long press timing
-const float ENCODER_LONG_PRESS_MS = 1500.0f;
+const float ENCODER_SEQUENCER_TOGGLE_MS = 500.0f;
 bool encoderWasPressed = false;
 bool longPressHandled = false;
 
@@ -224,7 +223,7 @@ uint8_t sequencerNoteToTurnOff = 0;
 int8_t sequencerVoiceToTurnOff = -1;
 
 // Parameter objects for trigger sequence controls
-Parameter densityParam, noteParam, enableParam;
+Parameter densityParam, noteParam;
 
 struct panelStruct
 {
@@ -264,9 +263,9 @@ panelStruct displayPanels[6] = {
         name: "TrigSeq",
         input1Name: "Density",
         input2Name: "Order",
-        input3Name: "Enable",
-        input4Name: "Length",
-        values: {0.0f, 0.0f, 0.0f, 0.5f}
+        input3Name: "Length",
+        input4Name: "",
+        values: {0.0f, 0.0f, 0.5f, 0.0f}
     },
     {
         name: "Tuning",
@@ -783,7 +782,7 @@ void HandleMidiMessage(MidiEvent m)
                 
                 uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + m.channel + channelOffset), p.note, p.velocity};
                 hw.midi.SendMessage(bytes, 3);
-            } else if (currentSequencerMode == SEQUENCER_MODE) {
+            } else if (sequencerMode) {
                 // Sequencer mode: Add note to sequencer notes array
                 AddNoteToSequencer(p.note);
                 
@@ -935,7 +934,7 @@ void HandleMidiMessage(MidiEvent m)
                 // Also send note-off to external devices
                 uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + m.channel + channelOffset), p.note, p.velocity};
                 hw.midi.SendMessage(bytes, 3);
-            } else if (currentSequencerMode == SEQUENCER_MODE) {
+            } else if (sequencerMode) {
                 // Sequencer mode: Remove note from sequencer notes array
                 RemoveNoteFromSequencer(p.note);
                 
@@ -1043,7 +1042,6 @@ int main(void)
     // Initialize parameter objects for trigger sequence controls
     densityParam.Init(hw.controls[0], 0.0f, 16.5f, Parameter::LINEAR); // maybe does not actually reach the maximum value
     noteParam.Init(hw.controls[1], 36.0f, 84.0f, Parameter::LINEAR);
-    enableParam.Init(hw.controls[2], 0.0f, 1.0f, Parameter::LINEAR);
 
     UpdateOled();
 
@@ -1077,10 +1075,8 @@ int main(void)
     }
 
     // Initialize parameters with linear scaling
-    Parameter densityParam, noteParam, enableParam;
     densityParam.Init(hw.controls[0], 0.0f, 16.0f, Parameter::LINEAR);
     noteParam.Init(hw.controls[1], 36.0f, 84.0f, Parameter::LINEAR);
-    enableParam.Init(hw.controls[2], 0.0f, 1.0f, Parameter::LINEAR);
 
     // Start the ADC and Audio Peripherals on the Hardware
     hw.StartAdc();
@@ -1213,7 +1209,7 @@ void UpdateOled()
         WriteFixedString(hw, 0, 32, TRIGGER_SEQUENCE_LENGTH, font_s, patternStr);
         
         // Show sequencer-specific information
-        if (currentSequencerMode == SEQUENCER_MODE) {
+        if (sequencerMode) {
             // Show note ordering direction - move to avoid conflicts
             WriteFixedString(hw, 80, 32, 4, font_s, sequencerNotesAscending ? "ASC" : "DESC");
             
@@ -1259,19 +1255,12 @@ void UpdateOled()
     WriteFixedStringF(hw, 0, 56, 10, font_s, "%3d|%3d", currentNote, clockBpm);
 
     // Display mode indicators - right side with proper spacing
-    // Both modes can be active simultaneously
-    if (shiftRegisterMode && currentSequencerMode == SEQUENCER_MODE) {
-        // Both modes active: show "SR SQ" with space between
-        WriteFixedString(hw, 100, 56, 5, font_s, "SR SQ");
-    } else if (shiftRegisterMode) {
-        // Only shift register mode active
-        WriteFixedString(hw, 100, 56, 2, font_s, "SR");
-    } else if (currentSequencerMode == SEQUENCER_MODE) {
-        // Only sequencer mode active
+    if (sequencerMode) {
+        // Sequencer mode active
         WriteFixedString(hw, 100, 56, 2, font_s, "SQ");
     } else {
-        // Neither mode active - clear the area
-        WriteFixedString(hw, 100, 56, 5, font_s, "     ");  // 5 spaces to clear "SR SQ"
+        // Sequencer mode inactive - clear the area
+        WriteFixedString(hw, 100, 56, 5, font_s, "     ");  // 5 spaces to clear
     }
     
     // draw current knob values
@@ -1332,25 +1321,16 @@ void ProcessEncoder()
 
     }
     
-    // Detect long press: trigger when held >= 3 seconds
-    if(encoderPressed && timeHeld >= ENCODER_LONG_PRESS_MS && !longPressHandled)
+    // Detect long press: trigger when held >= 0.5 seconds
+    if(encoderPressed && timeHeld >= ENCODER_SEQUENCER_TOGGLE_MS && !longPressHandled)
     {
-        // Long press detected - toggle shift register mode
-        shiftRegisterMode = !shiftRegisterMode;
+        // Long press detected - toggle sequencer mode
+        sequencerMode = !sequencerMode;
         longPressHandled = true;
         
-        // Clear all state when switching modes to prevent MIDI artifacts
-        // Reset shift register (this sends note-offs for active voices)
-        shift_register.Reset();
-        ApplyShiftRegisterState();
-        
-        // Clear all voice and envelope states
-        for(size_t i = 0; i < 4; ++i)
-        {
-            voices[i].note = 0;
-            voices[i].velocity = 0;
-            voices[i].allocationOrder = 0;
-            envelopes[i].gate = false;
+        // Clear sequencer notes when disabling sequencer mode to prevent artifacts
+        if (!sequencerMode) {
+            ClearSequencerNotes();
         }
         
         // Update display to show mode change
@@ -1372,16 +1352,6 @@ void ProcessEncoder()
             for (int i = 0; i < 4; i++)
             {
                 currentPanel.values[i] = hw.controls[i].Process();
-            }
-            
-            // If switching to TrigSeq panel, toggle sequencer mode
-            if (currentPanel.name == "TrigSeq") {
-                currentSequencerMode = (currentSequencerMode == KEYBOARD_MODE) ? SEQUENCER_MODE : KEYBOARD_MODE;
-                
-                // Clear sequencer notes when switching modes to prevent artifacts
-                if (currentSequencerMode == KEYBOARD_MODE) {
-                    ClearSequencerNotes();
-                }
             }
             
             UpdateOled();
@@ -1518,7 +1488,7 @@ void ProcessKnobs()
     else if (currentPanel.name == "TrigSeq")
     {
         // Process parameters continuously
-        sequenceEnabled = (enableParam.Process() > 0.5f);
+        sequenceEnabled = sequencerMode; // Enable sequence when sequencer mode is active
         
         // Only regenerate pattern when density knob changes
         if (inputIndex == 0) {
@@ -1893,7 +1863,7 @@ void InitTriggerSequence()
 void UpdateTriggerSequence()
 {
     // Only run sequencer when sequencer mode is enabled
-    if (currentSequencerMode != SEQUENCER_MODE) {
+    if (!sequencerMode) {
         return;
     }
     
@@ -1914,7 +1884,7 @@ void AdvanceSequenceStep()
 {
     // Check if current step should trigger
     if (triggerSequence[currentSequenceStep]) {
-        if (currentSequencerMode == SEQUENCER_MODE && !sequencerNotes.empty()) {
+        if (sequencerMode && !sequencerNotes.empty()) {
             // Sequencer mode: trigger next note from sequencer notes array
             uint8_t noteToTrigger = sequencerNotes[sequencerNoteIndex];
             
