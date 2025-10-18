@@ -107,7 +107,7 @@ int8_t lastCurrentNote = 0;
 int8_t nextVoiceIndex = 0;  // Round-robin voice allocator (0-3)
 uint32_t voiceAllocationCounter = 0;  // Counter to track voice allocation order
 
-// Shift Register Mode (disabled)
+// Shift Register Mode (disabled for now)
 bool shiftRegisterMode = false;
 
 // Sequencer Mode
@@ -244,7 +244,7 @@ panelStruct displayPanels[6] = {
         values: {0.0f, 0.0f, 0.0f, 0.0f}
     },
     {
-        name: "Panning",
+        name: "PANNING",
         input1Name: "Freq",
         input2Name: "Amp",
         input3Name: "",
@@ -252,7 +252,7 @@ panelStruct displayPanels[6] = {
         values: {0.0f, 0.0f, 0.0f, 0.0f}
     },
     {
-        name: "Oscillators",
+        name: "OSCILLATORS",
         input1Name: "Waveform",
         input2Name: "",
         input3Name: "",
@@ -260,7 +260,7 @@ panelStruct displayPanels[6] = {
         values: {0.0f, 0.0f, 0.0f, 0.0f}
     },
     {
-        name: "TrigSeq",
+        name: "TRIGSEQ",
         input1Name: "Density",
         input2Name: "Order",
         input3Name: "Length",
@@ -268,7 +268,7 @@ panelStruct displayPanels[6] = {
         values: {0.0f, 0.0f, 0.5f, 0.0f}
     },
     {
-        name: "Tuning",
+        name: "TUNING",
         input1Name: "Tuning",
         input2Name: "Range",
         input3Name: "MIDI",
@@ -276,7 +276,7 @@ panelStruct displayPanels[6] = {
         values: {0.0f, 0.0f, 1.0f, 1.0f}
     },
     {
-        name: "CC Slots",
+        name: "CC SLOTS",
         input1Name: "CC1-2",
         input2Name: "CC3-4",
         input3Name: "CC5-6",
@@ -1153,52 +1153,173 @@ int main(void)
     }
 }
 
+// Helper function to format parameter values based on panel context
+std::string FormatParameterValue(const std::string& panelName, int paramIndex, float value)
+{
+    if (panelName == "ADSR") {
+        switch(paramIndex) {
+            case 0: // Attack time
+                if (value < 0.01f) return "0ms";
+                else if (value < 0.1f) return std::to_string(static_cast<int>(value * 1000)) + "ms";
+                else return std::to_string(static_cast<int>(value * 10)) + "s";
+            case 1: // Decay/Release time
+                if (value < 0.01f) return "0ms";
+                else if (value < 0.1f) return std::to_string(static_cast<int>(value * 1000)) + "ms";
+                else return std::to_string(static_cast<int>(value * 10)) + "s";
+            case 2: // Sustain level
+                return std::to_string(static_cast<int>(value * 100)) + "%";
+            case 3: // Minimum level
+                return std::to_string(static_cast<int>(value * 100)) + "%";
+            default: return "0%";
+        }
+    }
+    else if (panelName == "PANNING") {
+        switch(paramIndex) {
+            case 0: // Frequency
+                return std::to_string(static_cast<int>(value * 10)) + "Hz";
+            case 1: // Amplitude
+                return std::to_string(static_cast<int>(value * 100)) + "%";
+            default: return "0%";
+        }
+    }
+    else if (panelName == "OSCILLATORS") {
+        switch(paramIndex) {
+            case 0: // Waveform
+                if (value < 0.25f) return "Sine";
+                else if (value < 0.5f) return "Tri";
+                else if (value < 0.75f) return "Sqr";
+                else return "Saw";
+            default: return "Sine";
+        }
+    }
+    else if (panelName == "TRIGSEQ") {
+        switch(paramIndex) {
+            case 0: // Density
+                return std::to_string(static_cast<int>(value * 16)) + "/16";
+            case 1: // Order
+                return value < 0.5f ? "ASC" : "DESC";
+            case 2: // Length
+                return std::to_string(static_cast<int>(value * 100)) + "%";
+            default: return "0";
+        }
+    }
+    else if (panelName == "TUNING") {
+        switch(paramIndex) {
+            case 0: // Tuning selector
+                return std::to_string(static_cast<int>(value * 9)) + "/9";
+            case 1: // Range
+                return std::to_string(static_cast<int>(100 + value * 1100)) + "c";
+            case 2: // MIDI
+                return value > 0.5f ? "ON" : "OFF";
+            case 3: // Osc
+                return value > 0.5f ? "ON" : "OFF";
+            default: return "OFF";
+        }
+    }
+    else if (panelName == "CC SLOTS") {
+        switch(paramIndex) {
+            case 0: // CC1-2
+                return value < 0.01f ? "OFF" : std::to_string(static_cast<int>(1.0f / value));
+            case 1: // CC3-4
+                return value < 0.01f ? "OFF" : std::to_string(static_cast<int>(1.0f / value));
+            case 2: // CC5-6
+                return value < 0.01f ? "OFF" : std::to_string(static_cast<int>(1.0f / value));
+            case 3: // CC7-8
+                return value < 0.01f ? "OFF" : std::to_string(static_cast<int>(1.0f / value));
+            default: return "OFF";
+        }
+    }
+    
+    // Default fallback
+    return std::to_string(static_cast<int>(value * 100)) + "%";
+}
+
+// Function to calculate knob positions dynamically, aligned to right edge
+void CalculateKnobPositions(int knobWidth, int knobPadding, int knobPositions[4]) {
+    const int displayWidth = 128;
+    const int numKnobs = 4;
+    
+    // Calculate total width needed for all knobs and padding
+    int totalKnobWidth = numKnobs * knobWidth + (numKnobs - 1) * knobPadding;
+    
+    // Calculate startX to align everything to the right edge
+    int startX = displayWidth - totalKnobWidth;
+    
+    // Calculate individual knob positions
+    for (int i = 0; i < numKnobs; i++) {
+        knobPositions[i] = startX + i * (knobWidth + knobPadding);
+    }
+}
+
 void UpdateOled()
 {
     // hw.display.Fill(false);
 
-    // Draw horizontal meters for each knob (1 pixel high, 0-20 pixels wide) - MOVED TO TOP
-    int meterY = 0;  // Position at very top
-    int meterPositions[4] = {0, 32, 64, 96};  // Equal 32-pixel spacing
-    int maxMeterWidth = 20;  // Maximum meter width in pixels
+    // Draw vertical panel name bar (x=0-15)
+    // Draw vertical bar background
+    hw.display.DrawRect(0, 0, 15, 63, false, true);  // Black background
+    
+    // Display panel name vertically (one character per row)
+    int startY = 0;
+    for (size_t i = 0; i < currentPanel.name.length() && i < 7; i++) {
+        char charStr[2] = {currentPanel.name[i], '\0'};
+        hw.display.SetCursor(2, startY + i * 9);  // 9 pixels between rows for font_s
+        hw.display.WriteString(charStr, font_s, true);
+    }
+    
+    // Define layout parameters
+    int knobWidth = 25;
+    int knobPadding = 5;
+    int paramValueY = 12;  // Y position for parameter value labels
+    
+    int knobPositions[4];
+    CalculateKnobPositions(knobWidth, knobPadding, knobPositions);
+    
+    // knob input labels at the top
+    int labelY = 0;  // Position at very top
+    WriteFixedString(hw, knobPositions[0], labelY, 5, font_s, currentPanel.input1Name.c_str());
+    WriteFixedString(hw, knobPositions[1], labelY, 5, font_s, currentPanel.input2Name.c_str());
+    WriteFixedString(hw, knobPositions[2], labelY, 5, font_s, currentPanel.input3Name.c_str());
+    WriteFixedString(hw, knobPositions[3], labelY, 5, font_s, currentPanel.input4Name.c_str());
+    
+    // Draw horizontal meters below labels
+    int meterY = 8;  // Position below labels
+    int maxMeterWidth = 22;  // Maximum meter width in pixels (fits within 25 pixel knob width)
 
     for (int i = 0; i < 4; i++)
     {
         // Clear the meter area first (draw black line to erase previous meter)
-        hw.display.DrawLine(meterPositions[i], meterY, meterPositions[i] + maxMeterWidth, meterY, false);
+        hw.display.DrawLine(knobPositions[i], meterY, knobPositions[i] + maxMeterWidth, meterY, false);
         
         // Draw the stored panel value (not current knob position)
         float val = displayPanels[panelMode].values[i];
-        int meterWidth = static_cast<int>(val * maxMeterWidth);  // Scale 0.0-1.0 to 0-20 pixels
-        meterWidth = std::max(0, std::min(meterWidth, maxMeterWidth));  // Clamp to 0-20 range
+        int meterWidth = static_cast<int>(val * maxMeterWidth);  // Scale 0.0-1.0 to 0-22 pixels
+        meterWidth = std::max(0, std::min(meterWidth, maxMeterWidth));  // Clamp to 0-22 range
         
         if (meterWidth > 0) {
-            hw.display.DrawLine(meterPositions[i], meterY, meterPositions[i] + meterWidth, meterY, true);
+            hw.display.DrawLine(knobPositions[i], meterY, knobPositions[i] + meterWidth, meterY, true);
         }
     }
     
-    // knob input labels
-    WriteFixedString(hw, 0, 2, 5, font_s, currentPanel.input1Name.c_str());
-    WriteFixedString(hw, 32, 2, 5, font_s, currentPanel.input2Name.c_str());
-    WriteFixedString(hw, 64, 2, 5, font_s, currentPanel.input3Name.c_str());
-    WriteFixedString(hw, 96, 2, 3, font_s, currentPanel.input4Name.c_str());
+    // Display parameter values below meters
+    for (int i = 0; i < 4; i++) {
+        std::string paramValue = FormatParameterValue(currentPanel.name, i, currentPanel.values[i]);
+        WriteFixedString(hw, knobPositions[i], paramValueY, 5, font_s, paramValue.c_str());
+    }
     
-    // panel name
-    WriteFixedString(hw, 0, 12, 12, font_m, currentPanel.name.c_str());
-    
-    // Show trigger sequence pattern when in TrigSeq mode
-    if (currentPanel.name == "TrigSeq") {
+    // Show trigger sequence pattern when in TRIGSEQ mode
+    if (currentPanel.name == "TRIGSEQ") {
         // Show current mode - REMOVE (now in bottom row)
         
         // Show step counter with fixed width - move to avoid bottom-right area
-        WriteFixedStringF(hw, 0, 40, 8, font_s, "Step:%02d", currentSequenceStep);
+        WriteFixedStringF(hw, knobPositions[0], 24, 8, font_s, "Step:%02d", currentSequenceStep);
 
         // Show density value with fixed width - move to avoid bottom-right area
         int numTriggers = 0;
         for (int i = 0; i < TRIGGER_SEQUENCE_LENGTH; i++) {
             if (triggerSequence[i]) numTriggers++;
         }
-        WriteFixedStringF(hw, 50, 40, 5, font_s, "D:%02d", numTriggers);
+        WriteFixedStringF(hw, knobPositions[2], 24, 5, font_s, "D:%02d", numTriggers);
         
         // Show sequence pattern as dots in one fixed-width string
         char patternStr[TRIGGER_SEQUENCE_LENGTH + 1];
@@ -1206,61 +1327,61 @@ void UpdateOled()
             patternStr[i] = triggerSequence[i] ? '*' : '-';
         }
         patternStr[TRIGGER_SEQUENCE_LENGTH] = '\0';
-        WriteFixedString(hw, 0, 32, TRIGGER_SEQUENCE_LENGTH, font_s, patternStr);
+        WriteFixedString(hw, knobPositions[0], 32, TRIGGER_SEQUENCE_LENGTH, font_s, patternStr);
         
         // Show sequencer-specific information
         if (sequencerMode) {
             // Show note ordering direction - move to avoid conflicts
-            WriteFixedString(hw, 80, 32, 4, font_s, sequencerNotesAscending ? "ASC" : "DESC");
+            WriteFixedString(hw, knobPositions[3], 32, 4, font_s, sequencerNotesAscending ? "ASC" : "DESC");
             
             // Show number of held notes - move to avoid conflicts
-            WriteFixedStringF(hw, 100, 32, 4, font_s, "N:%d", static_cast<int>(sequencerNotes.size()));
+            WriteFixedStringF(hw, knobPositions[0], 40, 4, font_s, "N:%d", static_cast<int>(sequencerNotes.size()));
             
             // Show note length percentage (10%-80% range) - REMOVE (conflicts with bottom-right)
             
             // Show current sequencer note index if there are notes - REMOVE (conflicts with bottom-right)
         }
     }
-    // Show tuning information when in Tuning mode
-    else if (currentPanel.name == "Tuning") {
+    // Show tuning information when in TUNING mode
+    else if (currentPanel.name == "TUNING") {
         // Show current tuning name with fixed width (21 chars to fill display width)
         const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
-        WriteFixedString(hw, 0, 24, 21, font_s, tuning->name);
+        WriteFixedString(hw, knobPositions[0], 24, 21, font_s, tuning->name);
         
         // Show pitch bend range with fixed width
-        WriteFixedStringF(hw, 0, 32, 10, font_s, "Rng:%4.0fc", pitchBendRange);
+        WriteFixedStringF(hw, knobPositions[0], 32, 10, font_s, "Rng:%4.0fc", pitchBendRange);
         
         // Show MIDI and Osc status with fixed width
-        WriteFixedStringF(hw, 70, 40, 2, font_s, "%s%s", 
+        WriteFixedStringF(hw, knobPositions[3], 40, 2, font_s, "%s%s", 
                          sendPitchBendMidi ? "M" : "-", 
                          applyToInternalOsc ? "O" : "-");
     }
-    // Show CC Slots information when in CC Slots mode
-    else if (currentPanel.name == "CC Slots") {
+    // Show CC Slots information when in CC SLOTS mode
+    else if (currentPanel.name == "CC SLOTS") {
         // Show current subdivisions for each pair
-        WriteFixedStringF(hw, 0, 24, 6, font_s, "1-2:%s", ccSlotSubdivisions[0] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[0]).c_str());
-        WriteFixedStringF(hw, 40, 24, 6, font_s, "3-4:%s", ccSlotSubdivisions[2] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[2]).c_str());
-        WriteFixedStringF(hw, 80, 24, 6, font_s, "5-6:%s", ccSlotSubdivisions[4] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[4]).c_str());
-        WriteFixedStringF(hw, 0, 32, 6, font_s, "7-8:%s", ccSlotSubdivisions[6] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[6]).c_str());
+        WriteFixedStringF(hw, knobPositions[0], 24, 6, font_s, "1-2:%s", ccSlotSubdivisions[0] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[0]).c_str());
+        WriteFixedStringF(hw, knobPositions[1], 24, 6, font_s, "3-4:%s", ccSlotSubdivisions[2] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[2]).c_str());
+        WriteFixedStringF(hw, knobPositions[2], 24, 6, font_s, "5-6:%s", ccSlotSubdivisions[4] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[4]).c_str());
+        WriteFixedStringF(hw, knobPositions[3], 24, 6, font_s, "7-8:%s", ccSlotSubdivisions[6] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[6]).c_str());
         
         // Show global note counter and queue status - move to avoid bottom-right area
-        WriteFixedStringF(hw, 0, 40, 8, font_s, "Note:%d", globalNoteCounter);
-        WriteFixedStringF(hw, 50, 40, 4, font_s, "Q:%d", ccQueueCount);
+        WriteFixedStringF(hw, knobPositions[0], 32, 8, font_s, "Note:%d", globalNoteCounter);
+        WriteFixedStringF(hw, knobPositions[2], 32, 4, font_s, "Q:%d", ccQueueCount);
     }
     
     // === BOTTOM ROW: General State Info (always visible) ===
     // Use entire bottom row (y=56-63) for general parameters
     
     // Display current note and BPM in compact format: "60|120" - left side
-    WriteFixedStringF(hw, 0, 56, 10, font_s, "%3d|%3d", currentNote, clockBpm);
+    WriteFixedStringF(hw, knobPositions[0], 56, 10, font_s, "%3d|%3d", currentNote, clockBpm);
 
     // Display mode indicators - right side with proper spacing
     if (sequencerMode) {
         // Sequencer mode active
-        WriteFixedString(hw, 100, 56, 2, font_s, "SQ");
+        WriteFixedString(hw, knobPositions[3], 56, 2, font_s, "SQ");
     } else {
         // Sequencer mode inactive - clear the area
-        WriteFixedString(hw, 100, 56, 5, font_s, "     ");  // 5 spaces to clear
+        WriteFixedString(hw, knobPositions[3], 56, 5, font_s, "     ");  // 5 spaces to clear
     }
     
     // draw current knob values
@@ -1444,7 +1565,7 @@ void ProcessKnobs()
             }
         }
     }
-    else if (currentPanel.name == "Panning")
+    else if (currentPanel.name == "PANNING")
     {
         switch(inputIndex)
         {
@@ -1471,7 +1592,7 @@ void ProcessKnobs()
         // hw.controls[0].Process();
         // ProcessPluck();
     }
-    else if (currentPanel.name == "Oscillators")
+    else if (currentPanel.name == "OSCILLATORS")
     {
         switch(inputIndex)
         {
@@ -1485,7 +1606,7 @@ void ProcessKnobs()
                 break;
         }
     }
-    else if (currentPanel.name == "TrigSeq")
+    else if (currentPanel.name == "TRIGSEQ")
     {
         // Process parameters continuously
         sequenceEnabled = sequencerMode; // Enable sequence when sequencer mode is active
@@ -1520,7 +1641,7 @@ void ProcessKnobs()
             }
         }
     }
-    else if (currentPanel.name == "Tuning")
+    else if (currentPanel.name == "TUNING")
     {
         switch(inputIndex)
         {
@@ -1570,7 +1691,7 @@ void ProcessKnobs()
                 break;
         }
     }
-    else if (currentPanel.name == "CC Slots")
+    else if (currentPanel.name == "CC SLOTS")
     {
         switch(inputIndex)
         {
