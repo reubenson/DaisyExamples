@@ -116,6 +116,7 @@ std::vector<uint8_t> sequencerNotes;  // Array of held notes for sequencer
 bool sequencerNotesAscending = true;  // Note ordering direction
 uint8_t sequencerNoteIndex = 0;  // Current index in sequencer notes array
 float sequencerNoteLengthPercent = 0.5f;  // Note length as percentage of step (10%-90%)
+bool sequencerUsingInitialCapture = false;  // True when using initially captured notes (don't stop on release)
 
 // option to use internal oscillators for voices 1 and 3
 bool useInternalOscillators = true;
@@ -356,6 +357,7 @@ void      AddNoteToSequencer(uint8_t note);
 void      RemoveNoteFromSequencer(uint8_t note);
 void      SortSequencerNotes();
 void      ClearSequencerNotes();
+void      CaptureCurrentlyHeldNotes();
 
 bool      knobChanged = false;
 
@@ -1449,8 +1451,11 @@ void ProcessEncoder()
         sequencerMode = !sequencerMode;
         longPressHandled = true;
         
-        // Clear sequencer notes when disabling sequencer mode to prevent artifacts
-        if (!sequencerMode) {
+        if (sequencerMode) {
+            // When enabling sequencer mode, capture currently held notes
+            CaptureCurrentlyHeldNotes();
+        } else {
+            // Clear sequencer notes when disabling sequencer mode to prevent artifacts
             ClearSequencerNotes();
         }
         
@@ -1936,11 +1941,23 @@ void AddNoteToSequencer(uint8_t note)
     
     // Reset sequencer note index when new notes are added
     sequencerNoteIndex = 0;
+    
+    // If we're adding notes after initial capture, reset the flag
+    // This means sequencer will now stop when notes are released (normal behavior)
+    if (sequencerUsingInitialCapture) {
+        sequencerUsingInitialCapture = false;
+    }
 }
 
 void RemoveNoteFromSequencer(uint8_t note)
 {
-    // Find and remove the note
+    // If we're using initially captured notes, preserve all notes in the sequencer
+    // This prevents losing notes when they're released at slightly different times
+    if (sequencerUsingInitialCapture) {
+        return; // Don't remove any notes when using initially captured notes
+    }
+    
+    // Find and remove the note (normal behavior for later-added notes)
     for (auto it = sequencerNotes.begin(); it != sequencerNotes.end(); ++it) {
         if (*it == note) {
             sequencerNotes.erase(it);
@@ -1967,6 +1984,28 @@ void ClearSequencerNotes()
 {
     sequencerNotes.clear();
     sequencerNoteIndex = 0;
+    sequencerUsingInitialCapture = false;  // Reset flag when clearing notes
+}
+
+void CaptureCurrentlyHeldNotes()
+{
+    // Clear existing sequencer notes first
+    sequencerNotes.clear();
+    
+    // Capture all currently held notes from the voices array
+    for (int i = 0; i < 4; i++) {
+        if (envelopes[i].gate && voices[i].note > 0) {
+            // Add note to sequencer if it's currently held
+            AddNoteToSequencer(static_cast<uint8_t>(voices[i].note));
+        }
+    }
+    
+    // Reset sequencer note index to start from the beginning
+    sequencerNoteIndex = 0;
+    
+    // Set flag to indicate we're using initially captured notes
+    // This means sequencer won't stop when these notes are released
+    sequencerUsingInitialCapture = true;
 }
 
 // Trigger Sequence Generator Implementation
