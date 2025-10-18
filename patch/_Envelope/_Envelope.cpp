@@ -181,6 +181,7 @@ uint8_t lastCCValue = 0; // Track the last CC value sent (start with lowest CC v
 // CC Subdivision System variables
 uint8_t ccSlotValues[8] = {0, 18, 36, 54, 73, 91, 109, 127}; // Equally distributed CC values 0-127
 uint8_t ccSlotSubdivisions[8] = {1, 1, 1, 1, 1, 1, 1, 1}; // Default all subdivisions to 1
+uint8_t ccSlotProbabilities[8] = {100, 100, 100, 100, 100, 100, 100, 100}; // Default all probabilities to 100%
 uint8_t ccSlotCounters[8] = {0, 0, 0, 0, 0, 0, 0, 0}; // Track note count for each slot
 uint32_t globalNoteCounter = 0; // Increments on every note-on
 
@@ -1297,13 +1298,29 @@ std::string FormatParameterValue(const std::string& panelName, int paramIndex, f
     else if (panelName == "CC SLOTS") {
         switch(paramIndex) {
             case 0: // CC1-2
-                return value < 0.01f ? "OFF" : std::to_string(static_cast<int>(1.0f / value));
+                {
+                    if (ccSlotSubdivisions[0] == 255) return "OFF";
+                    if (ccSlotProbabilities[0] == 100) return std::to_string(ccSlotSubdivisions[0]);
+                    return std::to_string(ccSlotSubdivisions[0]) + ":" + std::to_string(ccSlotProbabilities[0]);
+                }
             case 1: // CC3-4
-                return value < 0.01f ? "OFF" : std::to_string(static_cast<int>(1.0f / value));
+                {
+                    if (ccSlotSubdivisions[2] == 255) return "OFF";
+                    if (ccSlotProbabilities[2] == 100) return std::to_string(ccSlotSubdivisions[2]);
+                    return std::to_string(ccSlotSubdivisions[2]) + ":" + std::to_string(ccSlotProbabilities[2]);
+                }
             case 2: // CC5-6
-                return value < 0.01f ? "OFF" : std::to_string(static_cast<int>(1.0f / value));
+                {
+                    if (ccSlotSubdivisions[4] == 255) return "OFF";
+                    if (ccSlotProbabilities[4] == 100) return std::to_string(ccSlotSubdivisions[4]);
+                    return std::to_string(ccSlotSubdivisions[4]) + ":" + std::to_string(ccSlotProbabilities[4]);
+                }
             case 3: // CC7-8
-                return value < 0.01f ? "OFF" : std::to_string(static_cast<int>(1.0f / value));
+                {
+                    if (ccSlotSubdivisions[6] == 255) return "OFF";
+                    if (ccSlotProbabilities[6] == 100) return std::to_string(ccSlotSubdivisions[6]);
+                    return std::to_string(ccSlotSubdivisions[6]) + ":" + std::to_string(ccSlotProbabilities[6]);
+                }
             default: return "OFF";
         }
     }
@@ -1436,11 +1453,24 @@ void UpdateOled()
     }
     // Show CC Slots information when in CC SLOTS mode
     else if (currentPanel.name == "CC SLOTS") {
-        // Show current subdivisions for each pair
-        WriteFixedStringF(hw, knobPositions[0], 24, 6, font_s, "1-2:%s", ccSlotSubdivisions[0] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[0]).c_str());
-        WriteFixedStringF(hw, knobPositions[1], 24, 6, font_s, "3-4:%s", ccSlotSubdivisions[2] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[2]).c_str());
-        WriteFixedStringF(hw, knobPositions[2], 24, 6, font_s, "5-6:%s", ccSlotSubdivisions[4] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[4]).c_str());
-        WriteFixedStringF(hw, knobPositions[3], 24, 6, font_s, "7-8:%s", ccSlotSubdivisions[6] == 255 ? "OFF" : std::to_string(ccSlotSubdivisions[6]).c_str());
+        // Show current subdivisions and probabilities for each pair
+        std::string display1_2 = (ccSlotSubdivisions[0] == 255) ? "OFF" : 
+            (ccSlotProbabilities[0] == 100 ? std::to_string(ccSlotSubdivisions[0]) : 
+             std::to_string(ccSlotSubdivisions[0]) + ":" + std::to_string(ccSlotProbabilities[0]));
+        std::string display3_4 = (ccSlotSubdivisions[2] == 255) ? "OFF" : 
+            (ccSlotProbabilities[2] == 100 ? std::to_string(ccSlotSubdivisions[2]) : 
+             std::to_string(ccSlotSubdivisions[2]) + ":" + std::to_string(ccSlotProbabilities[2]));
+        std::string display5_6 = (ccSlotSubdivisions[4] == 255) ? "OFF" : 
+            (ccSlotProbabilities[4] == 100 ? std::to_string(ccSlotSubdivisions[4]) : 
+             std::to_string(ccSlotSubdivisions[4]) + ":" + std::to_string(ccSlotProbabilities[4]));
+        std::string display7_8 = (ccSlotSubdivisions[6] == 255) ? "OFF" : 
+            (ccSlotProbabilities[6] == 100 ? std::to_string(ccSlotSubdivisions[6]) : 
+             std::to_string(ccSlotSubdivisions[6]) + ":" + std::to_string(ccSlotProbabilities[6]));
+        
+        WriteFixedStringF(hw, knobPositions[0], 24, 6, font_s, "1-2:%s", display1_2.c_str());
+        WriteFixedStringF(hw, knobPositions[1], 24, 6, font_s, "3-4:%s", display3_4.c_str());
+        WriteFixedStringF(hw, knobPositions[2], 24, 6, font_s, "5-6:%s", display5_6.c_str());
+        WriteFixedStringF(hw, knobPositions[3], 24, 6, font_s, "7-8:%s", display7_8.c_str());
         
         // Show global note counter and queue status - move to avoid bottom-right area
         WriteFixedStringF(hw, knobPositions[0], 32, 8, font_s, "Note:%d", globalNoteCounter);
@@ -1794,54 +1824,106 @@ void ProcessKnobs()
         switch(inputIndex)
         {
             case 0:
-                // CC1-2 subdivision control: 0 = never (255), 1 = always (1)
+                // CC1-2 subdivision control: Map to 32 discrete positions (8 subdividers × 4 probabilities)
                 {
                     float knobValue = inputs[0];
+                    int position = (int)(knobValue * 32.99f); // 0-32
                     uint8_t subdivision;
-                    if (knobValue < 0.01f) subdivision = 255; // Never send (infinity)
-                    else subdivision = static_cast<uint8_t>(1.0f / knobValue); // Map 0.01-1.0 to 100-1
+                    uint8_t probability;
+                    
+                    if (position == 0) {
+                        subdivision = 255; // OFF
+                        probability = 0;
+                    } else {
+                        int adjustedPos = position - 1; // 0-31
+                        int subdivGroup = 7 - (adjustedPos / 4); // 7,6,5,4,3,2,1,0->1
+                        int probIndex = adjustedPos % 4; // 0,1,2,3
+                        subdivision = (subdivGroup == 0) ? 1 : subdivGroup;
+                        probability = 25 + (probIndex * 25); // 25,50,75,100
+                    }
                     
                     ccSlotSubdivisions[0] = subdivision;
                     ccSlotSubdivisions[1] = subdivision;
+                    ccSlotProbabilities[0] = probability;
+                    ccSlotProbabilities[1] = probability;
                     knobChanged = true;
                 }
                 break;
             case 1:
-                // CC3-4 subdivision control: 0 = never (255), 1 = always (1)
+                // CC3-4 subdivision control: Map to 32 discrete positions (8 subdividers × 4 probabilities)
                 {
                     float knobValue = inputs[1];
+                    int position = (int)(knobValue * 32.99f); // 0-32
                     uint8_t subdivision;
-                    if (knobValue < 0.01f) subdivision = 255; // Never send (infinity)
-                    else subdivision = static_cast<uint8_t>(1.0f / knobValue); // Map 0.01-1.0 to 100-1
+                    uint8_t probability;
+                    
+                    if (position == 0) {
+                        subdivision = 255; // OFF
+                        probability = 0;
+                    } else {
+                        int adjustedPos = position - 1; // 0-31
+                        int subdivGroup = 7 - (adjustedPos / 4); // 7,6,5,4,3,2,1,0->1
+                        int probIndex = adjustedPos % 4; // 0,1,2,3
+                        subdivision = (subdivGroup == 0) ? 1 : subdivGroup;
+                        probability = 25 + (probIndex * 25); // 25,50,75,100
+                    }
                     
                     ccSlotSubdivisions[2] = subdivision;
                     ccSlotSubdivisions[3] = subdivision;
+                    ccSlotProbabilities[2] = probability;
+                    ccSlotProbabilities[3] = probability;
                     knobChanged = true;
                 }
                 break;
             case 2:
-                // CC5-6 subdivision control: 0 = never (255), 1 = always (1)
+                // CC5-6 subdivision control: Map to 32 discrete positions (8 subdividers × 4 probabilities)
                 {
                     float knobValue = inputs[2];
+                    int position = (int)(knobValue * 32.99f); // 0-32
                     uint8_t subdivision;
-                    if (knobValue < 0.01f) subdivision = 255; // Never send (infinity)
-                    else subdivision = static_cast<uint8_t>(1.0f / knobValue); // Map 0.01-1.0 to 100-1
+                    uint8_t probability;
+                    
+                    if (position == 0) {
+                        subdivision = 255; // OFF
+                        probability = 0;
+                    } else {
+                        int adjustedPos = position - 1; // 0-31
+                        int subdivGroup = 7 - (adjustedPos / 4); // 7,6,5,4,3,2,1,0->1
+                        int probIndex = adjustedPos % 4; // 0,1,2,3
+                        subdivision = (subdivGroup == 0) ? 1 : subdivGroup;
+                        probability = 25 + (probIndex * 25); // 25,50,75,100
+                    }
                     
                     ccSlotSubdivisions[4] = subdivision;
                     ccSlotSubdivisions[5] = subdivision;
+                    ccSlotProbabilities[4] = probability;
+                    ccSlotProbabilities[5] = probability;
                     knobChanged = true;
                 }
                 break;
             case 3:
-                // CC7-8 subdivision control: 0 = never (255), 1 = always (1)
+                // CC7-8 subdivision control: Map to 32 discrete positions (8 subdividers × 4 probabilities)
                 {
                     float knobValue = inputs[3];
+                    int position = (int)(knobValue * 32.99f); // 0-32
                     uint8_t subdivision;
-                    if (knobValue < 0.01f) subdivision = 255; // Never send (infinity)
-                    else subdivision = static_cast<uint8_t>(1.0f / knobValue); // Map 0.01-1.0 to 100-1
+                    uint8_t probability;
+                    
+                    if (position == 0) {
+                        subdivision = 255; // OFF
+                        probability = 0;
+                    } else {
+                        int adjustedPos = position - 1; // 0-31
+                        int subdivGroup = 7 - (adjustedPos / 4); // 7,6,5,4,3,2,1,0->1
+                        int probIndex = adjustedPos % 4; // 0,1,2,3
+                        subdivision = (subdivGroup == 0) ? 1 : subdivGroup;
+                        probability = 25 + (probIndex * 25); // 25,50,75,100
+                    }
                     
                     ccSlotSubdivisions[6] = subdivision;
                     ccSlotSubdivisions[7] = subdivision;
+                    ccSlotProbabilities[6] = probability;
+                    ccSlotProbabilities[7] = probability;
                     knobChanged = true;
                 }
                 break;
@@ -2358,6 +2440,13 @@ void ProcessCCQueue()
     }
 }
 
+bool ShouldFireWithProbability(uint8_t probability) {
+    if (probability >= 100) return true;
+    if (probability == 0) return false;
+    uint8_t randomValue = rand() % 100; // 0-99
+    return randomValue < probability;
+}
+
 void ProcessCCSlots()
 {
     // Increment global note counter
@@ -2373,11 +2462,13 @@ void ProcessCCSlots()
         // Skip slots with subdivision 255 (never send)
         if (ccSlotSubdivisions[i] == 255) continue;
         
-        // Check if this slot should trigger based on subdivision
+        // Check if this slot should trigger based on subdivision AND probability
         if (globalNoteCounter % ccSlotSubdivisions[i] == 0) {
-            triggeredValues[triggeredSlots] = ccSlotValues[i];
-            triggeredIndices[triggeredSlots] = i;
-            triggeredSlots++;
+            if (ShouldFireWithProbability(ccSlotProbabilities[i])) {
+                triggeredValues[triggeredSlots] = ccSlotValues[i];
+                triggeredIndices[triggeredSlots] = i;
+                triggeredSlots++;
+            }
         }
     }
     
