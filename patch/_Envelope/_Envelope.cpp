@@ -358,6 +358,7 @@ void      RemoveNoteFromSequencer(uint8_t note);
 void      SortSequencerNotes();
 void      ClearSequencerNotes();
 void      CaptureCurrentlyHeldNotes();
+void      ApplyTuningToSequencerNotes();
 
 bool      knobChanged = false;
 
@@ -1658,6 +1659,8 @@ void ProcessKnobs()
                     if (newTuningIndex != currentTuningIndex) {
                         currentTuningIndex = newTuningIndex;
                         knobChanged = true;
+                        // Apply tuning changes to sequencer notes
+                        ApplyTuningToSequencerNotes();
                     }
                 }
                 break;
@@ -1669,6 +1672,8 @@ void ProcessKnobs()
                     if (fabs(newRange - pitchBendRange) > 1.0f) {
                         pitchBendRange = newRange;
                         knobChanged = true;
+                        // Apply tuning changes to sequencer notes
+                        ApplyTuningToSequencerNotes();
                     }
                 }
                 break;
@@ -1689,6 +1694,8 @@ void ProcessKnobs()
                     if (newApplyOsc != applyToInternalOsc) {
                         applyToInternalOsc = newApplyOsc;
                         knobChanged = true;
+                        // Apply tuning changes to sequencer notes
+                        ApplyTuningToSequencerNotes();
                     }
                 }
                 break;
@@ -2006,6 +2013,43 @@ void CaptureCurrentlyHeldNotes()
     // Set flag to indicate we're using initially captured notes
     // This means sequencer won't stop when these notes are released
     sequencerUsingInitialCapture = true;
+}
+
+void ApplyTuningToSequencerNotes()
+{
+    // Apply tuning changes to all currently playing sequencer voices
+    // This ensures that when tuning changes, the sequencer notes reflect the new tuning
+    if (!sequencerMode || sequencerNotes.empty()) {
+        return;
+    }
+    
+    // Update pitch bend for all currently active voices that are playing sequencer notes
+    for (int i = 0; i < 4; i++) {
+        if (envelopes[i].gate && voices[i].note > 0) {
+            // Check if this voice is playing a note from the sequencer
+            bool isSequencerNote = false;
+            for (size_t j = 0; j < sequencerNotes.size(); j++) {
+                if (voices[i].note == sequencerNotes[j]) {
+                    isSequencerNote = true;
+                    break;
+                }
+            }
+            
+            if (isSequencerNote && sendPitchBendMidi) {
+                // Apply new tuning to this voice
+                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                float centsDeviation = CalculateCentsDeviation(static_cast<uint8_t>(voices[i].note), tuning);
+                int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
+                SendPitchBend(static_cast<uint8_t>(i), pitchBendValue);
+            }
+            
+            // Update internal oscillator frequency if enabled
+            if (useInternalOscillators) {
+                float freq = MidiNoteToFrequency(voices[i].note, static_cast<int8_t>(i));
+                voiceInterpOsc[i].SetFreq(freq);
+            }
+        }
+    }
 }
 
 // Trigger Sequence Generator Implementation
