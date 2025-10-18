@@ -10,6 +10,7 @@
 #include "tuning/ScalaTuning.h"
 #include "tuning/TuningCalculator.h"
 #include "ScreenUtils.h"
+#include "util/bsp_sd_diskio.h"
 
 // Font aliases for cleaner code
 #define font_s Font_6x8    // 6x8 pixels - small, good for labels and compact info
@@ -24,7 +25,6 @@ Fm2             osc1, osc2;
 Oscillator      pan, lfo1, lfo2, lfo3;
 // Oscillator      voice1Osc, voice3Osc;  // Internal oscillators for voices 1 and 3
 SdmmcHandler    sdcard;
-FatFSInterface  fsi;
 
 // Custom oscillator class for waveform interpolation
 class InterpolatedOscillator {
@@ -330,12 +330,7 @@ struct envStruct
 // from PluckEcho example
 // PolyPluck<NUM_VOICES> synth;
 #define NUM_VOICES 1
-struct pluckStruct{
-    PolyPluck<NUM_VOICES> synth;
-    float wetDry; // param 1
-    float decay;  // param 2
-};
-pluckStruct plucks[4];
+// Removed pluckStruct and plucks array to save memory
 // #define MAX_DELAY ((size_t)(10.0f * 48000.0f))
 // 10 second delay line on the external SDRAM
 // DelayLine<float, MAX_DELAY> DSY_SDRAM_BSS delay;
@@ -359,6 +354,10 @@ void      SetDebugMessageF(const char* format, ...);
 void      ClearDebugMessage();
 bool      IsDebugMessageExpired();
 
+// SD Card functions
+bool      SaveSettingsToSD();
+bool      LoadSettingsFromSD();
+
 // Trigger Sequence Generator functions
 void      InitTriggerSequence();
 void      UpdateTriggerSequence();
@@ -380,6 +379,11 @@ void      CaptureCurrentlyHeldNotes();
 void      ApplyTuningToSequencerNotes();
 
 bool      knobChanged = false;
+
+// SD Card auto-save debouncing
+uint32_t  lastSaveTime = 0;
+const uint32_t SAVE_DEBOUNCE_MS = 2000; // Save 2 seconds after last knob change
+bool      sdCardInitialized = false;
 
 void DisplayMessage(const char* str)
 {
@@ -437,6 +441,127 @@ bool IsDebugMessageExpired()
     
     uint32_t currentTime = hw.seed.system.GetNow();
     return (currentTime - debugMessageTime) >= DEBUG_MESSAGE_DURATION_MS;
+}
+
+bool SaveSettingsToSD()
+{
+    uint32_t sectorBuffer[128]; // 512 bytes = 128 uint32_t words
+    uint32_t sectorNumber = 1001; // Use sector 1001 for preset data
+    char* buffer = (char*)sectorBuffer;
+    int pos = 0;
+    
+    // Clear sector buffer
+    memset(sectorBuffer, 0, 512);
+    
+    // Write settings in compact format
+    pos += snprintf(buffer + pos, 512 - pos, "BPM=%ld\n", clockBpm);
+    
+    // All panel values in one loop
+    for (int panel = 0; panel < 6; panel++) {
+        for (int i = 0; i < 4; i++) {
+            pos += snprintf(buffer + pos, 512 - pos, "P%d_%d=%.1f\n", panel, i, displayPanels[panel].values[i]);
+        }
+    }
+    
+    // CC probabilities (from panel values) - simplified to 4 slots only
+    for (int i = 0; i < 4; i++) {
+        uint8_t probability = (displayPanels[5].values[i] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[i] * 100.0f);
+        pos += snprintf(buffer + pos, 512 - pos, "CC%d=%d\n", i, probability);
+    }
+    
+    // Write sector to SD card
+    uint8_t result = BSP_SD_WriteBlocks(sectorBuffer, sectorNumber, 1, 5000);
+    if (result != MSD_OK) {
+        return false;
+    }
+    
+    SetDebugMessage("SD: Settings saved!");
+    return true;
+}
+
+bool LoadSettingsFromSD()
+{
+    uint32_t sectorBuffer[128]; // 512 bytes = 128 uint32_t words
+    uint32_t sectorNumber = 1001; // Use sector 1001 for preset data
+    char* buffer = (char*)sectorBuffer;
+    
+    // Read sector from SD card
+    uint8_t result = BSP_SD_ReadBlocks(sectorBuffer, sectorNumber, 1, 5000);
+    if (result != MSD_OK) {
+        return false;
+    }
+    
+    // Parse settings line by line
+    char* line = buffer;
+    while (*line && line < buffer + 512) {
+        char* endLine = strchr(line, '\n');
+        if (endLine) {
+            *endLine = '\0'; // Null terminate the line
+        }
+        
+        // Parse key=value pairs
+        char* equals = strchr(line, '=');
+        if (equals) {
+            *equals = '\0';
+            char* key = line;
+            char* value = equals + 1;
+            
+            // Parse different setting types
+            if (strcmp(key, "BPM") == 0) {
+                clockBpm = atoi(value);
+                clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
+            }
+            else if (strncmp(key, "P", 1) == 0 && strlen(key) == 3) {
+                // Parse P0_0 format
+                int panel = key[1] - '0';
+                int index = key[3] - '0';
+                if (panel >= 0 && panel < 6 && index >= 0 && index < 4) {
+                    displayPanels[panel].values[index] = atof(value);
+                }
+            }
+            else if (strncmp(key, "CC", 2) == 0 && strlen(key) == 3) {
+                // Parse CC0 format - load directly into displayPanels[5].values[]
+                int index = key[2] - '0';
+                if (index >= 0 && index < 4) {
+                    uint8_t probability = atoi(value);
+                    displayPanels[5].values[index] = probability / 100.0f;
+                }
+            }
+        }
+        
+        // Move to next line
+        if (endLine) {
+            line = endLine + 1;
+        } else {
+            break;
+        }
+    }
+    
+    // Update current panel to reflect loaded values
+    currentPanel = displayPanels[panelMode];
+    
+    // Sync ccSlotProbabilities with loaded CC slot panel values - correct mapping
+    // Knob 1 (CC1-2): affects slots 0 and 1
+    uint8_t prob1 = (displayPanels[5].values[0] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[0] * 100.0f);
+    ccSlotProbabilities[0] = prob1;
+    ccSlotProbabilities[1] = prob1;
+    
+    // Knob 2 (CC3-4): affects slots 2 and 3
+    uint8_t prob2 = (displayPanels[5].values[1] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[1] * 100.0f);
+    ccSlotProbabilities[2] = prob2;
+    ccSlotProbabilities[3] = prob2;
+    
+    // Knob 3 (CC5-6): affects slots 4 and 5
+    uint8_t prob3 = (displayPanels[5].values[2] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[2] * 100.0f);
+    ccSlotProbabilities[4] = prob3;
+    ccSlotProbabilities[5] = prob3;
+    
+    // Knob 4 (CC7-8): affects slots 6 and 7
+    uint8_t prob4 = (displayPanels[5].values[3] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[3] * 100.0f);
+    ccSlotProbabilities[6] = prob4;
+    ccSlotProbabilities[7] = prob4;
+    
+    return true;
 }
 
 void ClearPanelArea()
@@ -500,7 +625,7 @@ float IncrementTowards(float value, float target)
 {
     float incrementUp = 0.01f;
     float incrementDown = 0.00001f;
-    float increment = 0.0001f;
+    // Removed unused variable to save memory
     if (value < target)
     {
         value += incrementUp;
@@ -1063,6 +1188,51 @@ int main(void)
     size_t blocksize = 8;
     hw.Init();
 
+    // Initialize SD Card
+    SdmmcHandler::Config sd_cfg;
+    sd_cfg.Defaults();
+    SdmmcHandler::Result sd_result = sdcard.Init(sd_cfg);
+    if (sd_result != SdmmcHandler::Result::OK) {
+        SetDebugMessage("SD: Init failed");
+        // Set defaults when SD card fails
+        displayPanels[1].values[0] = 0.02f;  // Frequency (0.2Hz / 10Hz max = 0.02)
+        displayPanels[1].values[1] = 1.0f;   // Amplitude (full effect)
+        displayPanels[4].values[0] = 0.0f;  // Tuning selector (12-TET)
+        displayPanels[4].values[1] = 0.09f;  // Pitch bend range (200 cents)
+        displayPanels[4].values[2] = 1.0f;  // MIDI output enabled
+        displayPanels[4].values[3] = 1.0f;  // Internal oscillators enabled
+    } else {
+        // Initialize BSP SD card
+        uint8_t bsp_result = BSP_SD_Init();
+        if (bsp_result != MSD_OK) {
+            SetDebugMessage("SD: BSP Init failed");
+            // Set defaults when BSP SD init fails
+            displayPanels[1].values[0] = 0.02f;  // Frequency (0.2Hz / 10Hz max = 0.02)
+            displayPanels[1].values[1] = 1.0f;   // Amplitude (full effect)
+            displayPanels[4].values[0] = 0.0f;  // Tuning selector (12-TET)
+            displayPanels[4].values[1] = 0.09f;  // Pitch bend range (200 cents)
+            displayPanels[4].values[2] = 1.0f;  // MIDI output enabled
+            displayPanels[4].values[3] = 1.0f;  // Internal oscillators enabled
+        } else {
+            sdCardInitialized = true;
+            // Load settings from SD card
+            bool settingsLoaded = LoadSettingsFromSD();
+            
+            // Only set defaults if no settings were loaded from SD card
+            if (!settingsLoaded) {
+                // Initialize panning panel with default values
+                displayPanels[1].values[0] = 0.02f;  // Frequency (0.2Hz / 10Hz max = 0.02)
+                displayPanels[1].values[1] = 1.0f;   // Amplitude (full effect)
+                
+                // Initialize tuning panel with default values
+                displayPanels[4].values[0] = 0.0f;  // Tuning selector (12-TET)
+                displayPanels[4].values[1] = 0.09f;  // Pitch bend range (200 cents)
+                displayPanels[4].values[2] = 1.0f;  // MIDI output enabled
+                displayPanels[4].values[3] = 1.0f;  // Internal oscillators enabled
+            }
+        }
+    }
+
     samplerate = hw.AudioSampleRate();
 
     InitEnvelopes(samplerate);
@@ -1076,16 +1246,6 @@ int main(void)
         // displayPanels[3].values[i] = hw.controls[i].Process();
         // displayPanels[4].values[i] = hw.controls[i].Process();
     }
-    
-    // Initialize panning panel with default values
-    displayPanels[1].values[0] = 0.02f;  // Frequency (0.2Hz / 10Hz max = 0.02)
-    displayPanels[1].values[1] = 1.0f;   // Amplitude (full effect)
-    
-    // Initialize tuning panel with default values
-    displayPanels[4].values[0] = 0.0f;  // Tuning selector (12-TET)
-    displayPanels[4].values[1] = 0.09f;  // Pitch bend range (200 cents)
-    displayPanels[4].values[2] = 1.0f;  // MIDI output enabled
-    displayPanels[4].values[3] = 1.0f;  // Internal oscillators enabled
     
     // Initialize pitch bend values to center (no bend)
     for (int i = 0; i < 16; i++) {
@@ -1297,13 +1457,13 @@ std::string FormatParameterValue(const std::string& panelName, int paramIndex, f
     else if (panelName == "CC SLOTS") {
         switch(paramIndex) {
             case 0: // CC1-2
-                return (ccSlotProbabilities[0] == 0) ? "OFF" : std::to_string(ccSlotProbabilities[0]) + "%";
             case 1: // CC3-4
-                return (ccSlotProbabilities[2] == 0) ? "OFF" : std::to_string(ccSlotProbabilities[2]) + "%";
             case 2: // CC5-6
-                return (ccSlotProbabilities[4] == 0) ? "OFF" : std::to_string(ccSlotProbabilities[4]) + "%";
             case 3: // CC7-8
-                return (ccSlotProbabilities[6] == 0) ? "OFF" : std::to_string(ccSlotProbabilities[6]) + "%";
+                {
+                    uint8_t probability = (displayPanels[5].values[paramIndex] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[paramIndex] * 100.0f);
+                    return (probability == 0) ? "OFF" : std::to_string(probability) + "%";
+                }
             default: return "OFF";
         }
     }
@@ -1436,16 +1596,13 @@ void UpdateOled()
     }
     // Show CC Slots information when in CC SLOTS mode
     else if (currentPanel.name == "CC SLOTS") {
-        // Show current probabilities for each pair
-        std::string display1_2 = (ccSlotProbabilities[0] == 0) ? "OFF" : std::to_string(ccSlotProbabilities[0]) + "%";
-        std::string display3_4 = (ccSlotProbabilities[2] == 0) ? "OFF" : std::to_string(ccSlotProbabilities[2]) + "%";
-        std::string display5_6 = (ccSlotProbabilities[4] == 0) ? "OFF" : std::to_string(ccSlotProbabilities[4]) + "%";
-        std::string display7_8 = (ccSlotProbabilities[6] == 0) ? "OFF" : std::to_string(ccSlotProbabilities[6]) + "%";
-        
-        WriteFixedStringF(hw, knobPositions[0], 24, 6, font_s, "1-2:%s", display1_2.c_str());
-        WriteFixedStringF(hw, knobPositions[1], 24, 6, font_s, "3-4:%s", display3_4.c_str());
-        WriteFixedStringF(hw, knobPositions[2], 24, 6, font_s, "5-6:%s", display5_6.c_str());
-        WriteFixedStringF(hw, knobPositions[3], 24, 6, font_s, "7-8:%s", display7_8.c_str());
+        // Show current probabilities for each slot pair
+        const char* slotLabels[4] = {"CC1-2", "CC3-4", "CC5-6", "CC7-8"};
+        for (int i = 0; i < 4; i++) {
+            uint8_t probability = (displayPanels[5].values[i] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[i] * 100.0f);
+            std::string display = (probability == 0) ? "OFF" : std::to_string(probability) + "%";
+            WriteFixedStringF(hw, knobPositions[i], 24, 6, font_s, "%s:%s", slotLabels[i], display.c_str());
+        }
         
         // Show global note counter and queue status - move to avoid bottom-right area
         WriteFixedStringF(hw, knobPositions[0], 32, 8, font_s, "Note:%d", globalNoteCounter);
@@ -1482,7 +1639,7 @@ void UpdateOled()
     for (int i = 0; i < 4; i++)
     {
         // hw.display.SetCursor(0 + (i * 20), 25);
-        float val = currentPanel.values[i];
+        // Removed unused variable to save memory
 
         // bug: val oscillates between 0 and the actual value???
         // currently this seems to only get called when it is incorrectly reading 0 ... ?
@@ -1600,29 +1757,14 @@ void ProcessKnobs()
         if (fabs(smoothedKnobState[i] - previousKnobState[i]) > knobThreshold)
         {
             inputIndex = i;
-            // if (inputs[i] > 0.1f) {
-                currentPanel.values[i] = inputs[i];
-                displayPanels[panelMode].values[i] = inputs[i]; // Also update stored panel values
-                knobChanged = true;
-            // }
         }
     }
 
     if (inputIndex > -1) {
-        // float val = inputs[inputIndex];
-        // currentPanel.values[inputIndex] = val;
-        // std::string str = std::to_string(inputs[inputIndex]);
-        // DisplayMessage(str.c_str());
-
-        // float val = 0.141414f;
-        // char printme[50];
-        // snprintf(printme, sizeof(printme), "val: %d", static_cast<int>(val * 1000));
-        // DisplayMessage(printme);
-
-        // hw.display.DrawRect(0, 0, 128, 64, true);
-        // hw.display.SetCursor(35, 0);
-        // str = currentPanel.input2Name;
-        // hw.display.WriteString(cstr, Font_6x8, true);
+        // Update panel values for the currently selected panel
+        currentPanel.values[inputIndex] = inputs[inputIndex];
+        displayPanels[panelMode].values[inputIndex] = inputs[inputIndex];
+        knobChanged = true;
     }
 
     if (currentPanel.name == "ADSR")
@@ -1678,17 +1820,7 @@ void ProcessKnobs()
                 break;
         }
     }
-    else if (currentPanel.name == "Pluck")
-    {
-        for (size_t j = 0; j < 4; j++)
-        {
-            plucks[j].wetDry = inputs[0];
-            // plucks[j].decay = inputs[1];
-        }
-        
-        // hw.controls[0].Process();
-        // ProcessPluck();
-    }
+    // Removed Pluck panel processing to save memory
     else if (currentPanel.name == "OSCILLATORS")
     {
         switch(inputIndex)
@@ -1796,60 +1928,40 @@ void ProcessKnobs()
     }
     else if (currentPanel.name == "CC SLOTS")
     {
-        switch(inputIndex)
-        {
-            case 0:
-                // CC1-2 probability control: 0 = OFF, 1 = 100%
-                {
-                    float knobValue = inputs[0];
-                    uint8_t probability = (knobValue < 0.01f) ? 0 : static_cast<uint8_t>(knobValue * 100.0f);
-                    
-                    ccSlotProbabilities[0] = probability;
-                    ccSlotProbabilities[1] = probability;
-                    knobChanged = true;
-                }
-                break;
-            case 1:
-                // CC3-4 probability control: 0 = OFF, 1 = 100%
-                {
-                    float knobValue = inputs[1];
-                    uint8_t probability = (knobValue < 0.01f) ? 0 : static_cast<uint8_t>(knobValue * 100.0f);
-                    
-                    ccSlotProbabilities[2] = probability;
-                    ccSlotProbabilities[3] = probability;
-                    knobChanged = true;
-                }
-                break;
-            case 2:
-                // CC5-6 probability control: 0 = OFF, 1 = 100%
-                {
-                    float knobValue = inputs[2];
-                    uint8_t probability = (knobValue < 0.01f) ? 0 : static_cast<uint8_t>(knobValue * 100.0f);
-                    
-                    ccSlotProbabilities[4] = probability;
-                    ccSlotProbabilities[5] = probability;
-                    knobChanged = true;
-                }
-                break;
-            case 3:
-                // CC7-8 probability control: 0 = OFF, 1 = 100%
-                {
-                    float knobValue = inputs[3];
-                    uint8_t probability = (knobValue < 0.01f) ? 0 : static_cast<uint8_t>(knobValue * 100.0f);
-                    
-                    ccSlotProbabilities[6] = probability;
-                    ccSlotProbabilities[7] = probability;
-                    knobChanged = true;
-                }
-                break;
-            default:
-                break;
-        }
+        // Update ccSlotProbabilities from panel values - correct mapping
+        // Knob 1 (CC1-2): affects slots 0 and 1
+        uint8_t prob1 = (displayPanels[5].values[0] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[0] * 100.0f);
+        ccSlotProbabilities[0] = prob1;
+        ccSlotProbabilities[1] = prob1;
+        
+        // Knob 2 (CC3-4): affects slots 2 and 3
+        uint8_t prob2 = (displayPanels[5].values[1] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[1] * 100.0f);
+        ccSlotProbabilities[2] = prob2;
+        ccSlotProbabilities[3] = prob2;
+        
+        // Knob 3 (CC5-6): affects slots 4 and 5
+        uint8_t prob3 = (displayPanels[5].values[2] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[2] * 100.0f);
+        ccSlotProbabilities[4] = prob3;
+        ccSlotProbabilities[5] = prob3;
+        
+        // Knob 4 (CC7-8): affects slots 6 and 7
+        uint8_t prob4 = (displayPanels[5].values[3] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[3] * 100.0f);
+        ccSlotProbabilities[6] = prob4;
+        ccSlotProbabilities[7] = prob4;
     }
 
     for (int i = 0; i < 4; i++)
     {
         previousKnobState[i] = smoothedKnobState[i]; // Update with smoothed values for next comparison
+    }
+    
+    // Auto-save to SD card when knobs change (with debouncing)
+    if (knobChanged && sdCardInitialized) {
+        uint32_t currentTime = hw.seed.system.GetNow();
+        if (currentTime - lastSaveTime >= SAVE_DEBOUNCE_MS) {
+            SaveSettingsToSD();
+            lastSaveTime = currentTime;
+        }
     }
 }
 
@@ -1910,7 +2022,7 @@ void plucksApply(float* data) {
             trig = 1.0f;
         }
         
-        wet = plucks[i].wetDry;
+        wet = 0.0f; // No pluck wet/dry
         // note = voices[i].note;
         if(hw.encoder.RisingEdge() || hw.gate_input[DaisyPatch::GATE_IN_1].Trig())
             trig = 1.0f;
@@ -1923,7 +2035,7 @@ void plucksApply(float* data) {
             // note = 48 + rand() % 25;
             note = voices[i].note;
         }
-        sig = plucks[i].synth.Process(trig, note);
+        sig = 0.0f; // No pluck signal
 
         // sig = plucks[i].synth.Process(trig, note);
         // sig = plucks[i].synth.Process(trig, 60);
