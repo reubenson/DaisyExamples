@@ -278,7 +278,7 @@ panelStruct displayPanels[6] = {
         input1Name: "Density",
         input2Name: "Order",
         input3Name: "Length",
-        input4Name: "",
+        input4Name: "BPM",
         values: {0.0f, 0.0f, 0.5f, 0.0f}
     },
     {
@@ -475,7 +475,7 @@ bool SaveSettingsToSD()
         return false;
     }
     
-    SetDebugMessage("SD: Settings saved!");
+    // SetDebugMessage("SD: Settings saved!");
     return true;
 }
 
@@ -1193,7 +1193,7 @@ int main(void)
     sd_cfg.Defaults();
     SdmmcHandler::Result sd_result = sdcard.Init(sd_cfg);
     if (sd_result != SdmmcHandler::Result::OK) {
-        SetDebugMessage("SD: Init failed");
+        // SetDebugMessage("SD: Init failed");
         // Set defaults when SD card fails
         displayPanels[1].values[0] = 0.02f;  // Frequency (0.2Hz / 10Hz max = 0.02)
         displayPanels[1].values[1] = 1.0f;   // Amplitude (full effect)
@@ -1205,7 +1205,7 @@ int main(void)
         // Initialize BSP SD card
         uint8_t bsp_result = BSP_SD_Init();
         if (bsp_result != MSD_OK) {
-            SetDebugMessage("SD: BSP Init failed");
+            // SetDebugMessage("SD: BSP Init failed");
             // Set defaults when BSP SD init fails
             displayPanels[1].values[0] = 0.02f;  // Frequency (0.2Hz / 10Hz max = 0.02)
             displayPanels[1].values[1] = 1.0f;   // Amplitude (full effect)
@@ -1268,6 +1268,11 @@ int main(void)
     sequencerNoteIndex = 0;
     sequencerNotesAscending = true;
     sequencerNoteLengthPercent = 0.5f; // Default to 50%
+    
+    // Initialize BPM knob value based on current BPM
+    // Map BPM to 0-1 range for knob display
+    float bpmKnobValue = static_cast<float>(clockBpm - CLOCK_BPM_MIN) / (CLOCK_BPM_MAX - CLOCK_BPM_MIN);
+    displayPanels[3].values[3] = bpmKnobValue; // TRIGSEQ panel, knob 4 (BPM)
 
     // Initialize parameter objects for trigger sequence controls
     densityParam.Init(hw.controls[0], 0.0f, 16.5f, Parameter::LINEAR); // maybe does not actually reach the maximum value
@@ -1438,6 +1443,12 @@ std::string FormatParameterValue(const std::string& panelName, int paramIndex, f
                 return value < 0.5f ? "ASC" : "DESC";
             case 2: // Length
                 return std::to_string(static_cast<int>(value * 100)) + "%";
+            case 3: // BPM
+                {
+                    // Map 0-1 to CLOCK_BPM_MIN-CLOCK_BPM_MAX
+                    int bpm = CLOCK_BPM_MIN + static_cast<int>(value * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
+                    return std::to_string(bpm);
+                }
             default: return "0";
         }
     }
@@ -1629,8 +1640,11 @@ void UpdateOled()
         if (sequencerMode) {
             // Sequencer mode active
             WriteFixedString(hw, knobPositions[3], 56, 2, font_s, "SQ");
+        } else if (shiftRegisterMode) {
+            // Shift register mode active
+            WriteFixedString(hw, knobPositions[3], 56, 2, font_s, "SR");
         } else {
-            // Sequencer mode inactive - clear the area
+            // No special mode active - clear the area
             WriteFixedString(hw, knobPositions[3], 56, 5, font_s, "     ");  // 5 spaces to clear
         }
     }
@@ -1672,25 +1686,27 @@ void ProcessEncoder()
     // Check for encoder rotation (clockwise/counterclockwise)
     int32_t encoderValue = hw.encoder.Increment();
     if (encoderValue != 0) {
-        // Adjust BPM by configured increment for each encoder tick
-        clockBpm += encoderValue * CLOCK_BPM_INCREMENT;
-
-        // Clamp BPM to configured range
-        if (clockBpm < CLOCK_BPM_MIN) clockBpm = CLOCK_BPM_MIN;
-        if (clockBpm > CLOCK_BPM_MAX) clockBpm = CLOCK_BPM_MAX;
-
-        // Recalculate clock interval
-        // MIDI clock sends 24 pulses per quarter note
-        // Interval = 60000ms / (BPM * 24)
-        clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
+        // Navigate panels: clockwise = next panel, counterclockwise = previous panel
+        if (encoderValue > 0) {
+            // Clockwise rotation - next panel
+            panelMode = (panelMode + 1) % panelModesCount;
+        } else {
+            // Counterclockwise rotation - previous panel
+            panelMode = (panelMode - 1 + panelModesCount) % panelModesCount;
+        }
         
-        // Recalculate sequence step interval
-        // Each sequence step = 1/16th note = 6 MIDI clock pulses
-        // Interval = 60000ms / (BPM * 4) for 16th note timing
-        sequenceStepInterval = static_cast<uint32_t>(60000 / (clockBpm * 4));
+        currentPanel = displayPanels[panelMode];
+        
+        // Clear panel area to prevent overlap when switching panels
+        ClearPanelArea();
+        
+        // Update current panel values to reflect current knob positions
+        for (int i = 0; i < 4; i++)
+        {
+            currentPanel.values[i] = hw.controls[i].Process();
+        }
         
         knobChanged = true; // Trigger display update
-
     }
     
     // Detect long press: trigger when held >= 0.5 seconds
@@ -1716,17 +1732,15 @@ void ProcessEncoder()
         // Button was released
         if(!longPressHandled)
         {
-            // Short press - cycle through panel modes
-            panelMode = (panelMode + 1) % panelModesCount;
-            currentPanel = displayPanels[panelMode];
+            // Short press - toggle shift register mode
+            shiftRegisterMode = !shiftRegisterMode;
             
-            // Clear panel area to prevent overlap when switching panels
-            ClearPanelArea();
-            
-            // Update current panel values to reflect current knob positions
-            for (int i = 0; i < 4; i++)
-            {
-                currentPanel.values[i] = hw.controls[i].Process();
+            if (shiftRegisterMode) {
+                // SetDebugMessage("Shift Register ON");
+            } else {
+                // SetDebugMessage("Shift Register OFF");
+                // Clear all voices when disabling shift register mode
+                ClearAllVoices();
             }
             
             UpdateOled();
@@ -1861,11 +1875,32 @@ void ProcessKnobs()
             }
         }
         
-        // Handle knob 4: Note length control (10% to 80% of step duration)
-        if (inputIndex == 3) {
-            float newLengthPercent = 0.1f + inputs[3] * 0.8f; // Map 0-1 to 0.1-0.8
+        // Handle knob 3: Note length control (10% to 80% of step duration)
+        if (inputIndex == 2) {
+            float newLengthPercent = 0.1f + inputs[2] * 0.8f; // Map 0-1 to 0.1-0.8
             if (fabs(newLengthPercent - sequencerNoteLengthPercent) > 0.01f) {
                 sequencerNoteLengthPercent = newLengthPercent;
+                knobChanged = true;
+            }
+        }
+        
+        // Handle knob 4: BPM control
+        if (inputIndex == 3) {
+            // Map knob value (0-1) to BPM range (CLOCK_BPM_MIN to CLOCK_BPM_MAX)
+            int32_t newBpm = CLOCK_BPM_MIN + static_cast<int32_t>(inputs[3] * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
+            if (newBpm != clockBpm) {
+                clockBpm = newBpm;
+                
+                // Recalculate clock interval
+                // MIDI clock sends 24 pulses per quarter note
+                // Interval = 60000ms / (BPM * 24)
+                clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
+                
+                // Recalculate sequence step interval
+                // Each sequence step = 1/16th note = 6 MIDI clock pulses
+                // Interval = 60000ms / (BPM * 4) for 16th note timing
+                sequenceStepInterval = static_cast<uint32_t>(60000 / (clockBpm * 4));
+                
                 knobChanged = true;
             }
         }
@@ -2380,7 +2415,7 @@ void AddCCToQueue(uint8_t ccValue, bool isReset)
     // Check if queue is full
     if (ccQueueCount >= CC_QUEUE_SIZE) {
         // Debug: Show queue full error
-        SetDebugMessage("CC Queue Full!");
+        // SetDebugMessage("CC Queue Full!");
         return; // Queue is full, drop the CC
     }
     
