@@ -152,6 +152,28 @@ static envelope_midi::ShiftRegisterMidi shift_register(&daisy_midi_output);
 
 static void ApplyShiftRegisterState();
 
+// ============================================================================
+// MIDI Architecture - Template-based Handler Chain (Zero Runtime Overhead)
+// ============================================================================
+// Forward declarations
+struct NullHandler;
+template<typename NextHandler> class HandlerBase;
+template<typename NextHandler> class SequencerCaptureHandler;
+template<typename NextHandler> class ShiftRegisterHandler;
+template<typename NextHandler> class NormalVoiceHandler;
+template<typename NextHandler> class IntellijelTrackerHandler;
+using HandlerChain = SequencerCaptureHandler<
+    ShiftRegisterHandler<
+        NormalVoiceHandler<
+            IntellijelTrackerHandler<NullHandler>
+        >
+    >
+>;
+void ProcessHandlerChainNoteOn(NoteOnEvent& event);
+void ProcessHandlerChainNoteOff(NoteOffEvent& event);
+void ProcessSequencerMidiSource();
+void ResetCCState(); // Reset CC state to clean state
+
 // Display update timing
 uint32_t lastDisplayUpdate = 0;
 const uint32_t DISPLAY_UPDATE_INTERVAL_MS = 100; // Update display every 100ms
@@ -177,6 +199,7 @@ bool ccTriggerOffPending = false;
 // to experimentally test for value - send trig to next input and confirm 8 pulses
 const uint32_t CC_RESET_DELAY_MS = 55; // drops values sometimes at 50
 uint8_t lastCCValue = 0; // Track the last CC value sent (start with lowest CC value)
+bool ccStateInitialized = false; // Track if CC state has been properly initialized
 
 // CC Subdivision System variables
 uint8_t ccSlotValues[8] = {0, 18, 36, 54, 73, 91, 109, 127}; // Equally distributed CC values 0-127
@@ -192,7 +215,7 @@ struct CCQueueItem {
     bool isReset; // true if this is a reset to lowest value
 };
 
-const size_t CC_QUEUE_SIZE = 16; // Maximum queue size
+const size_t CC_QUEUE_SIZE = 8; // Reduced from 16 to save memory
 CCQueueItem ccQueue[CC_QUEUE_SIZE];
 size_t ccQueueHead = 0;
 size_t ccQueueTail = 0;
@@ -360,8 +383,6 @@ bool      LoadSettingsFromSD();
 
 // Trigger Sequence Generator functions
 void      InitTriggerSequence();
-void      UpdateTriggerSequence();
-void      AdvanceSequenceStep();
 void      GenerateEuclideanRhythm(int numTriggers, int numSteps, bool* pattern);
 void      BuildPattern(int level, std::vector<bool>& result, const std::vector<int>& count, const std::vector<int>& remainder);
 
@@ -951,238 +972,19 @@ int8_t getCurrentLowestNote() {
 
 void HandleMidiMessage(MidiEvent m)
 {   
-    // Note: MIDI passthrough is now handled directly in voice allocation code
-    // to send on the correct allocated voice channels
-    
-    // to handle round robin properly, may need to handle it here in Daisy, instead of using the setting
-    // on MIDI 1U
-    // int8_t channel = noteCount % 4;
-    // int8_t channelOffset = 1; // MPE mode shifts this up one
-    int8_t channelOffset = 0; // MPE mode shifts this up one
-
-    // can use Daisy to send the highest MIDI note to Intellijel?
-
     switch(m.type)
     {
         case NoteOn:
         {
-            NoteOnEvent p = m.AsNoteOn();
-            
-            // Handle shift register mode - processes all incoming MIDI notes
-            if (shiftRegisterMode)
-            {
-                AddNoteToQueue(p.note, p.velocity);
-                
-                // Also send MIDI to external devices with tuning applied
-                if (sendPitchBendMidi) {
-                    const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
-                    float centsDeviation = CalculateCentsDeviation(p.note, tuning);
-                    int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
-                    SendPitchBend(m.channel + channelOffset, pitchBendValue);
-                }
-                
-                uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + m.channel + channelOffset), p.note, p.velocity};
-                hw.midi.SendMessage(bytes, 3);
-            }
-            
-            // Handle sequencer mode - adds notes to sequencer array for later triggering
-            if (sequencerMode) {
-                // Sequencer mode: Add note to sequencer notes array
-                AddNoteToSequencer(p.note);
-                
-                // Don't immediately allocate voices - sequencer will trigger them later
-                // If shift register mode is also active, sequencer-generated notes will go through shift register
-            }
-            
-            // Handle normal voice allocation (only if neither special mode is active)
-            if (!shiftRegisterMode && !sequencerMode) {
-                // Voice allocation: Round-robin distribution across voices 0-3
-                int8_t voiceIndex = -1;
-                
-                // Step 1: Try the next voice in round-robin sequence if it's free
-                if (!envelopes[nextVoiceIndex].gate) {
-                    voiceIndex = nextVoiceIndex;
-                } else {
-                    // Step 2: If next voice is busy, search for any free voice
-                    bool foundFree = false;
-                    for (int i = 0; i < 4; i++) {
-                        if (!envelopes[i].gate) {
-                            voiceIndex = i;
-                            foundFree = true;
-                            break;
-                        }
-                    }
-                    
-                    // Step 3: If no free voice, use the next voice in round-robin (voice stealing)
-                    if (!foundFree) {
-                        voiceIndex = nextVoiceIndex;
-                        
-                        // Send note-off for the stolen voice
-                        if (voices[voiceIndex].note > 0) {
-                            uint8_t noteOffBytes[3] = {
-                                static_cast<uint8_t>(0x80 + voiceIndex + channelOffset), 
-                                static_cast<uint8_t>(voices[voiceIndex].note), 
-                                0
-                            };
-                            hw.midi.SendMessage(noteOffBytes, 3);
-                        }
-                    }
-                }
-                
-                // Store the allocated voice channel
-                p.channel = voiceIndex;
-                
-                // Advance round-robin index for next note
-                nextVoiceIndex = (voiceIndex + 1) % 4;
-                
-                // Send pitch bend before note-on if tuning is enabled
-                // Send on the allocated voice channel (voiceIndex)
-                if (sendPitchBendMidi) {
-                    const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
-                    float centsDeviation = CalculateCentsDeviation(p.note, tuning);
-                    int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
-                    SendPitchBend(voiceIndex + channelOffset, pitchBendValue);
-                }
-                
-                // Send MIDI note-on to external devices on the allocated voice channel
-                uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + voiceIndex + channelOffset), p.note, p.velocity};
-                hw.midi.SendMessage(bytes, 3);
-                
-                // Update internal oscillator frequencies BEFORE setting gate to avoid clicks
-                if (useInternalOscillators) {
-                    float freq = MidiNoteToFrequency(p.note, voiceIndex);
-                    voiceInterpOsc[voiceIndex].SetFreq(freq);
-                }
-                
-                // Update voice state
-                envelopes[voiceIndex].gate = true;
-                voices[voiceIndex].note = p.note;
-                voices[voiceIndex].velocity = p.velocity;
-                voices[voiceIndex].allocationOrder = voiceAllocationCounter++;
-                
-                // Set velocity-scaled sustain level before retriggering
-                float sustainKnobValue = hw.controls[2].Process(); // Read sustain knob directly
-                float baseSustainLevel = 0.01f * powf(100.0f, sustainKnobValue);
-                float velocityFactor = p.velocity / 127.0f;
-                float velocityScaledSustain = baseSustainLevel * velocityFactor;
-                envelopes[voiceIndex].env.SetSustainLevel(velocityScaledSustain);
-                
-                envelopes[voiceIndex].env.Retrigger(true);
-            }
-
-            // pass highest currently held note to Intellijel via channel 16 and CC
-            // 8 on the Intellijel Xpander
-            currentHighestNote = getCurrentHighestNote();
-            if (currentHighestNote != lastHighestNote) {
-                SendMidiMesssage(currentHighestNote, 14, "NOTE_ON");
-            }
-            // turn off previous note
-            if (lastHighestNote != 0 && lastHighestNote != currentHighestNote) {
-                SendMidiMesssage(lastHighestNote, 14, "NOTE_OFF");
-            }
-            lastHighestNote = currentHighestNote;
-
-            // pass lowest currently held note to Intellijel via channel 15 and CC
-            // 7 on the Intellijel Xpander
-            currentLowestNote = getCurrentLowestNote();
-            if (currentLowestNote != lastLowestNote) {
-                SendMidiMesssage(currentLowestNote, 13, "NOTE_ON");
-            }
-            // turn off previous note
-            if (lastLowestNote != 0 && lastLowestNote != currentLowestNote) {
-                SendMidiMesssage(lastLowestNote, 13, "NOTE_OFF");
-            }
-            lastLowestNote = currentLowestNote;
-
-            // Turn off the previously played note first
-            if (lastCurrentNote != 0) {
-                SendMidiMesssage(lastCurrentNote, 15, "NOTE_OFF");
-            }
-
-            // this voice is meant to be sent to Multigrain
-            // pass current note and trigger to Intellijel via channel 13
-            lastCurrentNote = currentNote;
-            currentNote = p.note;
-            
-            
-            // Send the new note
-            SendMidiMesssage(p.note, 15, "NOTE_ON");
-            
-            // Process CC slots based on subdivision logic
-            ProcessCCSlots();
-            
-            // Note: Triggers are now sent individually for each CC in ProcessCCQueue()
-            // This ensures each CC gets its own trigger, which is needed for CC pairs
-
-            // probably move outside of audio callback
-            // char message[60];
-            // snprintf(message, 60, "Note:%d Ch:%d", p.note, static_cast<int>(p.channel));
-            // DisplayMessage(message);
-            
-            noteCount++;
+            NoteOnEvent event = m.AsNoteOn();
+            ProcessHandlerChainNoteOn(event);
+            break;
         }
-        break;
         case NoteOff:
         {
-            NoteOffEvent p = m.AsNoteOff();
-            
-            // Handle shift register mode - processes all incoming MIDI note-offs
-            if (shiftRegisterMode)
-            {
-                RemoveNoteFromQueue(p.note);
-                
-                // Also send note-off to external devices
-                uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + m.channel + channelOffset), p.note, p.velocity};
-                hw.midi.SendMessage(bytes, 3);
-            }
-            
-            // Handle sequencer mode - removes notes from sequencer array
-            if (sequencerMode) {
-                // Sequencer mode: Remove note from sequencer notes array
-                RemoveNoteFromSequencer(p.note);
-            }
-            
-            // Handle normal voice allocation (only if neither special mode is active)
-            if (!shiftRegisterMode && !sequencerMode) {
-                // Voice allocation: turn off all voices playing this note
-                for (int i = 0; i < 4; i++) {
-                    if (voices[i].note == p.note) {
-                        // Send MIDI note-off to external devices on this voice's channel
-                        uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + i + channelOffset), p.note, p.velocity};
-                        hw.midi.SendMessage(bytes, 3);
-                        
-                        envelopes[i].gate = false;
-                        
-                        // Clear voice data when note is released
-                        voices[i].note = 0;
-                        voices[i].velocity = 0;
-                        voices[i].allocationOrder = 0;
-                    }
-                }
-            }
-            
-            // update highest and lowest notes when a note is released
-            currentHighestNote = getCurrentHighestNote();
-            if (currentHighestNote != lastHighestNote) {
-                if (lastHighestNote != 0) {
-                    SendMidiMesssage(lastHighestNote, 15, "NOTE_OFF");
-                }
-                if (currentHighestNote != 0) {
-                    SendMidiMesssage(currentHighestNote, 15, "NOTE_ON");
-                }
-            }
-            lastHighestNote = currentHighestNote;
-
-            currentLowestNote = getCurrentLowestNote();
-            if (currentLowestNote != lastLowestNote) {
-                if (lastLowestNote != 0) {
-                    SendMidiMesssage(lastLowestNote, 14, "NOTE_OFF");
-                }
-                if (currentLowestNote != 0) {
-                    SendMidiMesssage(currentLowestNote, 14, "NOTE_ON");
-                }
-            }
-            lastLowestNote = currentLowestNote;
+            NoteOffEvent event = m.AsNoteOff();
+            ProcessHandlerChainNoteOff(event);
+            break;
         }
         default: break;
     }
@@ -1401,7 +1203,7 @@ int main(void)
         }
 
         // Update trigger sequence
-        UpdateTriggerSequence();
+        ProcessSequencerMidiSource();
     }
 }
 
@@ -1736,10 +1538,11 @@ void ProcessEncoder()
         if (sequencerMode) {
             // When enabling sequencer mode, capture currently held notes
             CaptureCurrentlyHeldNotes();
-        } else {
-            // Clear sequencer notes when disabling sequencer mode to prevent artifacts
-            ClearSequencerNotes();
-        }
+            } else {
+                // Clear sequencer notes when disabling sequencer mode to prevent artifacts
+                ClearSequencerNotes();
+                ResetCCState(); // Reset CC state when disabling sequencer
+            }
         
         // Update display to show mode change
         UpdateOled();
@@ -1758,6 +1561,7 @@ void ProcessEncoder()
                 // SetDebugMessage("Shift Register OFF");
                 // Clear all voices when disabling shift register mode
                 ClearAllVoices();
+                ResetCCState(); // Reset CC state when disabling shift register
             }
             
             UpdateOled();
@@ -2311,151 +2115,30 @@ void InitTriggerSequence()
     sequenceStepInterval = static_cast<uint32_t>(60000 / (clockBpm * 4));  // 16th note timing
 }
 
-void UpdateTriggerSequence()
-{
-    // Only run sequencer when sequencer mode is enabled
-    if (!sequencerMode) {
-        return;
-    }
-    
-    if (!sequenceEnabled) {
-        return;
-    }
 
-    uint32_t currentTime = hw.seed.system.GetNow();
-
-    // Check if it's time to advance to the next sequence step
-    if ((currentTime - lastSequenceStepTime) >= sequenceStepInterval) {
-        AdvanceSequenceStep();
-        lastSequenceStepTime = currentTime;
-    }
-}
-
-void AdvanceSequenceStep()
-{
-    // Check if current step should trigger
-    if (triggerSequence[currentSequenceStep]) {
-        if (sequencerMode && !sequencerNotes.empty()) {
-            // Sequencer mode: trigger next note from sequencer notes array
-            uint8_t noteToTrigger = sequencerNotes[sequencerNoteIndex];
-            
-            // Send the sequencer-generated note to the shift register system
-            // This ensures all notes (MIDI and sequencer-generated) are handled consistently
-            if (shiftRegisterMode) {
-                // Send to shift register system
-                AddNoteToQueue(static_cast<int8_t>(noteToTrigger), 127);
-            } else {
-                // If shift register mode is off, use normal voice allocation
-                // Voice allocation: Round-robin distribution across voices 0-3
-                int8_t voiceIndex = nextVoiceIndex;
-                
-                // Send note-off for the voice we're about to steal (if it's playing a note)
-                if (voices[voiceIndex].note > 0) {
-                    uint8_t noteOffBytes[3] = {
-                        static_cast<uint8_t>(0x80 + voiceIndex), 
-                        static_cast<uint8_t>(voices[voiceIndex].note), 
-                        0
-                    };
-                    hw.midi.SendMessage(noteOffBytes, 3);
-                }
-                
-                // Advance round-robin index for next note
-                nextVoiceIndex = (voiceIndex + 1) % 4;
-                
-                // Send pitch bend before note-on if tuning is enabled
-                if (sendPitchBendMidi) {
-                    const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
-                    float centsDeviation = CalculateCentsDeviation(noteToTrigger, tuning);
-                    int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
-                    SendPitchBend(voiceIndex, pitchBendValue);
-                }
-                
-                // Send MIDI note-on to external devices on the allocated voice channel
-                uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + voiceIndex), noteToTrigger, 127};
-                hw.midi.SendMessage(bytes, 3);
-                
-                // Update internal oscillator frequencies BEFORE setting gate to avoid clicks
-                if (useInternalOscillators) {
-                    float freq = MidiNoteToFrequency(noteToTrigger, voiceIndex);
-                    voiceInterpOsc[voiceIndex].SetFreq(freq);
-                }
-                
-                // Update voice state
-                envelopes[voiceIndex].gate = true;
-                voices[voiceIndex].note = noteToTrigger;
-                voices[voiceIndex].velocity = 127;
-                voices[voiceIndex].allocationOrder = voiceAllocationCounter++;
-                
-                // Set velocity-scaled sustain level before retriggering
-                float sustainKnobValue = hw.controls[2].Process(); // Read sustain knob directly
-                float baseSustainLevel = 0.01f * powf(100.0f, sustainKnobValue);
-                float velocityScaledSustain = baseSustainLevel; // Use full velocity for sequencer
-                envelopes[voiceIndex].env.SetSustainLevel(velocityScaledSustain);
-                
-                envelopes[voiceIndex].env.Retrigger(true);
-                
-                // Schedule note-off based on note length percentage (only when not using shift register)
-                uint32_t noteOffDelay = static_cast<uint32_t>(sequenceStepInterval * sequencerNoteLengthPercent);
-                noteOffDelay = std::min(noteOffDelay, sequenceStepInterval - 10); // Leave at least 10ms before next step
-                sequencerNoteOffTime = hw.seed.system.GetNow() + noteOffDelay;
-                sequencerNoteOffPending = true;
-                sequencerNoteToTurnOff = noteToTrigger;
-                sequencerVoiceToTurnOff = voiceIndex;
-            }
-            
-            // Process CC slots based on subdivision logic
-            ProcessCCSlots();
-            
-            // Advance to next note in sequencer array
-            sequencerNoteIndex = (sequencerNoteIndex + 1) % sequencerNotes.size();
-        } else {
-            // Original trigger behavior for keyboard mode or when no sequencer notes
-            SendMidiMesssage(127, 15, "CC");
-            SendMidiMesssage(triggerNote, 15, "TRIGGER_ON");
-
-            // Schedule trigger off after a short duration (50ms)
-            sequenceTriggerOffTime = hw.seed.system.GetNow() + 50;
-            sequenceTriggerOffPending = true;
-        }
-    }
-    
-    // Advance to next step
-    currentSequenceStep = (currentSequenceStep + 1) % TRIGGER_SEQUENCE_LENGTH;
-}
-
-void AddCCToQueue(uint8_t ccValue, bool isReset)
-{
+// Legacy wrapper functions for backward compatibility
+void AddCCToQueue(uint8_t ccValue, bool isReset) {
     // Check if queue is full
     if (ccQueueCount >= CC_QUEUE_SIZE) {
-        // Debug: Show queue full error
         // SetDebugMessage("CC Queue Full!");
-        return; // Queue is full, drop the CC
+        return;
     }
     
-    // Calculate send time based on current time and delay
     uint32_t currentTime = hw.seed.system.GetNow();
     uint32_t sendTime;
     
     if (!isReset) {
-        // For regular CC, space them out by CC_RESET_DELAY_MS
-        // Each CC waits for the previous one to complete
         if (ccQueueCount == 0) {
-            // First CC in queue - send immediately
-            sendTime = currentTime + 10; // Small delay to ensure ordering
+            sendTime = currentTime + 10;
         } else {
-            // Subsequent CCs - wait for previous CC to complete
-            // Calculate based on queue position and CC_RESET_DELAY_MS
             sendTime = currentTime + (ccQueueCount * CC_RESET_DELAY_MS) + 10;
         }
     } else {
-        // For reset CC, use the configured delay
         sendTime = currentTime + CC_RESET_DELAY_MS;
     }
     
-    // Calculate hold duration - each CC is held for CC_RESET_DELAY_MS
     uint32_t holdUntil = sendTime + CC_RESET_DELAY_MS;
     
-    // Add to queue
     ccQueue[ccQueueTail].ccValue = ccValue;
     ccQueue[ccQueueTail].sendTime = sendTime;
     ccQueue[ccQueueTail].holdUntil = holdUntil;
@@ -2463,56 +2146,63 @@ void AddCCToQueue(uint8_t ccValue, bool isReset)
     
     ccQueueTail = (ccQueueTail + 1) % CC_QUEUE_SIZE;
     ccQueueCount++;
-    
-    // Debug: Show CC added to queue with timing info
-    // uint32_t delayMs = (sendTime - currentTime);
-    // SetDebugMessageF("Add CC:%d Q:%d +%dms", ccValue, ccQueueCount, delayMs);
 }
 
-void ProcessCCQueue()
-{
+void ProcessCCQueue() {
     uint32_t currentTime = hw.seed.system.GetNow();
+    
+    // Initialize CC state if not done yet
+    if (!ccStateInitialized) {
+        SendMidiMesssage(0, 15, "CC");
+        lastCCValue = 0;
+        ccIsLatched = false;
+        ccStateInitialized = true;
+        // SetDebugMessage("CC Init");
+    }
     
     // Process all ready items in the queue
     while (ccQueueCount > 0) {
         CCQueueItem& item = ccQueue[ccQueueHead];
         
-        // Check if it's time to send this CC
         if (currentTime >= item.sendTime) {
-            // Send the CC
             SendMidiMesssage(item.ccValue, 15, "CC");
             lastCCValue = item.ccValue;
             ccLatchTime = currentTime;
             ccIsLatched = true;
             
-            // Send trigger immediately after CC to ensure consumer sees updated CC value
             SendMidiMesssage(60, 15, "TRIGGER_ON");
-            
-            // Set timer for CC-triggered trigger off
             ccTriggerOffTime = currentTime + TRIGGER_OFF_DELAY_MS;
             ccTriggerOffPending = true;
-        
             
-            // Remove from queue
             ccQueueHead = (ccQueueHead + 1) % CC_QUEUE_SIZE;
             ccQueueCount--;
         } else {
-            // Not time yet, stop processing
             break;
         }
     }
     
-    // Check if CC should be latched down to lowest value
+    // Check if CC should be latched down to zero (using same delay as CC changes)
     if (ccIsLatched && ccQueueCount == 0) {
-        // No more CCs in queue, check if we should latch down
         uint32_t timeSinceLastCC = currentTime - ccLatchTime;
         if (timeSinceLastCC >= CC_RESET_DELAY_MS) {
-            // Latch down to lowest value (0)
-            SendMidiMesssage(ccSlotValues[0], 15, "CC");
-            lastCCValue = ccSlotValues[0];
+            SendMidiMesssage(0, 15, "CC");
+            lastCCValue = 0;
             ccIsLatched = false;
+            // SetDebugMessage("CC Latch Down");
         }
     }
+}
+
+void ResetCCState() {
+    // Force immediate reset to clean state
+    ccQueueCount = 0;
+    ccQueueHead = 0;
+    ccQueueTail = 0;
+    SendMidiMesssage(0, 15, "CC");
+    lastCCValue = 0;
+    ccIsLatched = false;
+    ccStateInitialized = true;
+    // SetDebugMessage("CC Reset");
 }
 
 bool ShouldFireWithProbability(uint8_t probability) {
@@ -2528,14 +2218,11 @@ void ProcessCCSlots()
     
     int triggeredSlots = 0;
     uint8_t triggeredValues[8];
-    int triggeredIndices[8];
     
     // Check each slot's probability
     for (int i = 0; i < 8; i++) {
-        // Check if this slot should fire based on probability only
         if (ShouldFireWithProbability(ccSlotProbabilities[i])) {
             triggeredValues[triggeredSlots] = ccSlotValues[i];
-            triggeredIndices[triggeredSlots] = i;
             triggeredSlots++;
         }
     }
@@ -2543,6 +2230,11 @@ void ProcessCCSlots()
     // Queue all triggered CCs
     for (int i = 0; i < triggeredSlots; i++) {
         AddCCToQueue(triggeredValues[i], false);
+    }
+    
+    // If no CCs were triggered and we have a high CC value, force latch down
+    if (triggeredSlots == 0 && lastCCValue > 0) {
+        ResetCCState();
     }
 }
 
@@ -2607,4 +2299,362 @@ void BuildPattern(int level, std::vector<bool>& result, const std::vector<int>& 
             BuildPattern(level - 2, result, count, remainder);
         }
     }
+}
+
+// ============================================================================
+// MIDI Architecture - Template-based Handler Chain Implementation
+// ============================================================================
+
+// NullHandler terminates the chain
+struct NullHandler {
+    bool HandleNoteOn(NoteOnEvent& event) { return false; }
+    bool HandleNoteOff(NoteOffEvent& event) { return false; }
+};
+
+// Template-based handler chain - zero runtime overhead
+template<typename NextHandler>
+class HandlerBase {
+protected:
+    NextHandler next;
+public:
+    NextHandler& GetNext() { return next; }
+};
+
+// SequencerCaptureHandler - captures notes into sequencer array
+template<typename NextHandler>
+class SequencerCaptureHandler : public HandlerBase<NextHandler> {
+public:
+    bool HandleNoteOn(NoteOnEvent& event) {
+        if (sequencerMode) {
+            // Add note to sequencer notes array
+            AddNoteToSequencer(event.note);
+        }
+        // Always pass to next handler
+        return this->GetNext().HandleNoteOn(event);
+    }
+    
+    bool HandleNoteOff(NoteOffEvent& event) {
+        if (sequencerMode) {
+            // Remove note from sequencer notes array
+            RemoveNoteFromSequencer(event.note);
+        }
+        // Always pass to next handler
+        return this->GetNext().HandleNoteOff(event);
+    }
+};
+
+// ShiftRegisterHandler - processes notes through shift register system
+template<typename NextHandler>
+class ShiftRegisterHandler : public HandlerBase<NextHandler> {
+public:
+    bool HandleNoteOn(NoteOnEvent& event) {
+        if (shiftRegisterMode) {
+            // Process through shift register
+            AddNoteToQueue(event.note, event.velocity);
+            
+            // Send MIDI to external devices with tuning applied
+            if (sendPitchBendMidi) {
+                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                float centsDeviation = CalculateCentsDeviation(event.note, tuning);
+                int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
+                SendPitchBend(event.channel, pitchBendValue);
+            }
+            
+            uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + event.channel), event.note, event.velocity};
+            hw.midi.SendMessage(bytes, 3);
+            
+            return true; // Handled - stop chain
+        }
+        // Pass to next handler if not in shift register mode
+        return this->GetNext().HandleNoteOn(event);
+    }
+    
+    bool HandleNoteOff(NoteOffEvent& event) {
+        if (shiftRegisterMode) {
+            // Process through shift register
+            RemoveNoteFromQueue(event.note);
+            
+            // Send note-off to external devices
+            uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + event.channel), event.note, event.velocity};
+            hw.midi.SendMessage(bytes, 3);
+            
+            return true; // Handled - stop chain
+        }
+        // Pass to next handler if not in shift register mode
+        return this->GetNext().HandleNoteOff(event);
+    }
+};
+
+// NormalVoiceHandler - direct voice allocation (round-robin)
+template<typename NextHandler>
+class NormalVoiceHandler : public HandlerBase<NextHandler> {
+public:
+    bool HandleNoteOn(NoteOnEvent& event) {
+        // Voice allocation: Round-robin distribution across voices 0-3
+        int8_t voiceIndex = -1;
+        
+        // Step 1: Try the next voice in round-robin sequence if it's free
+        if (!envelopes[nextVoiceIndex].gate) {
+            voiceIndex = nextVoiceIndex;
+        } else {
+            // Step 2: If next voice is busy, search for any free voice
+            bool foundFree = false;
+            for (int i = 0; i < 4; i++) {
+                if (!envelopes[i].gate) {
+                    voiceIndex = i;
+                    foundFree = true;
+                    break;
+                }
+            }
+            
+            // Step 3: If no free voice, use the next voice in round-robin (voice stealing)
+            if (!foundFree) {
+                voiceIndex = nextVoiceIndex;
+                
+                // Send note-off for the stolen voice
+                if (voices[voiceIndex].note > 0) {
+                    uint8_t noteOffBytes[3] = {
+                        static_cast<uint8_t>(0x80 + voiceIndex), 
+                        static_cast<uint8_t>(voices[voiceIndex].note), 
+                        0
+                    };
+                    hw.midi.SendMessage(noteOffBytes, 3);
+                }
+            }
+        }
+        
+        // Store the allocated voice channel
+        event.channel = voiceIndex;
+        
+        // Advance round-robin index for next note
+        nextVoiceIndex = (voiceIndex + 1) % 4;
+        
+        // Send pitch bend before note-on if tuning is enabled
+        if (sendPitchBendMidi) {
+            const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+            float centsDeviation = CalculateCentsDeviation(event.note, tuning);
+            int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
+            SendPitchBend(voiceIndex, pitchBendValue);
+        }
+        
+        // Send MIDI note-on to external devices on the allocated voice channel
+        uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + voiceIndex), event.note, event.velocity};
+        hw.midi.SendMessage(bytes, 3);
+        
+        // Update internal oscillator frequencies BEFORE setting gate to avoid clicks
+        if (useInternalOscillators) {
+            float freq = MidiNoteToFrequency(event.note, voiceIndex);
+            voiceInterpOsc[voiceIndex].SetFreq(freq);
+        }
+        
+        // Update voice state
+        envelopes[voiceIndex].gate = true;
+        voices[voiceIndex].note = event.note;
+        voices[voiceIndex].velocity = event.velocity;
+        voices[voiceIndex].allocationOrder = voiceAllocationCounter++;
+        
+        // Set velocity-scaled sustain level before retriggering
+        float sustainKnobValue = hw.controls[2].Process(); // Read sustain knob directly
+        float baseSustainLevel = 0.01f * powf(100.0f, sustainKnobValue);
+        float velocityFactor = event.velocity / 127.0f;
+        float velocityScaledSustain = baseSustainLevel * velocityFactor;
+        envelopes[voiceIndex].env.SetSustainLevel(velocityScaledSustain);
+        
+        envelopes[voiceIndex].env.Retrigger(true);
+        
+        // Pass to next handler
+        return this->GetNext().HandleNoteOn(event);
+    }
+    
+    bool HandleNoteOff(NoteOffEvent& event) {
+        // Voice allocation: turn off all voices playing this note
+        for (int i = 0; i < 4; i++) {
+            if (voices[i].note == event.note) {
+                // Send MIDI note-off to external devices on this voice's channel
+                uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + i), event.note, event.velocity};
+                hw.midi.SendMessage(bytes, 3);
+                
+                envelopes[i].gate = false;
+                
+                // Clear voice data when note is released
+                voices[i].note = 0;
+                voices[i].velocity = 0;
+                voices[i].allocationOrder = 0;
+            }
+        }
+        
+        // Pass to next handler
+        return this->GetNext().HandleNoteOff(event);
+    }
+};
+
+// IntellijelTrackerHandler - tracks highest/lowest/current notes and sends to Intellijel
+template<typename NextHandler>
+class IntellijelTrackerHandler : public HandlerBase<NextHandler> {
+public:
+    bool HandleNoteOn(NoteOnEvent& event) {
+        // Pass highest currently held note to Intellijel via channel 16 and CC
+        // 8 on the Intellijel Xpander
+        currentHighestNote = getCurrentHighestNote();
+        if (currentHighestNote != lastHighestNote) {
+            SendMidiMesssage(currentHighestNote, 14, "NOTE_ON");
+        }
+        // turn off previous note
+        if (lastHighestNote != 0 && lastHighestNote != currentHighestNote) {
+            SendMidiMesssage(lastHighestNote, 14, "NOTE_OFF");
+        }
+        lastHighestNote = currentHighestNote;
+
+        // pass lowest currently held note to Intellijel via channel 15 and CC
+        // 7 on the Intellijel Xpander
+        currentLowestNote = getCurrentLowestNote();
+        if (currentLowestNote != lastLowestNote) {
+            SendMidiMesssage(currentLowestNote, 13, "NOTE_ON");
+        }
+        // turn off previous note
+        if (lastLowestNote != 0 && lastLowestNote != currentLowestNote) {
+            SendMidiMesssage(lastLowestNote, 13, "NOTE_OFF");
+        }
+        lastLowestNote = currentLowestNote;
+
+        // Turn off the previously played note first
+        if (lastCurrentNote != 0) {
+            SendMidiMesssage(lastCurrentNote, 15, "NOTE_OFF");
+        }
+
+        // this voice is meant to be sent to Multigrain
+        // pass current note and trigger to Intellijel via channel 13
+        lastCurrentNote = currentNote;
+        currentNote = event.note;
+        
+        // Send the new note
+        SendMidiMesssage(event.note, 15, "NOTE_ON");
+        
+        // Process CC slots based on subdivision logic
+        ProcessCCSlots();
+        
+        noteCount++;
+        
+        // Always pass to next handler (side effects, doesn't stop chain)
+        return this->GetNext().HandleNoteOn(event);
+    }
+    
+    bool HandleNoteOff(NoteOffEvent& event) {
+        // update highest and lowest notes when a note is released
+        currentHighestNote = getCurrentHighestNote();
+        if (currentHighestNote != lastHighestNote) {
+            if (lastHighestNote != 0) {
+                SendMidiMesssage(lastHighestNote, 15, "NOTE_OFF");
+            }
+            if (currentHighestNote != 0) {
+                SendMidiMesssage(currentHighestNote, 15, "NOTE_ON");
+            }
+        }
+        lastHighestNote = currentHighestNote;
+
+        currentLowestNote = getCurrentLowestNote();
+        if (currentLowestNote != lastLowestNote) {
+            if (lastLowestNote != 0) {
+                SendMidiMesssage(lastLowestNote, 14, "NOTE_OFF");
+            }
+            if (currentLowestNote != 0) {
+                SendMidiMesssage(currentLowestNote, 14, "NOTE_ON");
+            }
+        }
+        lastLowestNote = currentLowestNote;
+        
+        // Always pass to next handler (side effects, doesn't stop chain)
+        return this->GetNext().HandleNoteOff(event);
+    }
+};
+
+// Define the handler chain type - compile-time composition
+using HandlerChain = SequencerCaptureHandler<
+    ShiftRegisterHandler<
+        NormalVoiceHandler<
+            IntellijelTrackerHandler<NullHandler>
+        >
+    >
+>;
+
+// Global handler chain instance
+HandlerChain handlerChain;
+
+// Wrapper functions for forward declarations
+void ProcessHandlerChainNoteOn(NoteOnEvent& event) {
+    handlerChain.HandleNoteOn(event);
+}
+
+void ProcessHandlerChainNoteOff(NoteOffEvent& event) {
+    handlerChain.HandleNoteOff(event);
+}
+
+// SequencerMidiSource - generates notes from sequencer array based on clock
+class SequencerMidiSource {
+public:
+    void Process() {
+        if (!sequencerMode || sequencerNotes.empty()) {
+            return;
+        }
+        
+        // Check if it's time to advance to the next sequence step
+        uint32_t currentTime = hw.seed.system.GetNow();
+        if ((currentTime - lastSequenceStepTime) >= sequenceStepInterval) {
+            AdvanceSequenceStep();
+            lastSequenceStepTime = currentTime;
+        }
+    }
+    
+private:
+    void AdvanceSequenceStep() {
+        // Check if current step should trigger
+        if (triggerSequence[currentSequenceStep]) {
+            // Sequencer mode: trigger next note from sequencer notes array
+            uint8_t noteToTrigger = sequencerNotes[sequencerNoteIndex];
+            
+            // Create note event and send through handler chain
+            NoteOnEvent event;
+            event.note = noteToTrigger;
+            event.velocity = 127;
+            event.channel = 0; // Will be set by voice allocation
+            
+            ProcessHandlerChainNoteOn(event);
+            
+            // Process CC slots based on subdivision logic
+            ProcessCCSlots();
+            
+            // Advance to next note in sequencer array
+            sequencerNoteIndex = (sequencerNoteIndex + 1) % sequencerNotes.size();
+            
+            // Schedule note-off based on note length percentage (only when not using shift register)
+            if (!shiftRegisterMode) {
+                uint32_t noteOffDelay = static_cast<uint32_t>(sequenceStepInterval * sequencerNoteLengthPercent);
+                noteOffDelay = std::min(noteOffDelay, sequenceStepInterval - 10); // Leave at least 10ms before next step
+                sequencerNoteOffTime = hw.seed.system.GetNow() + noteOffDelay;
+                sequencerNoteOffPending = true;
+                sequencerNoteToTurnOff = noteToTrigger;
+                sequencerVoiceToTurnOff = event.channel; // Will be set by voice allocation
+            }
+        } else {
+            // Original trigger behavior for keyboard mode or when no sequencer notes
+            // Use CC queue system instead of direct SendMidiMesssage to ensure proper state management
+            // AddCCToQueue(127, false);
+            SendMidiMesssage(triggerNote, 15, "TRIGGER_ON");
+
+            // Schedule trigger off after a short duration (50ms)
+            sequenceTriggerOffTime = hw.seed.system.GetNow() + 50;
+            sequenceTriggerOffPending = true;
+        }
+        
+        // Advance to next step
+        currentSequenceStep = (currentSequenceStep + 1) % TRIGGER_SEQUENCE_LENGTH;
+    }
+};
+
+// Global sequencer source instance
+SequencerMidiSource sequencerMidiSource;
+
+// Wrapper function for sequencer source
+void ProcessSequencerMidiSource() {
+    sequencerMidiSource.Process();
 }
