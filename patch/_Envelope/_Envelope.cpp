@@ -341,7 +341,7 @@ void      ProcessControls();
 void      ApplyVCAs();
 void      ApplyPanning(float* data);
 void      UpdateOled();
-void      plucksApply();
+// void      plucksApply();
 void      InitPan(float samplerate);
 void      SendPitchBend(uint8_t channel, int16_t bendValue);
 void      ProcessCCSlots();
@@ -968,6 +968,7 @@ void HandleMidiMessage(MidiEvent m)
         {
             NoteOnEvent p = m.AsNoteOn();
             
+            // Handle shift register mode - processes all incoming MIDI notes
             if (shiftRegisterMode)
             {
                 AddNoteToQueue(p.note, p.velocity);
@@ -982,16 +983,19 @@ void HandleMidiMessage(MidiEvent m)
                 
                 uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + m.channel + channelOffset), p.note, p.velocity};
                 hw.midi.SendMessage(bytes, 3);
-            } else if (sequencerMode) {
+            }
+            
+            // Handle sequencer mode - adds notes to sequencer array for later triggering
+            if (sequencerMode) {
                 // Sequencer mode: Add note to sequencer notes array
                 AddNoteToSequencer(p.note);
                 
-                // Don't immediately allocate voices - sequencer will trigger them
-                // Just update display
-                // char message[60];
-                // snprintf(message, 60, "Seq:%d Notes:%d", p.note, static_cast<int>(sequencerNotes.size()));
-                // DisplayMessage(message);
-            } else {
+                // Don't immediately allocate voices - sequencer will trigger them later
+                // If shift register mode is also active, sequencer-generated notes will go through shift register
+            }
+            
+            // Handle normal voice allocation (only if neither special mode is active)
+            if (!shiftRegisterMode && !sequencerMode) {
                 // Voice allocation: Round-robin distribution across voices 0-3
                 int8_t voiceIndex = -1;
                 
@@ -1122,6 +1126,7 @@ void HandleMidiMessage(MidiEvent m)
         {
             NoteOffEvent p = m.AsNoteOff();
             
+            // Handle shift register mode - processes all incoming MIDI note-offs
             if (shiftRegisterMode)
             {
                 RemoveNoteFromQueue(p.note);
@@ -1129,15 +1134,16 @@ void HandleMidiMessage(MidiEvent m)
                 // Also send note-off to external devices
                 uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + m.channel + channelOffset), p.note, p.velocity};
                 hw.midi.SendMessage(bytes, 3);
-            } else if (sequencerMode) {
+            }
+            
+            // Handle sequencer mode - removes notes from sequencer array
+            if (sequencerMode) {
                 // Sequencer mode: Remove note from sequencer notes array
                 RemoveNoteFromSequencer(p.note);
-                
-                // Update display
-                // char message[60];
-                // snprintf(message, 60, "Seq Off:%d Notes:%d", p.note, static_cast<int>(sequencerNotes.size()));
-                // DisplayMessage(message);
-            } else {
+            }
+            
+            // Handle normal voice allocation (only if neither special mode is active)
+            if (!shiftRegisterMode && !sequencerMode) {
                 // Voice allocation: turn off all voices playing this note
                 for (int i = 0; i < 4; i++) {
                     if (voices[i].note == p.note) {
@@ -1365,8 +1371,11 @@ int main(void)
         // Check for sequencer note-off timing
         if (sequencerNoteOffPending && currentTime >= sequencerNoteOffTime)
         {
-            if (sequencerVoiceToTurnOff >= 0) {
-                // Send MIDI note-off to external devices
+            if (shiftRegisterMode) {
+                // Send note-off to shift register system
+                RemoveNoteFromQueue(static_cast<int8_t>(sequencerNoteToTurnOff));
+            } else if (sequencerVoiceToTurnOff >= 0) {
+                // Send MIDI note-off to external devices (when shift register mode is off)
                 uint8_t bytes[3] = {
                     static_cast<uint8_t>(0x80 + sequencerVoiceToTurnOff), 
                     sequencerNoteToTurnOff, 
@@ -1616,8 +1625,8 @@ void UpdateOled()
         }
         
         // Show global note counter and queue status - move to avoid bottom-right area
-        WriteFixedStringF(hw, knobPositions[0], 32, 8, font_s, "Note:%d", globalNoteCounter);
-        WriteFixedStringF(hw, knobPositions[2], 32, 4, font_s, "Q:%d", ccQueueCount);
+        // WriteFixedStringF(hw, knobPositions[0], 32, 8, font_s, "Note:%d", globalNoteCounter);
+        // WriteFixedStringF(hw, knobPositions[2], 32, 4, font_s, "Q:%d", ccQueueCount);
     }
     
     // === BOTTOM ROW: General State Info (always visible) ===
@@ -1637,15 +1646,23 @@ void UpdateOled()
         WriteFixedStringF(hw, knobPositions[0], 56, 10, font_s, "%3d|%3d", currentNote, clockBpm);
 
         // Display mode indicators - right side with proper spacing
+        // if (sequencerMode && shiftRegisterMode) {
+            // Both modes active
+            // WriteFixedString(hw, knobPositions[3], 56, 4, font_s, "SQ+SR");
+        // } else if (sequencerMode) {
         if (sequencerMode) {
-            // Sequencer mode active
-            WriteFixedString(hw, knobPositions[3], 56, 2, font_s, "SQ");
-        } else if (shiftRegisterMode) {
-            // Shift register mode active
-            WriteFixedString(hw, knobPositions[3], 56, 2, font_s, "SR");
+            // Sequencer mode active only
+            WriteFixedString(hw, 100, 56, 4, font_s, "SQ");
+        } else {
+            WriteFixedString(hw, 100, 56, 5, font_s, "  ");
+        }
+        
+        if (shiftRegisterMode) {
+            // Shift register mode active only
+            WriteFixedString(hw, 116, 56, 4, font_s, "SR");
         } else {
             // No special mode active - clear the area
-            WriteFixedString(hw, knobPositions[3], 56, 5, font_s, "     ");  // 5 spaces to clear
+            WriteFixedString(hw, 116, 56, 5, font_s, "  ");
         }
     }
     
@@ -2322,79 +2339,75 @@ void AdvanceSequenceStep()
             // Sequencer mode: trigger next note from sequencer notes array
             uint8_t noteToTrigger = sequencerNotes[sequencerNoteIndex];
             
-            // Voice allocation: Round-robin distribution across voices 0-3
-            // In sequencer mode, we always use round-robin regardless of gate state
-            // because note-offs are scheduled with delays and gates may still be true
-            // This ensures proper voice distribution instead of always stealing the same voice
-            int8_t voiceIndex = nextVoiceIndex;
-            
-            // Send note-off for the voice we're about to steal (if it's playing a note)
-            if (voices[voiceIndex].note > 0) {
-                uint8_t noteOffBytes[3] = {
-                    static_cast<uint8_t>(0x80 + voiceIndex), 
-                    static_cast<uint8_t>(voices[voiceIndex].note), 
-                    0
-                };
-                hw.midi.SendMessage(noteOffBytes, 3);
+            // Send the sequencer-generated note to the shift register system
+            // This ensures all notes (MIDI and sequencer-generated) are handled consistently
+            if (shiftRegisterMode) {
+                // Send to shift register system
+                AddNoteToQueue(static_cast<int8_t>(noteToTrigger), 127);
+            } else {
+                // If shift register mode is off, use normal voice allocation
+                // Voice allocation: Round-robin distribution across voices 0-3
+                int8_t voiceIndex = nextVoiceIndex;
+                
+                // Send note-off for the voice we're about to steal (if it's playing a note)
+                if (voices[voiceIndex].note > 0) {
+                    uint8_t noteOffBytes[3] = {
+                        static_cast<uint8_t>(0x80 + voiceIndex), 
+                        static_cast<uint8_t>(voices[voiceIndex].note), 
+                        0
+                    };
+                    hw.midi.SendMessage(noteOffBytes, 3);
+                }
+                
+                // Advance round-robin index for next note
+                nextVoiceIndex = (voiceIndex + 1) % 4;
+                
+                // Send pitch bend before note-on if tuning is enabled
+                if (sendPitchBendMidi) {
+                    const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                    float centsDeviation = CalculateCentsDeviation(noteToTrigger, tuning);
+                    int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
+                    SendPitchBend(voiceIndex, pitchBendValue);
+                }
+                
+                // Send MIDI note-on to external devices on the allocated voice channel
+                uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + voiceIndex), noteToTrigger, 127};
+                hw.midi.SendMessage(bytes, 3);
+                
+                // Update internal oscillator frequencies BEFORE setting gate to avoid clicks
+                if (useInternalOscillators) {
+                    float freq = MidiNoteToFrequency(noteToTrigger, voiceIndex);
+                    voiceInterpOsc[voiceIndex].SetFreq(freq);
+                }
+                
+                // Update voice state
+                envelopes[voiceIndex].gate = true;
+                voices[voiceIndex].note = noteToTrigger;
+                voices[voiceIndex].velocity = 127;
+                voices[voiceIndex].allocationOrder = voiceAllocationCounter++;
+                
+                // Set velocity-scaled sustain level before retriggering
+                float sustainKnobValue = hw.controls[2].Process(); // Read sustain knob directly
+                float baseSustainLevel = 0.01f * powf(100.0f, sustainKnobValue);
+                float velocityScaledSustain = baseSustainLevel; // Use full velocity for sequencer
+                envelopes[voiceIndex].env.SetSustainLevel(velocityScaledSustain);
+                
+                envelopes[voiceIndex].env.Retrigger(true);
+                
+                // Schedule note-off based on note length percentage (only when not using shift register)
+                uint32_t noteOffDelay = static_cast<uint32_t>(sequenceStepInterval * sequencerNoteLengthPercent);
+                noteOffDelay = std::min(noteOffDelay, sequenceStepInterval - 10); // Leave at least 10ms before next step
+                sequencerNoteOffTime = hw.seed.system.GetNow() + noteOffDelay;
+                sequencerNoteOffPending = true;
+                sequencerNoteToTurnOff = noteToTrigger;
+                sequencerVoiceToTurnOff = voiceIndex;
             }
-            
-            // Advance round-robin index for next note
-            nextVoiceIndex = (voiceIndex + 1) % 4;
-            
-            // Send pitch bend before note-on if tuning is enabled
-            if (sendPitchBendMidi) {
-                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
-                float centsDeviation = CalculateCentsDeviation(noteToTrigger, tuning);
-                int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
-                SendPitchBend(voiceIndex, pitchBendValue);
-            }
-            
-            // Send MIDI note-on to external devices on the allocated voice channel
-            uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + voiceIndex), noteToTrigger, 127};
-            hw.midi.SendMessage(bytes, 3);
-            
-            // Update internal oscillator frequencies BEFORE setting gate to avoid clicks
-            if (useInternalOscillators) {
-                float freq = MidiNoteToFrequency(noteToTrigger, voiceIndex);
-                voiceInterpOsc[voiceIndex].SetFreq(freq);
-            }
-            
-            // Update voice state
-            envelopes[voiceIndex].gate = true;
-            voices[voiceIndex].note = noteToTrigger;
-            voices[voiceIndex].velocity = 127;
-            voices[voiceIndex].allocationOrder = voiceAllocationCounter++;
-            
-            // Set velocity-scaled sustain level before retriggering
-            float sustainKnobValue = hw.controls[2].Process(); // Read sustain knob directly
-            float baseSustainLevel = 0.01f * powf(100.0f, sustainKnobValue);
-            float velocityScaledSustain = baseSustainLevel; // Use full velocity for sequencer
-            envelopes[voiceIndex].env.SetSustainLevel(velocityScaledSustain);
-            
-            envelopes[voiceIndex].env.Retrigger(true);
             
             // Process CC slots based on subdivision logic
             ProcessCCSlots();
             
             // Advance to next note in sequencer array
             sequencerNoteIndex = (sequencerNoteIndex + 1) % sequencerNotes.size();
-            
-            // Note: Triggers are now sent individually for each CC in ProcessCCQueue()
-            // This ensures each CC gets its own trigger, which is needed for CC pairs
-            
-            // Schedule note-off based on note length percentage
-            // Ensure note-off happens well before next step to avoid timing conflicts
-            uint32_t noteOffDelay = static_cast<uint32_t>(sequenceStepInterval * sequencerNoteLengthPercent);
-            noteOffDelay = std::min(noteOffDelay, sequenceStepInterval - 10); // Leave at least 10ms before next step
-            sequencerNoteOffTime = hw.seed.system.GetNow() + noteOffDelay;
-            sequencerNoteOffPending = true;
-            sequencerNoteToTurnOff = noteToTrigger;
-            sequencerVoiceToTurnOff = voiceIndex;
-            
-            // Display current sequencer note
-            // char message[60];
-            // snprintf(message, 60, "Seq:%d Ch:%d", noteToTrigger, voiceIndex);
-            // DisplayMessage(message);
         } else {
             // Original trigger behavior for keyboard mode or when no sequencer notes
             SendMidiMesssage(127, 15, "CC");
