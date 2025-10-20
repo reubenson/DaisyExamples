@@ -160,15 +160,9 @@ struct NullHandler;
 template<typename NextHandler> class HandlerBase;
 template<typename NextHandler> class SequencerCaptureHandler;
 template<typename NextHandler> class ShiftRegisterHandler;
-template<typename NextHandler> class NormalVoiceHandler;
 template<typename NextHandler> class IntellijelTrackerHandler;
-using HandlerChain = SequencerCaptureHandler<
-    ShiftRegisterHandler<
-        NormalVoiceHandler<
-            IntellijelTrackerHandler<NullHandler>
-        >
-    >
->;
+template<typename NextHandler> class NormalVoiceHandler;
+
 void ProcessHandlerChainNoteOn(NoteOnEvent& event);
 void ProcessHandlerChainNoteOff(NoteOffEvent& event);
 void ProcessSequencerMidiSource();
@@ -248,10 +242,12 @@ uint32_t lastSequenceStepTime = 0;  // Last time sequence step advanced
 uint32_t sequenceStepInterval = 0;  // Interval between sequence steps
 bool sequenceEnabled = true;  // Enable/disable sequence
 uint8_t triggerNote = 36;  // MIDI note for triggers (C2)
+uint8_t ccTriggerChannel = 12; // configured to channel 13 in Intellijel MIDI
+uint8_t ccValueChannel = 15; // configured to channel 16 in Intellijel MIDI
 
 // Trigger off timing for sequence
-uint32_t sequenceTriggerOffTime = 0;
-bool sequenceTriggerOffPending = false;
+// uint32_t sequenceTriggerOffTime = 0;
+// bool sequenceTriggerOffPending = false;
 
 // Sequencer note-off timing
 uint32_t sequencerNoteOffTime = 0;
@@ -845,82 +841,78 @@ void InitEnvelopes(float samplerate)
     }
 }
 
-void PassthroughMidiMessage(MidiEvent m)
-{
-    int8_t channelOffset = 0; // probably don't need this
-    if (m.channel > 4)
-    {
-        // return;
-    }
+// void PassthroughMidiMessage(MidiEvent m)
+// {
+//     int8_t channelOffset = 0; // probably don't need this
 
-    switch(m.type)
-    {
-        case NoteOn:
-        {
-            NoteOnEvent p = m.AsNoteOn();
+//     switch(m.type)
+//     {
+//         case NoteOn:
+//         {
+//             NoteOnEvent p = m.AsNoteOn();
 
-            // Send pitch bend before note-on if tuning is enabled
-            if (sendPitchBendMidi) {
-                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
-                float centsDeviation = CalculateCentsDeviation(p.note, tuning);
-                int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
-                SendPitchBend(m.channel + channelOffset, pitchBendValue);
-            }
+//             // Send pitch bend before note-on if tuning is enabled
+//             if (sendPitchBendMidi) {
+//                 const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+//                 float centsDeviation = CalculateCentsDeviation(p.note, tuning);
+//                 int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
+//                 SendPitchBend(m.channel + channelOffset, pitchBendValue);
+//             }
 
-            uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + m.channel + channelOffset), p.note, p.velocity};
+//             uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + m.channel + channelOffset), p.note, p.velocity};
 
-            // if (m.channel == 0)
-            // {
-            //     bytes[0] = 0x90;
-            //     // osc1.SetFrequency(mtof(p.note) / 4.0);
-            // } else if (m.channel == 1)
-            // {
-            //     bytes[0] = 0x91;
-            //     // osc2.SetFrequency(mtof(p.note) / 4.0);
-            // }
-            hw.midi.SendMessage(bytes, 3);
-        }
-        break;
-        case NoteOff:
-        {
-            NoteOffEvent p = m.AsNoteOff();
-            // for (int i = 0; i < 4; i++) {
-            uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + m.channel + channelOffset), p.note, p.velocity};
-                // hw.midi.SendMessage(bytes, 3);
-            // }
-            // if (m.channel == 0)
-            // {
-            //     bytes[0] = 0x80;
-            // } else if (m.channel == 1)
-            // {
-            //     bytes[0] = 0x81;
-            // }
-            hw.midi.SendMessage(bytes, 3);
-            // DisplayMessage("NoteOff");
-        }
-        break;
-        case ControlChange:
-        {
-            ControlChangeEvent p = m.AsControlChange();
-            switch(p.control_number)
-            {
-                case 76: // slide
-                    // hw.seed.dac.WriteValue(DacHandle::Channel::ONE,
-                    //     (p.value / 64.) * 4095);
+//             // if (m.channel == 0)
+//             // {
+//             //     bytes[0] = 0x90;
+//             //     // osc1.SetFrequency(mtof(p.note) / 4.0);
+//             // } else if (m.channel == 1)
+//             // {
+//             //     bytes[0] = 0x91;
+//             //     // osc2.SetFrequency(mtof(p.note) / 4.0);
+//             // }
+//             hw.midi.SendMessage(bytes, 3);
+//         }
+//         break;
+//         case NoteOff:
+//         {
+//             NoteOffEvent p = m.AsNoteOff();
+//             // for (int i = 0; i < 4; i++) {
+//             uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + m.channel + channelOffset), p.note, p.velocity};
+//                 // hw.midi.SendMessage(bytes, 3);
+//             // }
+//             // if (m.channel == 0)
+//             // {
+//             //     bytes[0] = 0x80;
+//             // } else if (m.channel == 1)
+//             // {
+//             //     bytes[0] = 0x81;
+//             // }
+//             hw.midi.SendMessage(bytes, 3);
+//             // DisplayMessage("NoteOff");
+//         }
+//         break;
+//         case ControlChange:
+//         {
+//             ControlChangeEvent p = m.AsControlChange();
+//             switch(p.control_number)
+//             {
+//                 case 76: // slide
+//                     // hw.seed.dac.WriteValue(DacHandle::Channel::ONE,
+//                     //     (p.value / 64.) * 4095);
                     
-                    // CC 1 for cutoff.
-                    // filt.SetFreq(mtof((float)p.value));
-                    break;
-                case 2:
-                    // CC 2 for res.
-                    // filt.SetRes(((float)p.value / 127.0f));
-                    break;
-                default: break;
-            }
-        }
-        default: break;
-    }
-}
+//                     // CC 1 for cutoff.
+//                     // filt.SetFreq(mtof((float)p.value));
+//                     break;
+//                 case 2:
+//                     // CC 2 for res.
+//                     // filt.SetRes(((float)p.value / 127.0f));
+//                     break;
+//                 default: break;
+//             }
+//         }
+//         default: break;
+//     }
+// }
 
 void SendMidiMesssage(uint8_t value, uint8_t channel, char* type)
 {
@@ -1154,7 +1146,7 @@ int main(void)
         if (triggerOffPending && currentTime >= triggerOffTime)
         {
             // Send trigger off on channel 15 (matches the trigger on sent earlier)
-            SendMidiMesssage(60, 15, "TRIGGER_OFF");
+            SendMidiMesssage(triggerNote, ccTriggerChannel, "TRIGGER_OFF");
             triggerOffPending = false;
         }
         
@@ -1162,7 +1154,7 @@ int main(void)
         if (ccTriggerOffPending && currentTime >= ccTriggerOffTime)
         {
             // Send CC-triggered trigger off on channel 15
-            SendMidiMesssage(60, 15, "TRIGGER_OFF");
+            SendMidiMesssage(triggerNote, ccTriggerChannel, "TRIGGER_OFF");
             ccTriggerOffPending = false;
         }
         
@@ -1170,11 +1162,11 @@ int main(void)
         ProcessCCQueue();
         
         // Check for sequence trigger off timing
-        if (sequenceTriggerOffPending && currentTime >= sequenceTriggerOffTime)
-        {
-            SendMidiMesssage(triggerNote, 15, "TRIGGER_OFF");
-            sequenceTriggerOffPending = false;
-        }
+        // if (sequenceTriggerOffPending && currentTime >= sequenceTriggerOffTime)
+        // {
+        //     SendMidiMesssage(triggerNote, ccTriggerChannel, "TRIGGER_OFF");
+        //     sequenceTriggerOffPending = false;
+        // }
         
         // Check for sequencer note-off timing
         if (sequencerNoteOffPending && currentTime >= sequencerNoteOffTime)
@@ -2149,7 +2141,7 @@ void ProcessCCQueue() {
             ccLatchTime = currentTime;
             ccIsLatched = true;
             
-            SendMidiMesssage(60, 15, "TRIGGER_ON");
+            SendMidiMesssage(triggerNote, ccTriggerChannel, "TRIGGER_ON");
             ccTriggerOffTime = currentTime + TRIGGER_OFF_DELAY_MS;
             ccTriggerOffPending = true;
             
@@ -2164,7 +2156,7 @@ void ProcessCCQueue() {
     if (ccIsLatched && ccQueueCount == 0) {
         uint32_t timeSinceLastCC = currentTime - ccLatchTime;
         if (timeSinceLastCC >= CC_RESET_DELAY_MS) {
-            SendMidiMesssage(0, 15, "CC");
+            SendMidiMesssage(0, ccValueChannel, "CC");
             lastCCValue = 0;
             ccIsLatched = false;
             // SetDebugMessage("CC Latch Down");
@@ -2177,7 +2169,7 @@ void ResetCCState() {
     ccQueueCount = 0;
     ccQueueHead = 0;
     ccQueueTail = 0;
-    SendMidiMesssage(0, 15, "CC");
+    SendMidiMesssage(0, ccValueChannel, "CC");
     lastCCValue = 0;
     ccIsLatched = false;
     ccStateInitialized = true;
@@ -2468,6 +2460,7 @@ public:
 };
 
 // IntellijelTrackerHandler - tracks highest/lowest/current notes and sends to Intellijel
+// needs to be sent before triggers for notes/triggers/gates from normal voice handling
 template<typename NextHandler>
 class IntellijelTrackerHandler : public HandlerBase<NextHandler> {
 public:
@@ -2523,10 +2516,10 @@ public:
         currentHighestNote = getCurrentHighestNote();
         if (currentHighestNote != lastHighestNote) {
             if (lastHighestNote != 0) {
-                SendMidiMesssage(lastHighestNote, 15, "NOTE_OFF");
+                SendMidiMesssage(lastHighestNote, 14, "NOTE_OFF");
             }
             if (currentHighestNote != 0) {
-                SendMidiMesssage(currentHighestNote, 15, "NOTE_ON");
+                SendMidiMesssage(currentHighestNote, 14, "NOTE_ON");
             }
         }
         lastHighestNote = currentHighestNote;
@@ -2534,10 +2527,10 @@ public:
         currentLowestNote = getCurrentLowestNote();
         if (currentLowestNote != lastLowestNote) {
             if (lastLowestNote != 0) {
-                SendMidiMesssage(lastLowestNote, 14, "NOTE_OFF");
+                SendMidiMesssage(lastLowestNote, 13, "NOTE_OFF");
             }
             if (currentLowestNote != 0) {
-                SendMidiMesssage(currentLowestNote, 14, "NOTE_ON");
+                SendMidiMesssage(currentLowestNote, 13, "NOTE_ON");
             }
         }
         lastLowestNote = currentLowestNote;
@@ -2550,8 +2543,8 @@ public:
 // Define the handler chain type - compile-time composition
 using HandlerChain = SequencerCaptureHandler<
     ShiftRegisterHandler<
-        NormalVoiceHandler<
-            IntellijelTrackerHandler<NullHandler>
+        IntellijelTrackerHandler<
+            NormalVoiceHandler<NullHandler>
         >
     >
 >;
@@ -2618,11 +2611,11 @@ private:
             // Original trigger behavior for keyboard mode or when no sequencer notes
             // Use CC queue system instead of direct SendMidiMesssage to ensure proper state management
             // AddCCToQueue(127, false);
-            SendMidiMesssage(triggerNote, 15, "TRIGGER_ON");
+            // SendMidiMesssage(triggerNote, 15, "TRIGGER_ON");
 
             // Schedule trigger off after a short duration (50ms)
-            sequenceTriggerOffTime = hw.seed.system.GetNow() + 50;
-            sequenceTriggerOffPending = true;
+            // sequenceTriggerOffTime = hw.seed.system.GetNow() + 50;
+            // sequenceTriggerOffPending = true;
         }
         
         // Advance to next step
