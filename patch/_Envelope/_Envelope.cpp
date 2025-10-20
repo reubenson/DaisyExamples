@@ -265,6 +265,7 @@ Parameter densityParam, noteParam;
 struct panelStruct
 {
     std::string     name;
+    char            id;
     std::string     input1Name;
     std::string     input2Name;
     std::string     input3Name;
@@ -273,7 +274,8 @@ struct panelStruct
 };
 panelStruct displayPanels[6] = {
     { 
-        name: "ADSR", 
+        name: "ADSR",
+        id: 'e',
         input1Name: "A", 
         input2Name: "D/R", 
         input3Name: "S",
@@ -281,15 +283,17 @@ panelStruct displayPanels[6] = {
         values: {0.0f, 0.0f, 0.0f, 0.0f}
     },
     {
-        name: "PANNING",
+        name: "MIXER",
+        id: 'm',
         input1Name: "Freq",
         input2Name: "Amp",
         input3Name: "",
-        input4Name: "",
-        values: {0.0f, 0.0f, 0.0f, 0.0f}
+        input4Name: "Vol",
+        values: {0.0f, 0.0f, 0.0f, 0.8f}
     },
     {
-        name: "OSCILLATORS",
+        name: "OSC",
+        id: 'o',
         input1Name: "Waveform",
         input2Name: "",
         input3Name: "",
@@ -297,7 +301,17 @@ panelStruct displayPanels[6] = {
         values: {0.0f, 0.0f, 0.0f, 0.0f}
     },
     {
-        name: "TRIGSEQ",
+        name: "TUNING",
+        id: 't',
+        input1Name: "T",
+        input2Name: "",
+        input3Name: "MIDI",
+        input4Name: "",
+        values: {0.0f, 0.0f, 1.0f, 1.0f}
+    },
+    {
+        name: "SEQUENCER",
+        id: 's',
         input1Name: "Density",
         input2Name: "Order",
         input3Name: "Length",
@@ -305,15 +319,8 @@ panelStruct displayPanels[6] = {
         values: {0.0f, 0.0f, 0.5f, 0.0f}
     },
     {
-        name: "TUNING",
-        input1Name: "Tuning",
-        input2Name: "Range",
-        input3Name: "MIDI",
-        input4Name: "Osc",
-        values: {0.0f, 0.0f, 1.0f, 1.0f}
-    },
-    {
-        name: "CC SLOTS",
+        name: "SAMPLER",
+        id: 'c',
         input1Name: "CC1-2",
         input2Name: "CC3-4",
         input3Name: "CC5-6",
@@ -380,6 +387,7 @@ bool      IsDebugMessageExpired();
 // SD Card functions
 bool      SaveSettingsToSD();
 bool      LoadSettingsFromSD();
+void      SetDefaultPanelValues();
 
 // Trigger Sequence Generator functions
 void      InitTriggerSequence();
@@ -585,6 +593,20 @@ bool LoadSettingsFromSD()
     return true;
 }
 
+void SetDefaultPanelValues()
+{
+    // Initialize MIXER panel with default values
+    displayPanels[1].values[0] = 0.02f;  // Frequency (0.2Hz / 10Hz max = 0.02)
+    displayPanels[1].values[1] = 1.0f;   // Amplitude (full effect)
+    displayPanels[1].values[3] = 0.8f;   // Volume (default 0.8 to prevent distortion)
+    
+    // Initialize tuning panel with default values
+    displayPanels[4].values[0] = 0.0f;  // Tuning selector (12-TET)
+    displayPanels[4].values[1] = 0.09f;  // Pitch bend range (200 cents)
+    displayPanels[4].values[2] = 1.0f;  // MIDI output enabled
+    displayPanels[4].values[3] = 1.0f;  // Internal oscillators enabled
+}
+
 void ClearPanelArea()
 {
     // Clear the panel-specific area (y=24-55) to prevent overlap when switching panels
@@ -637,8 +659,10 @@ void ApplyPanning(float* data) {
     PanEqualPowerStereo(pan2, data[2], &L3, &R3);
     PanEqualPowerStereo(pan3, data[3], &L4, &R4);
 
-    data[0] = L1 + L2 + L3 + L4;
-    data[1] = R1 + R2 + R3 + R4;
+    // Sum all voices and apply volume control from MIXER panel knob 4
+    float mixVolume = displayPanels[1].values[3]; // MIXER panel (index 1), knob 4 (index 3)
+    data[0] = (L1 + L2 + L3 + L4) * mixVolume;
+    data[1] = (R1 + R2 + R3 + R4) * mixVolume;
     hw.seed.dac.WriteValue(DacHandle::Channel::ONE, ((panOutput + 1.0f) / 2.0f) * 4095);
 }
 
@@ -1003,24 +1027,14 @@ int main(void)
     if (sd_result != SdmmcHandler::Result::OK) {
         // SetDebugMessage("SD: Init failed");
         // Set defaults when SD card fails
-        displayPanels[1].values[0] = 0.02f;  // Frequency (0.2Hz / 10Hz max = 0.02)
-        displayPanels[1].values[1] = 1.0f;   // Amplitude (full effect)
-        displayPanels[4].values[0] = 0.0f;  // Tuning selector (12-TET)
-        displayPanels[4].values[1] = 0.09f;  // Pitch bend range (200 cents)
-        displayPanels[4].values[2] = 1.0f;  // MIDI output enabled
-        displayPanels[4].values[3] = 1.0f;  // Internal oscillators enabled
+        SetDefaultPanelValues();
     } else {
         // Initialize BSP SD card
         uint8_t bsp_result = BSP_SD_Init();
         if (bsp_result != MSD_OK) {
             // SetDebugMessage("SD: BSP Init failed");
             // Set defaults when BSP SD init fails
-            displayPanels[1].values[0] = 0.02f;  // Frequency (0.2Hz / 10Hz max = 0.02)
-            displayPanels[1].values[1] = 1.0f;   // Amplitude (full effect)
-            displayPanels[4].values[0] = 0.0f;  // Tuning selector (12-TET)
-            displayPanels[4].values[1] = 0.09f;  // Pitch bend range (200 cents)
-            displayPanels[4].values[2] = 1.0f;  // MIDI output enabled
-            displayPanels[4].values[3] = 1.0f;  // Internal oscillators enabled
+            SetDefaultPanelValues();
         } else {
             sdCardInitialized = true;
             // Load settings from SD card
@@ -1028,15 +1042,7 @@ int main(void)
             
             // Only set defaults if no settings were loaded from SD card
             if (!settingsLoaded) {
-                // Initialize panning panel with default values
-                displayPanels[1].values[0] = 0.02f;  // Frequency (0.2Hz / 10Hz max = 0.02)
-                displayPanels[1].values[1] = 1.0f;   // Amplitude (full effect)
-                
-                // Initialize tuning panel with default values
-                displayPanels[4].values[0] = 0.0f;  // Tuning selector (12-TET)
-                displayPanels[4].values[1] = 0.09f;  // Pitch bend range (200 cents)
-                displayPanels[4].values[2] = 1.0f;  // MIDI output enabled
-                displayPanels[4].values[3] = 1.0f;  // Internal oscillators enabled
+                SetDefaultPanelValues();
             }
         }
     }
@@ -1208,9 +1214,9 @@ int main(void)
 }
 
 // Helper function to format parameter values based on panel context
-std::string FormatParameterValue(const std::string& panelName, int paramIndex, float value)
+std::string FormatParameterValue(char panelId, int paramIndex, float value)
 {
-    if (panelName == "ADSR") {
+    if (panelId == 'e') {
         switch(paramIndex) {
             case 0: // Attack time
                 if (value < 0.01f) return "0ms";
@@ -1227,16 +1233,18 @@ std::string FormatParameterValue(const std::string& panelName, int paramIndex, f
             default: return "0%";
         }
     }
-    else if (panelName == "PANNING") {
+    else if (panelId == 'm') {
         switch(paramIndex) {
             case 0: // Frequency
                 return std::to_string(static_cast<int>(value * 10)) + "Hz";
             case 1: // Amplitude
                 return std::to_string(static_cast<int>(value * 100)) + "%";
+            case 3: // Volume
+                return std::to_string(static_cast<int>(value * 100)) + "%";
             default: return "0%";
         }
     }
-    else if (panelName == "OSCILLATORS") {
+    else if (panelId == 'o') {
         switch(paramIndex) {
             case 0: // Waveform
                 if (value < 0.25f) return "Sine";
@@ -1246,7 +1254,7 @@ std::string FormatParameterValue(const std::string& panelName, int paramIndex, f
             default: return "Sine";
         }
     }
-    else if (panelName == "TRIGSEQ") {
+    else if (panelId == 's') {
         switch(paramIndex) {
             case 0: // Density
                 return std::to_string(static_cast<int>(value * 16)) + "/16";
@@ -1263,20 +1271,16 @@ std::string FormatParameterValue(const std::string& panelName, int paramIndex, f
             default: return "0";
         }
     }
-    else if (panelName == "TUNING") {
+    else if (panelId == 't') {
         switch(paramIndex) {
             case 0: // Tuning selector
                 return std::to_string(static_cast<int>(value * 9)) + "/9";
-            case 1: // Range
-                return std::to_string(static_cast<int>(100 + value * 1100)) + "c";
             case 2: // MIDI
-                return value > 0.5f ? "ON" : "OFF";
-            case 3: // Osc
                 return value > 0.5f ? "ON" : "OFF";
             default: return "OFF";
         }
     }
-    else if (panelName == "CC SLOTS") {
+    else if (panelId == 'c') {
         switch(paramIndex) {
             case 0: // CC1-2
             case 1: // CC3-4
@@ -1363,12 +1367,12 @@ void UpdateOled()
     
     // Display parameter values below meters
     for (int i = 0; i < 4; i++) {
-        std::string paramValue = FormatParameterValue(currentPanel.name, i, currentPanel.values[i]);
+        std::string paramValue = FormatParameterValue(currentPanel.id, i, currentPanel.values[i]);
         WriteFixedString(hw, knobPositions[i], paramValueY, 5, font_s, paramValue.c_str());
     }
     
     // Show trigger sequence pattern when in TRIGSEQ mode
-    if (currentPanel.name == "TRIGSEQ") {
+    if (currentPanel.id == 's') {
         // Show current mode - REMOVE (now in bottom row)
         
         // Show step counter with fixed width - move to avoid bottom-right area
@@ -1403,21 +1407,13 @@ void UpdateOled()
         }
     }
     // Show tuning information when in TUNING mode
-    else if (currentPanel.name == "TUNING") {
+    else if (currentPanel.id == 't') {
         // Show current tuning name with fixed width (21 chars to fill display width)
         const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
         WriteFixedString(hw, knobPositions[0], 24, 21, font_s, tuning->name);
-        
-        // Show pitch bend range with fixed width
-        WriteFixedStringF(hw, knobPositions[0], 32, 10, font_s, "Rng:%4.0fc", pitchBendRange);
-        
-        // Show MIDI and Osc status with fixed width
-        WriteFixedStringF(hw, knobPositions[3], 40, 2, font_s, "%s%s", 
-                         sendPitchBendMidi ? "M" : "-", 
-                         applyToInternalOsc ? "O" : "-");
     }
     // Show CC Slots information when in CC SLOTS mode
-    else if (currentPanel.name == "CC SLOTS") {
+    else if (currentPanel.id == 'c') {
         // Show current probabilities for each slot pair
         const char* slotLabels[4] = {"CC1-2", "CC3-4", "CC5-6", "CC7-8"};
         for (int i = 0; i < 4; i++) {
@@ -1531,18 +1527,18 @@ void ProcessEncoder()
     // Detect long press: trigger when held >= 0.5 seconds
     if(encoderPressed && timeHeld >= ENCODER_SEQUENCER_TOGGLE_MS && !longPressHandled)
     {
-        // Long press detected - toggle sequencer mode
-        sequencerMode = !sequencerMode;
+        // Long press detected - toggle shift register mode
+        shiftRegisterMode = !shiftRegisterMode;
         longPressHandled = true;
         
-        if (sequencerMode) {
-            // When enabling sequencer mode, capture currently held notes
-            CaptureCurrentlyHeldNotes();
-            } else {
-                // Clear sequencer notes when disabling sequencer mode to prevent artifacts
-                ClearSequencerNotes();
-                ResetCCState(); // Reset CC state when disabling sequencer
-            }
+        if (shiftRegisterMode) {
+            // SetDebugMessage("Shift Register ON");
+        } else {
+            // SetDebugMessage("Shift Register OFF");
+            // Clear all voices when disabling shift register mode
+            ClearAllVoices();
+            ResetCCState(); // Reset CC state when disabling shift register
+        }
         
         // Update display to show mode change
         UpdateOled();
@@ -1552,17 +1548,17 @@ void ProcessEncoder()
         // Button was released
         if(!longPressHandled)
         {
-            // Short press - toggle shift register mode
-            shiftRegisterMode = !shiftRegisterMode;
+            // Short press - toggle sequencer mode
+            sequencerMode = !sequencerMode;
             
-            if (shiftRegisterMode) {
-                // SetDebugMessage("Shift Register ON");
-            } else {
-                // SetDebugMessage("Shift Register OFF");
-                // Clear all voices when disabling shift register mode
-                ClearAllVoices();
-                ResetCCState(); // Reset CC state when disabling shift register
-            }
+            if (sequencerMode) {
+                // When enabling sequencer mode, capture currently held notes
+                CaptureCurrentlyHeldNotes();
+                } else {
+                    // Clear sequencer notes when disabling sequencer mode to prevent artifacts
+                    ClearSequencerNotes();
+                    ResetCCState(); // Reset CC state when disabling sequencer
+                }
             
             UpdateOled();
         }
@@ -1602,7 +1598,7 @@ void ProcessKnobs()
         knobChanged = true;
     }
 
-    if (currentPanel.name == "ADSR")
+    if (currentPanel.id == 'e')
     {
         for (int i = 0; i < 4; i++)
         {
@@ -1639,7 +1635,7 @@ void ProcessKnobs()
             }
         }
     }
-    else if (currentPanel.name == "PANNING")
+    else if (currentPanel.id == 'm')
     {
         switch(inputIndex)
         {
@@ -1651,12 +1647,16 @@ void ProcessKnobs()
                 // Pan amplitude control: 0 = all voices centered, 1 = full panning effect
                 panAmp = inputs[1];
                 break;
+            case 3:
+                // Volume control: 0 = silence, 1 = unity gain
+                // This will be applied in ApplyPanning function
+                break;
             default:
                 break;
         }
     }
     // Removed Pluck panel processing to save memory
-    else if (currentPanel.name == "OSCILLATORS")
+    else if (currentPanel.id == 'o')
     {
         switch(inputIndex)
         {
@@ -1670,7 +1670,7 @@ void ProcessKnobs()
                 break;
         }
     }
-    else if (currentPanel.name == "TRIGSEQ")
+    else if (currentPanel.id == 's')
     {
         // Process parameters continuously
         sequenceEnabled = sequencerMode; // Enable sequence when sequencer mode is active
@@ -1726,7 +1726,7 @@ void ProcessKnobs()
             }
         }
     }
-    else if (currentPanel.name == "TUNING")
+    else if (currentPanel.id == 't')
     {
         switch(inputIndex)
         {
@@ -1744,17 +1744,6 @@ void ProcessKnobs()
                 }
                 break;
             case 1:
-                // Pitch bend range: ±100 to ±1200 cents
-                {
-                    float rangeValue = inputs[1];
-                    float newRange = 100.0f + rangeValue * 1100.0f; // 100 to 1200 cents
-                    if (fabs(newRange - pitchBendRange) > 1.0f) {
-                        pitchBendRange = newRange;
-                        knobChanged = true;
-                        // Apply tuning changes to sequencer notes
-                        ApplyTuningToSequencerNotes();
-                    }
-                }
                 break;
             case 2:
                 // Enable/disable pitch bend MIDI output
@@ -1767,22 +1756,12 @@ void ProcessKnobs()
                 }
                 break;
             case 3:
-                // Enable/disable internal oscillator tuning
-                {
-                    bool newApplyOsc = inputs[3] > 0.5f;
-                    if (newApplyOsc != applyToInternalOsc) {
-                        applyToInternalOsc = newApplyOsc;
-                        knobChanged = true;
-                        // Apply tuning changes to sequencer notes
-                        ApplyTuningToSequencerNotes();
-                    }
-                }
                 break;
             default:
                 break;
         }
     }
-    else if (currentPanel.name == "CC SLOTS")
+    else if (currentPanel.id == 'c')
     {
         // Update ccSlotProbabilities from panel values - correct mapping
         // Knob 1 (CC1-2): affects slots 0 and 1
