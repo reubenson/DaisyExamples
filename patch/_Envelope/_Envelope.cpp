@@ -978,9 +978,10 @@ int8_t getCurrentHighestNote() {
 }
 
 int8_t getCurrentLowestNote() {
-    int8_t lowestNote = voices[0].note;
-    for (int i = 1; i < 4; i++)
+    int8_t lowestNote = 127;
+    for (int i = 0; i < 4; i++)
     {
+        if (voices[i].note == 0) continue;
         lowestNote = std::min(lowestNote, voices[i].note);
     }
     return lowestNote;
@@ -2459,43 +2460,19 @@ public:
     }
 };
 
-// IntellijelTrackerHandler - tracks highest/lowest/current notes and sends to Intellijel
-// needs to be sent before triggers for notes/triggers/gates from normal voice handling
+// IntellijelPitchHandler - handles current note processing for channel 15
+// processes the incoming note and sends it to Multigrain via channel 15
 template<typename NextHandler>
-class IntellijelTrackerHandler : public HandlerBase<NextHandler> {
+class IntellijelPitchHandler : public HandlerBase<NextHandler> {
 public:
     bool HandleNoteOn(NoteOnEvent& event) {
-        // Pass highest currently held note to Intellijel via channel 16 and CC
-        // 8 on the Intellijel Xpander
-        currentHighestNote = getCurrentHighestNote();
-        if (currentHighestNote != lastHighestNote) {
-            SendMidiMesssage(currentHighestNote, 14, "NOTE_ON");
-        }
-        // turn off previous note
-        if (lastHighestNote != 0 && lastHighestNote != currentHighestNote) {
-            SendMidiMesssage(lastHighestNote, 14, "NOTE_OFF");
-        }
-        lastHighestNote = currentHighestNote;
-
-        // pass lowest currently held note to Intellijel via channel 15 and CC
-        // 7 on the Intellijel Xpander
-        currentLowestNote = getCurrentLowestNote();
-        if (currentLowestNote != lastLowestNote) {
-            SendMidiMesssage(currentLowestNote, 13, "NOTE_ON");
-        }
-        // turn off previous note
-        if (lastLowestNote != 0 && lastLowestNote != currentLowestNote) {
-            SendMidiMesssage(lastLowestNote, 13, "NOTE_OFF");
-        }
-        lastLowestNote = currentLowestNote;
-
         // Turn off the previously played note first
         if (lastCurrentNote != 0) {
             SendMidiMesssage(lastCurrentNote, 15, "NOTE_OFF");
         }
 
         // this voice is meant to be sent to Multigrain
-        // pass current note and trigger to Intellijel via channel 13
+        // pass current note and trigger to Intellijel via channel 15
         lastCurrentNote = currentNote;
         currentNote = event.note;
         
@@ -2512,30 +2489,48 @@ public:
     }
     
     bool HandleNoteOff(NoteOffEvent& event) {
-        // update highest and lowest notes when a note is released
+        // Always pass to next handler (side effects, doesn't stop chain)
+        return this->GetNext().HandleNoteOff(event);
+    }
+};
+
+// IntellijelTrackerHandler - tracks highest/lowest notes and sends to Intellijel
+// needs to be sent AFTER voice allocation so it can access complete voice state
+template<typename NextHandler>
+class IntellijelTrackerHandler : public HandlerBase<NextHandler> {
+public:
+    bool HandleNoteOn(NoteOnEvent& event) {
+        // Pass highest currently held note to Intellijel via channel 14
         currentHighestNote = getCurrentHighestNote();
         if (currentHighestNote != lastHighestNote) {
-            if (lastHighestNote != 0) {
+            SendMidiMesssage(currentHighestNote, 14, "NOTE_ON");
+
+            // turn off previous note
+            if (lastHighestNote != 0 && lastHighestNote != currentHighestNote) {
                 SendMidiMesssage(lastHighestNote, 14, "NOTE_OFF");
             }
-            if (currentHighestNote != 0) {
-                SendMidiMesssage(currentHighestNote, 14, "NOTE_ON");
-            }
-        }
-        lastHighestNote = currentHighestNote;
 
+            lastHighestNote = currentHighestNote;
+        }
+        
+        // pass lowest currently held note to Intellijel via channel 13
         currentLowestNote = getCurrentLowestNote();
         if (currentLowestNote != lastLowestNote) {
-            if (lastLowestNote != 0) {
+            SendMidiMesssage(currentLowestNote, 13, "NOTE_ON");
+
+            // turn off previous note
+            if (lastLowestNote != 0 && lastLowestNote != currentLowestNote) {
                 SendMidiMesssage(lastLowestNote, 13, "NOTE_OFF");
             }
-            if (currentLowestNote != 0) {
-                SendMidiMesssage(currentLowestNote, 13, "NOTE_ON");
-            }
         }
+        
         lastLowestNote = currentLowestNote;
         
         // Always pass to next handler (side effects, doesn't stop chain)
+        return this->GetNext().HandleNoteOn(event);
+    }
+    
+    bool HandleNoteOff(NoteOffEvent& event) {
         return this->GetNext().HandleNoteOff(event);
     }
 };
@@ -2543,8 +2538,10 @@ public:
 // Define the handler chain type - compile-time composition
 using HandlerChain = SequencerCaptureHandler<
     ShiftRegisterHandler<
-        IntellijelTrackerHandler<
-            NormalVoiceHandler<NullHandler>
+        IntellijelPitchHandler<
+            NormalVoiceHandler<
+                IntellijelTrackerHandler<NullHandler>
+            >
         >
     >
 >;
