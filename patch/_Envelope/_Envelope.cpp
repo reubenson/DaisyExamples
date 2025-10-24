@@ -12,7 +12,7 @@
 #include "ScreenUtils.h"
 #include "util/bsp_sd_diskio.h"
 
-// Font aliases for cleaner code
+// Font aliases
 #define font_s Font_6x8    // 6x8 pixels - small, good for labels and compact info
 #define font_m Font_7x10   // 7x10 pixels - medium, good for panel names
 #define font_l Font_11x18  // 11x18 pixels - large, good for emphasis
@@ -23,7 +23,6 @@ using namespace daisysp;
 DaisyPatch      hw;
 Fm2             osc1, osc2;
 Oscillator      pan, lfo1, lfo2, lfo3;
-// Oscillator      voice1Osc, voice3Osc;  // Internal oscillators for voices 1 and 3
 SdmmcHandler    sdcard;
 
 // Custom oscillator class for waveform interpolation
@@ -110,14 +109,6 @@ uint32_t voiceAllocationCounter = 0;  // Counter to track voice allocation order
 
 // Shift Register Mode (disabled for now)
 bool shiftRegisterMode = false;
-
-// Sequencer Mode
-bool sequencerMode = false;
-std::vector<uint8_t> sequencerNotes;  // Array of held notes for sequencer
-bool sequencerNotesAscending = true;  // Note ordering direction
-uint8_t sequencerNoteIndex = 0;  // Current index in sequencer notes array
-float sequencerNoteLengthPercent = 0.5f;  // Note length as percentage of step (10%-90%)
-bool sequencerUsingInitialCapture = false;  // True when using initially captured notes (don't stop on release)
 
 // option to use internal oscillators for voices 1 and 3
 bool useInternalOscillators = true;
@@ -228,35 +219,81 @@ const int32_t CLOCK_BPM_MAX = 1000;   // Maximum BPM
 const int32_t CLOCK_BPM_DEFAULT = 120; // Default BPM
 const int32_t CLOCK_BPM_INCREMENT = 10; // BPM change per encoder tick
 
-int32_t clockBpm = CLOCK_BPM_DEFAULT;  // Current BPM
-uint32_t lastClockTime = 0;
-uint32_t clockInterval = 0;  // Calculated interval between clock messages
-bool clockEnabled = true;
 int8_t encoderIncrement = 0;  // Track encoder rotation
 
 // Trigger Sequence Generator variables
 const uint8_t TRIGGER_SEQUENCE_LENGTH = 16;  // 16-step sequence
-bool triggerSequence[TRIGGER_SEQUENCE_LENGTH] = {false};  // Sequence pattern
-uint8_t currentSequenceStep = 0;  // Current step in sequence
-uint32_t lastSequenceStepTime = 0;  // Last time sequence step advanced
-uint32_t sequenceStepInterval = 0;  // Interval between sequence steps
-bool sequenceEnabled = true;  // Enable/disable sequence
-uint8_t triggerNote = 36;  // MIDI note for triggers (C2)
-uint8_t ccTriggerChannel = 12; // configured to channel 13 in Intellijel MIDI
-uint8_t ccValueChannel = 15; // configured to channel 16 in Intellijel MIDI
 
 // Trigger off timing for sequence
 // uint32_t sequenceTriggerOffTime = 0;
 // bool sequenceTriggerOffPending = false;
 
-// Sequencer note-off timing
-uint32_t sequencerNoteOffTime = 0;
-bool sequencerNoteOffPending = false;
-uint8_t sequencerNoteToTurnOff = 0;
-int8_t sequencerVoiceToTurnOff = -1;
 
-// Parameter objects for trigger sequence controls
-Parameter densityParam, noteParam;
+// Trigger Sequence Generator functions
+void      InitTriggerSequence();
+void      GenerateEuclideanRhythm(int numTriggers, int numSteps, bool* pattern);
+void      BuildPattern(int level, std::vector<bool>& result, const std::vector<int>& count, const std::vector<int>& remainder);
+
+// Sequencer parameters and state
+struct SequencerParams {
+    // Hardware parameter objects
+    Parameter densityParam;
+    Parameter noteParam;
+    
+    // Sequencer mode and state
+    bool sequencerMode = false;
+    bool sequencerNotesAscending = true;
+    uint8_t sequencerNoteIndex = 0;
+    float sequencerNoteLengthPercent = 0.5f;  // Note length as percentage of step (10%-90%)
+    bool sequencerUsingInitialCapture = false;
+    
+    // Sequencer note management
+    std::vector<uint8_t> sequencerNotes;  // Array of held notes for sequencer
+    uint32_t sequencerNoteOffTime = 0;
+    bool sequencerNoteOffPending = false;
+    uint8_t sequencerNoteToTurnOff = 0;
+    int8_t sequencerVoiceToTurnOff = -1;
+    
+    // Clock and timing
+    int32_t clockBpm = CLOCK_BPM_DEFAULT;
+    uint32_t lastClockTime = 0;
+    uint32_t clockInterval = 0;
+    bool clockEnabled = true;
+    
+    // Trigger sequence
+    bool triggerSequence[TRIGGER_SEQUENCE_LENGTH] = {false};
+    uint8_t currentSequenceStep = 0;
+    uint32_t lastSequenceStepTime = 0;
+    uint32_t sequenceStepInterval = 0;
+    bool sequenceEnabled = true;
+    uint8_t triggerNote = 36;  // MIDI note for triggers (C2)
+    uint8_t ccTriggerChannel = 12;
+    uint8_t ccValueChannel = 15;
+    
+    // Inline initialization (no function call overhead)
+    void Init() {
+        densityParam.Init(hw.controls[0], 0.0f, 16.0f, Parameter::LINEAR);
+        noteParam.Init(hw.controls[1], 36.0f, 84.0f, Parameter::LINEAR);
+        sequencerNotes.clear();
+        sequencerNoteIndex = 0;
+        sequencerNotesAscending = true;
+        sequencerNoteLengthPercent = 0.5f;
+        clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
+        lastClockTime = hw.seed.system.GetNow();
+        InitTriggerSequence();
+    }
+    
+    // Inline helper (no function call overhead)
+    inline int GetDensityValue() {
+        return static_cast<int>(densityParam.Process() + 0.5f);
+    }
+    
+    inline void UpdateClockInterval() {
+        clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
+    }
+};
+
+SequencerParams sequencer;
 
 struct panelStruct
 {
@@ -385,11 +422,6 @@ bool      SaveSettingsToSD();
 bool      LoadSettingsFromSD();
 void      SetDefaultPanelValues();
 
-// Trigger Sequence Generator functions
-void      InitTriggerSequence();
-void      GenerateEuclideanRhythm(int numTriggers, int numSteps, bool* pattern);
-void      BuildPattern(int level, std::vector<bool>& result, const std::vector<int>& count, const std::vector<int>& remainder);
-
 // Shift Register Mode functions
 void      AddNoteToQueue(int8_t note, int8_t velocity);
 void      RemoveNoteFromQueue(int8_t note);
@@ -479,7 +511,7 @@ bool SaveSettingsToSD()
     memset(sectorBuffer, 0, 512);
     
     // Write settings in compact format
-    pos += snprintf(buffer + pos, 512 - pos, "BPM=%ld\n", clockBpm);
+    pos += snprintf(buffer + pos, 512 - pos, "BPM=%ld\n", sequencer.clockBpm);
     
     // All panel values in one loop
     for (int panel = 0; panel < 6; panel++) {
@@ -533,8 +565,8 @@ bool LoadSettingsFromSD()
             
             // Parse different setting types
             if (strcmp(key, "BPM") == 0) {
-                clockBpm = atoi(value);
-                clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
+                sequencer.clockBpm = atoi(value);
+                sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
             }
             else if (strncmp(key, "P", 1) == 0 && strlen(key) == 3) {
                 // Parse P0_0 format
@@ -610,14 +642,6 @@ void ClearPanelArea()
     // Draw black rectangles to clear the area (false = black fill)
     hw.display.DrawRect(0, 24, 127, 55, false, true);  // Fill with black (false = black)
 }
-
-// void UpdateEnvelopes() {
-//     float ctrl4 = hw.controls[3].Process(); // the fourth control knob controls baseline level
-//     for(int j = 0; j < 4; j++)
-//     {
-//         envelopes[j].envSig = std::max(envelopes[j].env.Process(envelopes[j].gate), ctrl4);
-//     }
-// }
 
 void PanEqualPowerStereo(float pan, float value, float* left, float* right)
 {
@@ -740,8 +764,6 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     ProcessControls();
     
     // Process envelopes at audio rate for consistent timing
-    // float ctrl4 = hw.controls[3].Process(); // the fourth control knob controls baseline level
-
     for(int j = 0; j < 4; j++)
     {
         envelopes[j].envSig = envelopes[j].env.Process(envelopes[j].gate);
@@ -1043,16 +1065,6 @@ int main(void)
     samplerate = hw.AudioSampleRate();
 
     InitEnvelopes(samplerate);
-
-    // Initialize display panel values with current knob positions
-    for(int i = 0; i < 4; i++)
-    {
-        // displayPanels[0].values[i] = hw.controls[i].Process();
-        // displayPanels[1].values[i] = hw.controls[i].Process();
-        // displayPanels[2].values[i] = hw.controls[i].Process();
-        // displayPanels[3].values[i] = hw.controls[i].Process();
-        // displayPanels[4].values[i] = hw.controls[i].Process();
-    }
     
     // Initialize pitch bend values to center (no bend)
     for (int i = 0; i < 16; i++) {
@@ -1063,27 +1075,13 @@ int main(void)
     currentPanel = displayPanels[panelMode];
 
     
-    // Initialize clock interval
-    clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
-    lastClockTime = hw.seed.system.GetNow();
-    
-    // Initialize trigger sequence
-    InitTriggerSequence();
-
-    // Initialize sequencer mode
-    sequencerNotes.clear();
-    sequencerNoteIndex = 0;
-    sequencerNotesAscending = true;
-    sequencerNoteLengthPercent = 0.5f; // Default to 50%
+    // Initialize sequencer parameters
+    sequencer.Init();
     
     // Initialize BPM knob value based on current BPM
     // Map BPM to 0-1 range for knob display
-    float bpmKnobValue = static_cast<float>(clockBpm - CLOCK_BPM_MIN) / (CLOCK_BPM_MAX - CLOCK_BPM_MIN);
+    float bpmKnobValue = static_cast<float>(sequencer.clockBpm - CLOCK_BPM_MIN) / (CLOCK_BPM_MAX - CLOCK_BPM_MIN);
     displayPanels[3].values[3] = bpmKnobValue; // TRIGSEQ panel, knob 4 (BPM)
-
-    // Initialize parameter objects for trigger sequence controls
-    densityParam.Init(hw.controls[0], 0.0f, 16.5f, Parameter::LINEAR); // maybe does not actually reach the maximum value
-    noteParam.Init(hw.controls[1], 36.0f, 84.0f, Parameter::LINEAR);
 
     UpdateOled();
 
@@ -1116,10 +1114,6 @@ int main(void)
         voiceInterpOsc[i].SetWaveformParam(0.0f);  // Start with sine wave
     }
 
-    // Initialize parameters with linear scaling
-    densityParam.Init(hw.controls[0], 0.0f, 16.0f, Parameter::LINEAR);
-    noteParam.Init(hw.controls[1], 36.0f, 84.0f, Parameter::LINEAR);
-
     // Start the ADC and Audio Peripherals on the Hardware
     hw.StartAdc();
     hw.SetAudioBlockSize(blocksize);
@@ -1147,7 +1141,7 @@ int main(void)
         if (triggerOffPending && currentTime >= triggerOffTime)
         {
             // Send trigger off on channel 15 (matches the trigger on sent earlier)
-            SendMidiMesssage(triggerNote, ccTriggerChannel, "TRIGGER_OFF");
+            SendMidiMesssage(sequencer.triggerNote, sequencer.ccTriggerChannel, "TRIGGER_OFF");
             triggerOffPending = false;
         }
         
@@ -1155,7 +1149,7 @@ int main(void)
         if (ccTriggerOffPending && currentTime >= ccTriggerOffTime)
         {
             // Send CC-triggered trigger off on channel 15
-            SendMidiMesssage(triggerNote, ccTriggerChannel, "TRIGGER_OFF");
+            SendMidiMesssage(sequencer.triggerNote, sequencer.ccTriggerChannel, "TRIGGER_OFF");
             ccTriggerOffPending = false;
         }
         
@@ -1170,35 +1164,35 @@ int main(void)
         // }
         
         // Check for sequencer note-off timing
-        if (sequencerNoteOffPending && currentTime >= sequencerNoteOffTime)
+        if (sequencer.sequencerNoteOffPending && currentTime >= sequencer.sequencerNoteOffTime)
         {
             if (shiftRegisterMode) {
                 // Send note-off to shift register system
-                RemoveNoteFromQueue(static_cast<int8_t>(sequencerNoteToTurnOff));
-            } else if (sequencerVoiceToTurnOff >= 0) {
+                RemoveNoteFromQueue(static_cast<int8_t>(sequencer.sequencerNoteToTurnOff));
+            } else if (sequencer.sequencerVoiceToTurnOff >= 0) {
                 // Send MIDI note-off to external devices (when shift register mode is off)
                 uint8_t bytes[3] = {
-                    static_cast<uint8_t>(0x80 + sequencerVoiceToTurnOff), 
-                    sequencerNoteToTurnOff, 
+                    static_cast<uint8_t>(0x80 + sequencer.sequencerVoiceToTurnOff), 
+                    sequencer.sequencerNoteToTurnOff, 
                     0
                 };
                 hw.midi.SendMessage(bytes, 3);
                 
                 // Turn off the envelope gate
-                envelopes[sequencerVoiceToTurnOff].gate = false;
+                envelopes[sequencer.sequencerVoiceToTurnOff].gate = false;
                 
                 // Clear voice data
-                voices[sequencerVoiceToTurnOff].note = 0;
-                voices[sequencerVoiceToTurnOff].velocity = 0;
+                voices[sequencer.sequencerVoiceToTurnOff].note = 0;
+                voices[sequencer.sequencerVoiceToTurnOff].velocity = 0;
             }
-            sequencerNoteOffPending = false;
+            sequencer.sequencerNoteOffPending = false;
         }
 
         // Check for MIDI clock timing
-        if (clockEnabled && (currentTime - lastClockTime) >= clockInterval)
+        if (sequencer.clockEnabled && (currentTime - sequencer.lastClockTime) >= sequencer.clockInterval)
         {
             SendMidiClock();
-            lastClockTime = currentTime;
+            sequencer.lastClockTime = currentTime;
         }
 
         // Update trigger sequence
@@ -1369,30 +1363,30 @@ void UpdateOled()
         // Show current mode - REMOVE (now in bottom row)
         
         // Show step counter with fixed width - move to avoid bottom-right area
-        WriteFixedStringF(hw, knobPositions[0], 24, 8, font_s, "Step:%02d", currentSequenceStep);
+        WriteFixedStringF(hw, knobPositions[0], 24, 8, font_s, "Step:%02d", sequencer.currentSequenceStep);
 
         // Show density value with fixed width - move to avoid bottom-right area
         int numTriggers = 0;
         for (int i = 0; i < TRIGGER_SEQUENCE_LENGTH; i++) {
-            if (triggerSequence[i]) numTriggers++;
+            if (sequencer.triggerSequence[i]) numTriggers++;
         }
         WriteFixedStringF(hw, knobPositions[2], 24, 5, font_s, "D:%02d", numTriggers);
         
         // Show sequence pattern as dots in one fixed-width string
         char patternStr[TRIGGER_SEQUENCE_LENGTH + 1];
         for (int i = 0; i < TRIGGER_SEQUENCE_LENGTH; i++) {
-            patternStr[i] = triggerSequence[i] ? '*' : '-';
+            patternStr[i] = sequencer.triggerSequence[i] ? '*' : '-';
         }
         patternStr[TRIGGER_SEQUENCE_LENGTH] = '\0';
         WriteFixedString(hw, knobPositions[0], 32, TRIGGER_SEQUENCE_LENGTH, font_s, patternStr);
         
         // Show sequencer-specific information
-        if (sequencerMode) {
+        if (sequencer.sequencerMode) {
             // Show note ordering direction - move to avoid conflicts
-            WriteFixedString(hw, knobPositions[3], 32, 4, font_s, sequencerNotesAscending ? "ASC" : "DESC");
+            WriteFixedString(hw, knobPositions[3], 32, 4, font_s, sequencer.sequencerNotesAscending ? "ASC" : "DESC");
             
             // Show number of held notes - move to avoid conflicts
-            WriteFixedStringF(hw, knobPositions[0], 40, 4, font_s, "N:%d", static_cast<int>(sequencerNotes.size()));
+            WriteFixedStringF(hw, knobPositions[0], 40, 4, font_s, "N:%d", static_cast<int>(sequencer.sequencerNotes.size()));
             
             // Show note length percentage (10%-80% range) - REMOVE (conflicts with bottom-right)
             
@@ -1434,14 +1428,14 @@ void UpdateOled()
         }
     } else {
         // Display current note and BPM in compact format: "60|120" - left side
-        WriteFixedStringF(hw, knobPositions[0], 56, 10, font_s, "%3d|%3d", currentNote, clockBpm);
+        WriteFixedStringF(hw, knobPositions[0], 56, 10, font_s, "%3d|%3d", currentNote, sequencer.clockBpm);
 
         // Display mode indicators - right side with proper spacing
         // if (sequencerMode && shiftRegisterMode) {
             // Both modes active
             // WriteFixedString(hw, knobPositions[3], 56, 4, font_s, "SQ+SR");
         // } else if (sequencerMode) {
-        if (sequencerMode) {
+        if (sequencer.sequencerMode) {
             // Sequencer mode active only
             WriteFixedString(hw, 100, 56, 4, font_s, "SQ");
         } else {
@@ -1509,10 +1503,10 @@ void ProcessEncoder()
         ClearPanelArea();
         
         // Update current panel values to reflect current knob positions
-        for (int i = 0; i < 4; i++)
-        {
-            currentPanel.values[i] = hw.controls[i].Process();
-        }
+        // for (int i = 0; i < 4; i++)
+        // {
+        //     currentPanel.values[i] = hw.controls[i].Process();
+        // }
         
         knobChanged = true; // Trigger display update
     }
@@ -1542,9 +1536,9 @@ void ProcessEncoder()
         if(!longPressHandled)
         {
             // Short press - toggle sequencer mode
-            sequencerMode = !sequencerMode;
+            sequencer.sequencerMode = !sequencer.sequencerMode;
             
-            if (sequencerMode) {
+            if (sequencer.sequencerMode) {
                 // When enabling sequencer mode, capture currently held notes
                 CaptureCurrentlyHeldNotes();
                 } else {
@@ -1666,24 +1660,24 @@ void ProcessKnobs()
     else if (currentPanel.id == 's')
     {
         // Process parameters continuously
-        sequenceEnabled = sequencerMode; // Enable sequence when sequencer mode is active
+        sequencer.sequenceEnabled = sequencer.sequencerMode; // Enable sequence when sequencer mode is active
         
         // Only regenerate pattern when density knob changes
         if (inputIndex == 0) {
             // Round the parameter value to ensure we get exact integer values
-            int numTriggers = static_cast<int>(densityParam.Process() + 0.5f);
+            int numTriggers = sequencer.GetDensityValue();
             numTriggers = std::max(0, std::min(numTriggers, static_cast<int>(TRIGGER_SEQUENCE_LENGTH)));
             
             // Generate Euclidean rhythm pattern
-            GenerateEuclideanRhythm(numTriggers, TRIGGER_SEQUENCE_LENGTH, triggerSequence);
+            GenerateEuclideanRhythm(numTriggers, TRIGGER_SEQUENCE_LENGTH, sequencer.triggerSequence);
             knobChanged = true;
         }
         
         // Handle knob 2: Note ordering control
         if (inputIndex == 1) {
             bool newAscending = inputs[1] < 0.5f;
-            if (newAscending != sequencerNotesAscending) {
-                sequencerNotesAscending = newAscending;
+            if (newAscending != sequencer.sequencerNotesAscending) {
+                sequencer.sequencerNotesAscending = newAscending;
                 SortSequencerNotes(); // Re-sort existing notes
                 knobChanged = true;
             }
@@ -1692,8 +1686,8 @@ void ProcessKnobs()
         // Handle knob 3: Note length control (10% to 80% of step duration)
         if (inputIndex == 2) {
             float newLengthPercent = 0.1f + inputs[2] * 0.8f; // Map 0-1 to 0.1-0.8
-            if (fabs(newLengthPercent - sequencerNoteLengthPercent) > 0.01f) {
-                sequencerNoteLengthPercent = newLengthPercent;
+            if (fabs(newLengthPercent - sequencer.sequencerNoteLengthPercent) > 0.01f) {
+                sequencer.sequencerNoteLengthPercent = newLengthPercent;
                 knobChanged = true;
             }
         }
@@ -1702,18 +1696,18 @@ void ProcessKnobs()
         if (inputIndex == 3) {
             // Map knob value (0-1) to BPM range (CLOCK_BPM_MIN to CLOCK_BPM_MAX)
             int32_t newBpm = CLOCK_BPM_MIN + static_cast<int32_t>(inputs[3] * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
-            if (newBpm != clockBpm) {
-                clockBpm = newBpm;
+            if (newBpm != sequencer.clockBpm) {
+                sequencer.clockBpm = newBpm;
                 
                 // Recalculate clock interval
                 // MIDI clock sends 24 pulses per quarter note
                 // Interval = 60000ms / (BPM * 24)
-                clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
+                sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
                 
                 // Recalculate sequence step interval
                 // Each sequence step = 1/16th note = 6 MIDI clock pulses
                 // Interval = 60000ms / (BPM * 4) for 16th note timing
-                sequenceStepInterval = static_cast<uint32_t>(60000 / (clockBpm * 4));
+                sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));
                 
                 knobChanged = true;
             }
@@ -1957,25 +1951,25 @@ void ClearAllVoices()
 void AddNoteToSequencer(uint8_t note)
 {
     // Check if note already exists
-    for (size_t i = 0; i < sequencerNotes.size(); i++) {
-        if (sequencerNotes[i] == note) {
+    for (size_t i = 0; i < sequencer.sequencerNotes.size(); i++) {
+        if (sequencer.sequencerNotes[i] == note) {
             return; // Note already exists, don't add duplicate
         }
     }
     
     // Add note to array
-    sequencerNotes.push_back(note);
+    sequencer.sequencerNotes.push_back(note);
     
     // Sort notes based on current ordering preference
     SortSequencerNotes();
     
     // Reset sequencer note index when new notes are added
-    sequencerNoteIndex = 0;
+    sequencer.sequencerNoteIndex = 0;
     
     // If we're adding notes after initial capture, reset the flag
     // This means sequencer will now stop when notes are released (normal behavior)
-    if (sequencerUsingInitialCapture) {
-        sequencerUsingInitialCapture = false;
+    if (sequencer.sequencerUsingInitialCapture) {
+        sequencer.sequencerUsingInitialCapture = false;
     }
 }
 
@@ -1983,44 +1977,44 @@ void RemoveNoteFromSequencer(uint8_t note)
 {
     // If we're using initially captured notes, preserve all notes in the sequencer
     // This prevents losing notes when they're released at slightly different times
-    if (sequencerUsingInitialCapture) {
+    if (sequencer.sequencerUsingInitialCapture) {
         return; // Don't remove any notes when using initially captured notes
     }
     
     // Find and remove the note (normal behavior for later-added notes)
-    for (auto it = sequencerNotes.begin(); it != sequencerNotes.end(); ++it) {
+    for (auto it = sequencer.sequencerNotes.begin(); it != sequencer.sequencerNotes.end(); ++it) {
         if (*it == note) {
-            sequencerNotes.erase(it);
+            sequencer.sequencerNotes.erase(it);
             break;
         }
     }
     
     // Adjust sequencer note index if needed
-    if (!sequencerNotes.empty() && sequencerNoteIndex >= sequencerNotes.size()) {
-        sequencerNoteIndex = 0;
+    if (!sequencer.sequencerNotes.empty() && sequencer.sequencerNoteIndex >= sequencer.sequencerNotes.size()) {
+        sequencer.sequencerNoteIndex = 0;
     }
 }
 
 void SortSequencerNotes()
 {
-    if (sequencerNotesAscending) {
-        std::sort(sequencerNotes.begin(), sequencerNotes.end());
+    if (sequencer.sequencerNotesAscending) {
+        std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end());
     } else {
-        std::sort(sequencerNotes.begin(), sequencerNotes.end(), std::greater<uint8_t>());
+        std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end(), std::greater<uint8_t>());
     }
 }
 
 void ClearSequencerNotes()
 {
-    sequencerNotes.clear();
-    sequencerNoteIndex = 0;
-    sequencerUsingInitialCapture = false;  // Reset flag when clearing notes
+    sequencer.sequencerNotes.clear();
+    sequencer.sequencerNoteIndex = 0;
+    sequencer.sequencerUsingInitialCapture = false;  // Reset flag when clearing notes
 }
 
 void CaptureCurrentlyHeldNotes()
 {
     // Clear existing sequencer notes first
-    sequencerNotes.clear();
+    sequencer.sequencerNotes.clear();
     
     // Capture all currently held notes from the voices array
     for (int i = 0; i < 4; i++) {
@@ -2031,18 +2025,18 @@ void CaptureCurrentlyHeldNotes()
     }
     
     // Reset sequencer note index to start from the beginning
-    sequencerNoteIndex = 0;
+    sequencer.sequencerNoteIndex = 0;
     
     // Set flag to indicate we're using initially captured notes
     // This means sequencer won't stop when these notes are released
-    sequencerUsingInitialCapture = true;
+    sequencer.sequencerUsingInitialCapture = true;
 }
 
 void ApplyTuningToSequencerNotes()
 {
     // Apply tuning changes to all currently playing sequencer voices
     // This ensures that when tuning changes, the sequencer notes reflect the new tuning
-    if (!sequencerMode || sequencerNotes.empty()) {
+    if (!sequencer.sequencerMode || sequencer.sequencerNotes.empty()) {
         return;
     }
     
@@ -2051,8 +2045,8 @@ void ApplyTuningToSequencerNotes()
         if (envelopes[i].gate && voices[i].note > 0) {
             // Check if this voice is playing a note from the sequencer
             bool isSequencerNote = false;
-            for (size_t j = 0; j < sequencerNotes.size(); j++) {
-                if (voices[i].note == sequencerNotes[j]) {
+            for (size_t j = 0; j < sequencer.sequencerNotes.size(); j++) {
+                if (voices[i].note == sequencer.sequencerNotes[j]) {
                     isSequencerNote = true;
                     break;
                 }
@@ -2079,12 +2073,12 @@ void ApplyTuningToSequencerNotes()
 void InitTriggerSequence()
 {
     // Initialize sequence with Euclidean rhythm (4 triggers out of 16 steps)
-    GenerateEuclideanRhythm(4, TRIGGER_SEQUENCE_LENGTH, triggerSequence);
+    GenerateEuclideanRhythm(4, TRIGGER_SEQUENCE_LENGTH, sequencer.triggerSequence);
 
     // Initialize timing
-    currentSequenceStep = 0;
-    lastSequenceStepTime = hw.seed.system.GetNow();
-    sequenceStepInterval = static_cast<uint32_t>(60000 / (clockBpm * 4));  // 16th note timing
+    sequencer.currentSequenceStep = 0;
+    sequencer.lastSequenceStepTime = hw.seed.system.GetNow();
+    sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));  // 16th note timing
 }
 
 
@@ -2142,7 +2136,7 @@ void ProcessCCQueue() {
             ccLatchTime = currentTime;
             ccIsLatched = true;
             
-            SendMidiMesssage(triggerNote, ccTriggerChannel, "TRIGGER_ON");
+            SendMidiMesssage(sequencer.triggerNote, sequencer.ccTriggerChannel, "TRIGGER_ON");
             ccTriggerOffTime = currentTime + TRIGGER_OFF_DELAY_MS;
             ccTriggerOffPending = true;
             
@@ -2157,7 +2151,7 @@ void ProcessCCQueue() {
     if (ccIsLatched && ccQueueCount == 0) {
         uint32_t timeSinceLastCC = currentTime - ccLatchTime;
         if (timeSinceLastCC >= CC_RESET_DELAY_MS) {
-            SendMidiMesssage(0, ccValueChannel, "CC");
+            SendMidiMesssage(0, sequencer.ccValueChannel, "CC");
             lastCCValue = 0;
             ccIsLatched = false;
             // SetDebugMessage("CC Latch Down");
@@ -2170,7 +2164,7 @@ void ResetCCState() {
     ccQueueCount = 0;
     ccQueueHead = 0;
     ccQueueTail = 0;
-    SendMidiMesssage(0, ccValueChannel, "CC");
+    SendMidiMesssage(0, sequencer.ccValueChannel, "CC");
     lastCCValue = 0;
     ccIsLatched = false;
     ccStateInitialized = true;
@@ -2297,7 +2291,7 @@ template<typename NextHandler>
 class SequencerCaptureHandler : public HandlerBase<NextHandler> {
 public:
     bool HandleNoteOn(NoteOnEvent& event) {
-        if (sequencerMode) {
+        if (sequencer.sequencerMode) {
             // Add note to sequencer notes array
             AddNoteToSequencer(event.note);
         }
@@ -2306,7 +2300,7 @@ public:
     }
     
     bool HandleNoteOff(NoteOffEvent& event) {
-        if (sequencerMode) {
+        if (sequencer.sequencerMode) {
             // Remove note from sequencer notes array
             RemoveNoteFromSequencer(event.note);
         }
@@ -2562,24 +2556,24 @@ void ProcessHandlerChainNoteOff(NoteOffEvent& event) {
 class SequencerMidiSource {
 public:
     void Process() {
-        if (!sequencerMode || sequencerNotes.empty()) {
+        if (!sequencer.sequencerMode || sequencer.sequencerNotes.empty()) {
             return;
         }
         
         // Check if it's time to advance to the next sequence step
         uint32_t currentTime = hw.seed.system.GetNow();
-        if ((currentTime - lastSequenceStepTime) >= sequenceStepInterval) {
+        if ((currentTime - sequencer.lastSequenceStepTime) >= sequencer.sequenceStepInterval) {
             AdvanceSequenceStep();
-            lastSequenceStepTime = currentTime;
+            sequencer.lastSequenceStepTime = currentTime;
         }
     }
     
 private:
     void AdvanceSequenceStep() {
         // Check if current step should trigger
-        if (triggerSequence[currentSequenceStep]) {
+        if (sequencer.triggerSequence[sequencer.currentSequenceStep]) {
             // Sequencer mode: trigger next note from sequencer notes array
-            uint8_t noteToTrigger = sequencerNotes[sequencerNoteIndex];
+            uint8_t noteToTrigger = sequencer.sequencerNotes[sequencer.sequencerNoteIndex];
             
             // Create note event and send through handler chain
             NoteOnEvent event;
@@ -2593,16 +2587,16 @@ private:
             ProcessCCSlots();
             
             // Advance to next note in sequencer array
-            sequencerNoteIndex = (sequencerNoteIndex + 1) % sequencerNotes.size();
+            sequencer.sequencerNoteIndex = (sequencer.sequencerNoteIndex + 1) % sequencer.sequencerNotes.size();
             
             // Schedule note-off based on note length percentage (only when not using shift register)
             if (!shiftRegisterMode) {
-                uint32_t noteOffDelay = static_cast<uint32_t>(sequenceStepInterval * sequencerNoteLengthPercent);
-                noteOffDelay = std::min(noteOffDelay, sequenceStepInterval - 10); // Leave at least 10ms before next step
-                sequencerNoteOffTime = hw.seed.system.GetNow() + noteOffDelay;
-                sequencerNoteOffPending = true;
-                sequencerNoteToTurnOff = noteToTrigger;
-                sequencerVoiceToTurnOff = event.channel; // Will be set by voice allocation
+                uint32_t noteOffDelay = static_cast<uint32_t>(sequencer.sequenceStepInterval * sequencer.sequencerNoteLengthPercent);
+                noteOffDelay = std::min(noteOffDelay, sequencer.sequenceStepInterval - 10); // Leave at least 10ms before next step
+                sequencer.sequencerNoteOffTime = hw.seed.system.GetNow() + noteOffDelay;
+                sequencer.sequencerNoteOffPending = true;
+                sequencer.sequencerNoteToTurnOff = noteToTrigger;
+                sequencer.sequencerVoiceToTurnOff = event.channel; // Will be set by voice allocation
             }
         } else {
             // Original trigger behavior for keyboard mode or when no sequencer notes
@@ -2616,7 +2610,7 @@ private:
         }
         
         // Advance to next step
-        currentSequenceStep = (currentSequenceStep + 1) % TRIGGER_SEQUENCE_LENGTH;
+        sequencer.currentSequenceStep = (sequencer.currentSequenceStep + 1) % TRIGGER_SEQUENCE_LENGTH;
     }
 };
 
