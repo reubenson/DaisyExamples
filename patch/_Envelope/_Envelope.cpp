@@ -296,15 +296,127 @@ struct SequencerParams {
 
 SequencerParams sequencer;
 
+// ============================================================================
+// State Management System - Centralized State Storage
+// ============================================================================
+
+// ParamId enum - identifies each user-adjustable parameter
+enum ParamId {
+    // ADSR Panel
+    PARAM_ADSR_ATTACK = 0,
+    PARAM_ADSR_DECAY_RELEASE,
+    PARAM_ADSR_SUSTAIN,
+    PARAM_ADSR_MIN,
+    
+    // MIXER Panel
+    PARAM_PAN_FREQ,
+    PARAM_PAN_AMP,
+    PARAM_VOLUME,
+    
+    // OSC Panel
+    PARAM_OSC_WAVEFORM,
+    
+    // TUNING Panel
+    PARAM_TUNING_INDEX,
+    PARAM_TUNING_MIDI_ENABLE,
+    
+    // SEQUENCER Panel
+    PARAM_SEQ_DENSITY,
+    PARAM_SEQ_ORDER,
+    PARAM_SEQ_LENGTH,
+    PARAM_SEQ_BPM,
+    
+    // SAMPLER Panel (CC Probabilities)
+    PARAM_CC_PROB_0_1,
+    PARAM_CC_PROB_2_3,
+    PARAM_CC_PROB_4_5,
+    PARAM_CC_PROB_6_7,
+    
+    PARAM_NONE  // Used for unbound knobs
+};
+
+// UserState struct - single source of truth for all user-adjustable parameters
+// All values stored in normalized 0.0-1.0 range
+struct UserState {
+    // ADSR parameters (normalized 0.0-1.0)
+    float adsrAttack;           // 0.0-1.0 maps to 0.0001s-5.0s logarithmically
+    float adsrDecayRelease;     // 0.0-1.0 maps to 0.0001s-3.0s logarithmically
+    float adsrSustain;          // 0.0-1.0 maps to 0.01-1.0 logarithmically
+    float adsrMin;              // 0.0-1.0 minimum envelope level
+    
+    // MIXER parameters
+    float panFreq;              // 0.0-1.0 maps to 0-10Hz
+    float panAmp;               // 0.0-1.0 amplitude (0=centered, 1=full pan)
+    float volume;               // 0.0-1.0 master volume
+    
+    // OSC parameters
+    float oscWaveform;          // 0.0-1.0 (sine->tri->square->saw)
+    
+    // TUNING parameters
+    float tuningIndex;          // 0.0-1.0 maps to tuning preset index
+    float tuningMidiEnable;     // 0.0-1.0 (>0.5 = enabled)
+    
+    // SEQUENCER parameters
+    float seqDensity;           // 0.0-1.0 maps to 0-16 triggers
+    float seqOrder;             // 0.0-1.0 (<0.5=ascending, >=0.5=descending)
+    float seqLength;            // 0.0-1.0 note length percentage
+    float seqBpm;               // 0.0-1.0 maps to CLOCK_BPM_MIN-CLOCK_BPM_MAX
+    
+    // SAMPLER parameters (CC probabilities)
+    float ccProb0_1;            // 0.0-1.0 probability for CC slots 0 and 1
+    float ccProb2_3;            // 0.0-1.0 probability for CC slots 2 and 3
+    float ccProb4_5;            // 0.0-1.0 probability for CC slots 4 and 5
+    float ccProb6_7;            // 0.0-1.0 probability for CC slots 6 and 7
+    
+    // Constructor with default values
+    UserState() :
+        adsrAttack(0.0f),
+        adsrDecayRelease(0.0f),
+        adsrSustain(0.0f),
+        adsrMin(0.0f),
+        panFreq(0.02f),         // Default 0.2Hz
+        panAmp(1.0f),           // Default full amplitude
+        volume(0.8f),           // Default 80% volume
+        oscWaveform(0.0f),      // Default sine wave
+        tuningIndex(0.0f),      // Default 12-TET
+        tuningMidiEnable(1.0f), // Default enabled
+        seqDensity(0.0f),
+        seqOrder(0.0f),         // Default ascending
+        seqLength(0.5f),        // Default 50% length
+        seqBpm(0.0f),           // Will be set from sequencer.clockBpm
+        ccProb0_1(0.0f),
+        ccProb2_3(0.0f),
+        ccProb4_5(0.0f),
+        ccProb6_7(0.0f)
+    {}
+};
+
+// Global state instance
+UserState appState;
+
+// State accessor functions
+float GetParamValue(ParamId paramId);
+void SetParamValue(ParamId paramId, float value);
+float GetKnobValue(int panelIndex, int knobIndex);  // Helper to get knob value from UserState
+
+// Panel knob binding structure
+struct PanelKnobBinding {
+    ParamId knob1;
+    ParamId knob2;
+    ParamId knob3;
+    ParamId knob4;
+};
+
 struct panelStruct
 {
-    std::string     name;
-    char            id;
-    std::string     input1Name;
-    std::string     input2Name;
-    std::string     input3Name;
-    std::string     input4Name;
-    float           values[4];
+    std::string         name;
+    char                id;
+    std::string         input1Name;
+    std::string         input2Name;
+    std::string         input3Name;
+    std::string         input4Name;
+    float               values[4];      // Legacy - will be removed in cleanup
+    PanelKnobBinding    bindings;       // New binding system
 };
 panelStruct displayPanels[6] = {
     { 
@@ -314,7 +426,8 @@ panelStruct displayPanels[6] = {
         input2Name: "D/R", 
         input3Name: "S",
         input4Name: "Min",
-        values: {0.0f, 0.0f, 0.0f, 0.0f}
+        values: {0.0f, 0.0f, 0.0f, 0.0f},
+        bindings: {PARAM_ADSR_ATTACK, PARAM_ADSR_DECAY_RELEASE, PARAM_ADSR_SUSTAIN, PARAM_ADSR_MIN}
     },
     {
         name: "MIXER",
@@ -323,7 +436,8 @@ panelStruct displayPanels[6] = {
         input2Name: "Amp",
         input3Name: "",
         input4Name: "Vol",
-        values: {0.0f, 0.0f, 0.0f, 0.8f}
+        values: {0.0f, 0.0f, 0.0f, 0.8f},
+        bindings: {PARAM_PAN_FREQ, PARAM_PAN_AMP, PARAM_NONE, PARAM_VOLUME}
     },
     {
         name: "OSC",
@@ -332,7 +446,8 @@ panelStruct displayPanels[6] = {
         input2Name: "",
         input3Name: "",
         input4Name: "",
-        values: {0.0f, 0.0f, 0.0f, 0.0f}
+        values: {0.0f, 0.0f, 0.0f, 0.0f},
+        bindings: {PARAM_OSC_WAVEFORM, PARAM_NONE, PARAM_NONE, PARAM_NONE}
     },
     {
         name: "TUNING",
@@ -341,7 +456,8 @@ panelStruct displayPanels[6] = {
         input2Name: "",
         input3Name: "MIDI",
         input4Name: "",
-        values: {0.0f, 0.0f, 1.0f, 1.0f}
+        values: {0.0f, 0.0f, 1.0f, 1.0f},
+        bindings: {PARAM_TUNING_INDEX, PARAM_NONE, PARAM_TUNING_MIDI_ENABLE, PARAM_NONE}
     },
     {
         name: "SEQUENCER",
@@ -350,7 +466,8 @@ panelStruct displayPanels[6] = {
         input2Name: "Order",
         input3Name: "Length",
         input4Name: "BPM",
-        values: {0.0f, 0.0f, 0.5f, 0.0f}
+        values: {0.0f, 0.0f, 0.5f, 0.0f},
+        bindings: {PARAM_SEQ_DENSITY, PARAM_SEQ_ORDER, PARAM_SEQ_LENGTH, PARAM_SEQ_BPM}
     },
     {
         name: "SAMPLER",
@@ -359,7 +476,8 @@ panelStruct displayPanels[6] = {
         input2Name: "CC3-4",
         input3Name: "CC5-6",
         input4Name: "CC7-8",
-        values: {0.0f, 0.0f, 0.0f, 0.0f}
+        values: {0.0f, 0.0f, 0.0f, 0.0f},
+        bindings: {PARAM_CC_PROB_0_1, PARAM_CC_PROB_2_3, PARAM_CC_PROB_4_5, PARAM_CC_PROB_6_7}
     }
 };
 int panelModesCount = sizeof(displayPanels) / sizeof(displayPanels[0]);
@@ -501,6 +619,232 @@ bool IsDebugMessageExpired()
     return (currentTime - debugMessageTime) >= DEBUG_MESSAGE_DURATION_MS;
 }
 
+// ============================================================================
+// State Accessor Functions Implementation
+// ============================================================================
+
+float GetParamValue(ParamId paramId)
+{
+    switch(paramId) {
+        // ADSR Panel
+        case PARAM_ADSR_ATTACK:         return appState.adsrAttack;
+        case PARAM_ADSR_DECAY_RELEASE:  return appState.adsrDecayRelease;
+        case PARAM_ADSR_SUSTAIN:        return appState.adsrSustain;
+        case PARAM_ADSR_MIN:            return appState.adsrMin;
+        
+        // MIXER Panel
+        case PARAM_PAN_FREQ:            return appState.panFreq;
+        case PARAM_PAN_AMP:             return appState.panAmp;
+        case PARAM_VOLUME:              return appState.volume;
+        
+        // OSC Panel
+        case PARAM_OSC_WAVEFORM:        return appState.oscWaveform;
+        
+        // TUNING Panel
+        case PARAM_TUNING_INDEX:        return appState.tuningIndex;
+        case PARAM_TUNING_MIDI_ENABLE:  return appState.tuningMidiEnable;
+        
+        // SEQUENCER Panel
+        case PARAM_SEQ_DENSITY:         return appState.seqDensity;
+        case PARAM_SEQ_ORDER:           return appState.seqOrder;
+        case PARAM_SEQ_LENGTH:          return appState.seqLength;
+        case PARAM_SEQ_BPM:             return appState.seqBpm;
+        
+        // SAMPLER Panel
+        case PARAM_CC_PROB_0_1:         return appState.ccProb0_1;
+        case PARAM_CC_PROB_2_3:         return appState.ccProb2_3;
+        case PARAM_CC_PROB_4_5:         return appState.ccProb4_5;
+        case PARAM_CC_PROB_6_7:         return appState.ccProb6_7;
+        
+        case PARAM_NONE:
+        default:                        return 0.0f;
+    }
+}
+
+void SetParamValue(ParamId paramId, float value)
+{
+    // Clamp value to 0.0-1.0 range
+    value = std::max(0.0f, std::min(1.0f, value));
+    
+    switch(paramId) {
+        // ADSR Panel
+        case PARAM_ADSR_ATTACK:
+            appState.adsrAttack = value;
+            // Apply to all envelopes
+            for (int i = 0; i < 4; i++) {
+                float attackTime = 0.0001f * powf(5000.0f, value);
+                envelopes[i].env.SetTime(ADSR_SEG_ATTACK, attackTime);
+            }
+            break;
+            
+        case PARAM_ADSR_DECAY_RELEASE:
+            appState.adsrDecayRelease = value;
+            // Apply to all envelopes
+            for (int i = 0; i < 4; i++) {
+                float decayTime = 0.0001f * powf(3000.0f, value);
+                envelopes[i].env.SetTime(ADSR_SEG_DECAY, decayTime);
+                envelopes[i].env.SetTime(ADSR_SEG_RELEASE, decayTime);
+            }
+            break;
+            
+        case PARAM_ADSR_SUSTAIN:
+            appState.adsrSustain = value;
+            // Apply to all envelopes
+            for (int i = 0; i < 4; i++) {
+                float sustainLevel = 0.01f * powf(100.0f, value);
+                envelopes[i].env.SetSustainLevel(sustainLevel);
+            }
+            break;
+            
+        case PARAM_ADSR_MIN:
+            appState.adsrMin = value;
+            voicesMinLevel = value;
+            break;
+        
+        // MIXER Panel
+        case PARAM_PAN_FREQ:
+            appState.panFreq = value;
+            panFreq = value * 10.0f;  // Map to 0-10Hz
+            break;
+            
+        case PARAM_PAN_AMP:
+            appState.panAmp = value;
+            panAmp = value;
+            break;
+            
+        case PARAM_VOLUME:
+            appState.volume = value;
+            // Volume is read directly in ApplyPanning
+            break;
+        
+        // OSC Panel
+        case PARAM_OSC_WAVEFORM:
+            appState.oscWaveform = value;
+            // Apply to all oscillators
+            for (int i = 0; i < 4; i++) {
+                voiceInterpOsc[i].SetWaveformParam(value);
+            }
+            break;
+        
+        // TUNING Panel
+        case PARAM_TUNING_INDEX:
+            {
+                appState.tuningIndex = value;
+                uint8_t newTuningIndex = static_cast<uint8_t>(value * (NUM_TUNING_PRESETS - 1) + 0.5f);
+                if (newTuningIndex != currentTuningIndex) {
+                    currentTuningIndex = newTuningIndex;
+                    ApplyTuningToSequencerNotes();
+                }
+            }
+            break;
+            
+        case PARAM_TUNING_MIDI_ENABLE:
+            appState.tuningMidiEnable = value;
+            sendPitchBendMidi = (value > 0.5f);
+            break;
+        
+        // SEQUENCER Panel
+        case PARAM_SEQ_DENSITY:
+            appState.seqDensity = value;
+            sequencer.density = value * static_cast<float>(TRIGGER_SEQUENCE_LENGTH);
+            {
+                int numTriggers = static_cast<int>(sequencer.density);
+                numTriggers = std::max(0, std::min(numTriggers, static_cast<int>(TRIGGER_SEQUENCE_LENGTH)));
+                GenerateEuclideanRhythm(numTriggers, TRIGGER_SEQUENCE_LENGTH, sequencer.triggerSequence);
+            }
+            break;
+            
+        case PARAM_SEQ_ORDER:
+            {
+                appState.seqOrder = value;
+                bool newAscending = value < 0.5f;
+                if (newAscending != sequencer.sequencerNotesAscending) {
+                    sequencer.sequencerNotesAscending = newAscending;
+                    SortSequencerNotes();
+                }
+            }
+            break;
+            
+        case PARAM_SEQ_LENGTH:
+            appState.seqLength = value;
+            sequencer.sequencerNoteLengthPercent = 0.1f + value * 0.8f;  // Map to 0.1-0.9
+            break;
+            
+        case PARAM_SEQ_BPM:
+            {
+                appState.seqBpm = value;
+                int32_t newBpm = CLOCK_BPM_MIN + static_cast<int32_t>(value * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
+                if (newBpm != sequencer.clockBpm) {
+                    sequencer.clockBpm = newBpm;
+                    sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
+                    sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));
+                }
+            }
+            break;
+        
+        // SAMPLER Panel
+        case PARAM_CC_PROB_0_1:
+            appState.ccProb0_1 = value;
+            {
+                uint8_t prob = (value < 0.01f) ? 0 : static_cast<uint8_t>(value * 100.0f);
+                ccSlotProbabilities[0] = prob;
+                ccSlotProbabilities[1] = prob;
+            }
+            break;
+            
+        case PARAM_CC_PROB_2_3:
+            appState.ccProb2_3 = value;
+            {
+                uint8_t prob = (value < 0.01f) ? 0 : static_cast<uint8_t>(value * 100.0f);
+                ccSlotProbabilities[2] = prob;
+                ccSlotProbabilities[3] = prob;
+            }
+            break;
+            
+        case PARAM_CC_PROB_4_5:
+            appState.ccProb4_5 = value;
+            {
+                uint8_t prob = (value < 0.01f) ? 0 : static_cast<uint8_t>(value * 100.0f);
+                ccSlotProbabilities[4] = prob;
+                ccSlotProbabilities[5] = prob;
+            }
+            break;
+            
+        case PARAM_CC_PROB_6_7:
+            appState.ccProb6_7 = value;
+            {
+                uint8_t prob = (value < 0.01f) ? 0 : static_cast<uint8_t>(value * 100.0f);
+                ccSlotProbabilities[6] = prob;
+                ccSlotProbabilities[7] = prob;
+            }
+            break;
+        
+        case PARAM_NONE:
+        default:
+            break;
+    }
+}
+
+// Helper to get knob value from UserState via panel bindings
+float GetKnobValue(int panelIndex, int knobIndex)
+{
+    if (panelIndex < 0 || panelIndex >= 6 || knobIndex < 0 || knobIndex >= 4) {
+        return 0.0f;
+    }
+    
+    const PanelKnobBinding& binding = displayPanels[panelIndex].bindings;
+    ParamId paramId = PARAM_NONE;
+    
+    switch(knobIndex) {
+        case 0: paramId = binding.knob1; break;
+        case 1: paramId = binding.knob2; break;
+        case 2: paramId = binding.knob3; break;
+        case 3: paramId = binding.knob4; break;
+    }
+    
+    return GetParamValue(paramId);
+}
+
 bool SaveSettingsToSD()
 {
     uint32_t sectorBuffer[128]; // 512 bytes = 128 uint32_t words
@@ -511,21 +855,36 @@ bool SaveSettingsToSD()
     // Clear sector buffer
     memset(sectorBuffer, 0, 512);
     
-    // Write settings in compact format
-    pos += snprintf(buffer + pos, 512 - pos, "BPM=%ld\n", sequencer.clockBpm);
+    // Write settings from UserState in compact format
+    // ADSR parameters
+    pos += snprintf(buffer + pos, 512 - pos, "ADSR_A=%.3f\n", appState.adsrAttack);
+    pos += snprintf(buffer + pos, 512 - pos, "ADSR_D=%.3f\n", appState.adsrDecayRelease);
+    pos += snprintf(buffer + pos, 512 - pos, "ADSR_S=%.3f\n", appState.adsrSustain);
+    pos += snprintf(buffer + pos, 512 - pos, "ADSR_M=%.3f\n", appState.adsrMin);
     
-    // All panel values in one loop
-    for (int panel = 0; panel < 6; panel++) {
-        for (int i = 0; i < 4; i++) {
-            pos += snprintf(buffer + pos, 512 - pos, "P%d_%d=%.1f\n", panel, i, displayPanels[panel].values[i]);
-        }
-    }
+    // MIXER parameters
+    pos += snprintf(buffer + pos, 512 - pos, "PAN_F=%.3f\n", appState.panFreq);
+    pos += snprintf(buffer + pos, 512 - pos, "PAN_A=%.3f\n", appState.panAmp);
+    pos += snprintf(buffer + pos, 512 - pos, "VOL=%.3f\n", appState.volume);
     
-    // CC probabilities (from panel values) - simplified to 4 slots only
-    for (int i = 0; i < 4; i++) {
-        uint8_t probability = (displayPanels[5].values[i] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[i] * 100.0f);
-        pos += snprintf(buffer + pos, 512 - pos, "CC%d=%d\n", i, probability);
-    }
+    // OSC parameters
+    pos += snprintf(buffer + pos, 512 - pos, "OSC_W=%.3f\n", appState.oscWaveform);
+    
+    // TUNING parameters
+    pos += snprintf(buffer + pos, 512 - pos, "TUN_I=%.3f\n", appState.tuningIndex);
+    pos += snprintf(buffer + pos, 512 - pos, "TUN_M=%.3f\n", appState.tuningMidiEnable);
+    
+    // SEQUENCER parameters
+    pos += snprintf(buffer + pos, 512 - pos, "SEQ_D=%.3f\n", appState.seqDensity);
+    pos += snprintf(buffer + pos, 512 - pos, "SEQ_O=%.3f\n", appState.seqOrder);
+    pos += snprintf(buffer + pos, 512 - pos, "SEQ_L=%.3f\n", appState.seqLength);
+    pos += snprintf(buffer + pos, 512 - pos, "SEQ_B=%.3f\n", appState.seqBpm);
+    
+    // SAMPLER parameters (CC probabilities)
+    pos += snprintf(buffer + pos, 512 - pos, "CC_01=%.3f\n", appState.ccProb0_1);
+    pos += snprintf(buffer + pos, 512 - pos, "CC_23=%.3f\n", appState.ccProb2_3);
+    pos += snprintf(buffer + pos, 512 - pos, "CC_45=%.3f\n", appState.ccProb4_5);
+    pos += snprintf(buffer + pos, 512 - pos, "CC_67=%.3f\n", appState.ccProb6_7);
     
     // Write sector to SD card
     uint8_t result = BSP_SD_WriteBlocks(sectorBuffer, sectorNumber, 1, 5000);
@@ -564,26 +923,43 @@ bool LoadSettingsFromSD()
             char* key = line;
             char* value = equals + 1;
             
-            // Parse different setting types
-            if (strcmp(key, "BPM") == 0) {
-                sequencer.clockBpm = atoi(value);
-                sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
-            }
-            else if (strncmp(key, "P", 1) == 0 && strlen(key) == 3) {
-                // Parse P0_0 format
-                int panel = key[1] - '0';
-                int index = key[3] - '0';
-                if (panel >= 0 && panel < 6 && index >= 0 && index < 4) {
-                    displayPanels[panel].values[index] = atof(value);
-                }
-            }
-            else if (strncmp(key, "CC", 2) == 0 && strlen(key) == 3) {
-                // Parse CC0 format - load directly into displayPanels[5].values[]
-                int index = key[2] - '0';
-                if (index >= 0 && index < 4) {
-                    uint8_t probability = atoi(value);
-                    displayPanels[5].values[index] = probability / 100.0f;
-                }
+            // Load into UserState (new format)
+            if (strcmp(key, "ADSR_A") == 0) {
+                appState.adsrAttack = atof(value);
+            } else if (strcmp(key, "ADSR_D") == 0) {
+                appState.adsrDecayRelease = atof(value);
+            } else if (strcmp(key, "ADSR_S") == 0) {
+                appState.adsrSustain = atof(value);
+            } else if (strcmp(key, "ADSR_M") == 0) {
+                appState.adsrMin = atof(value);
+            } else if (strcmp(key, "PAN_F") == 0) {
+                appState.panFreq = atof(value);
+            } else if (strcmp(key, "PAN_A") == 0) {
+                appState.panAmp = atof(value);
+            } else if (strcmp(key, "VOL") == 0) {
+                appState.volume = atof(value);
+            } else if (strcmp(key, "OSC_W") == 0) {
+                appState.oscWaveform = atof(value);
+            } else if (strcmp(key, "TUN_I") == 0) {
+                appState.tuningIndex = atof(value);
+            } else if (strcmp(key, "TUN_M") == 0) {
+                appState.tuningMidiEnable = atof(value);
+            } else if (strcmp(key, "SEQ_D") == 0) {
+                appState.seqDensity = atof(value);
+            } else if (strcmp(key, "SEQ_O") == 0) {
+                appState.seqOrder = atof(value);
+            } else if (strcmp(key, "SEQ_L") == 0) {
+                appState.seqLength = atof(value);
+            } else if (strcmp(key, "SEQ_B") == 0) {
+                appState.seqBpm = atof(value);
+            } else if (strcmp(key, "CC_01") == 0) {
+                appState.ccProb0_1 = atof(value);
+            } else if (strcmp(key, "CC_23") == 0) {
+                appState.ccProb2_3 = atof(value);
+            } else if (strcmp(key, "CC_45") == 0) {
+                appState.ccProb4_5 = atof(value);
+            } else if (strcmp(key, "CC_67") == 0) {
+                appState.ccProb6_7 = atof(value);
             }
         }
         
@@ -595,45 +971,41 @@ bool LoadSettingsFromSD()
         }
     }
     
+    // Apply loaded UserState to hardware objects and global variables
+    SetParamValue(PARAM_ADSR_ATTACK, appState.adsrAttack);
+    SetParamValue(PARAM_ADSR_DECAY_RELEASE, appState.adsrDecayRelease);
+    SetParamValue(PARAM_ADSR_SUSTAIN, appState.adsrSustain);
+    SetParamValue(PARAM_ADSR_MIN, appState.adsrMin);
+    SetParamValue(PARAM_PAN_FREQ, appState.panFreq);
+    SetParamValue(PARAM_PAN_AMP, appState.panAmp);
+    SetParamValue(PARAM_VOLUME, appState.volume);
+    SetParamValue(PARAM_OSC_WAVEFORM, appState.oscWaveform);
+    SetParamValue(PARAM_TUNING_INDEX, appState.tuningIndex);
+    SetParamValue(PARAM_TUNING_MIDI_ENABLE, appState.tuningMidiEnable);
+    SetParamValue(PARAM_SEQ_DENSITY, appState.seqDensity);
+    SetParamValue(PARAM_SEQ_ORDER, appState.seqOrder);
+    SetParamValue(PARAM_SEQ_LENGTH, appState.seqLength);
+    SetParamValue(PARAM_SEQ_BPM, appState.seqBpm);
+    SetParamValue(PARAM_CC_PROB_0_1, appState.ccProb0_1);
+    SetParamValue(PARAM_CC_PROB_2_3, appState.ccProb2_3);
+    SetParamValue(PARAM_CC_PROB_4_5, appState.ccProb4_5);
+    SetParamValue(PARAM_CC_PROB_6_7, appState.ccProb6_7);
+    
     // Update current panel to reflect loaded values
     currentPanel = displayPanels[panelMode];
-    
-    // Sync ccSlotProbabilities with loaded CC slot panel values - correct mapping
-    // Knob 1 (CC1-2): affects slots 0 and 1
-    uint8_t prob1 = (displayPanels[5].values[0] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[0] * 100.0f);
-    ccSlotProbabilities[0] = prob1;
-    ccSlotProbabilities[1] = prob1;
-    
-    // Knob 2 (CC3-4): affects slots 2 and 3
-    uint8_t prob2 = (displayPanels[5].values[1] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[1] * 100.0f);
-    ccSlotProbabilities[2] = prob2;
-    ccSlotProbabilities[3] = prob2;
-    
-    // Knob 3 (CC5-6): affects slots 4 and 5
-    uint8_t prob3 = (displayPanels[5].values[2] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[2] * 100.0f);
-    ccSlotProbabilities[4] = prob3;
-    ccSlotProbabilities[5] = prob3;
-    
-    // Knob 4 (CC7-8): affects slots 6 and 7
-    uint8_t prob4 = (displayPanels[5].values[3] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[3] * 100.0f);
-    ccSlotProbabilities[6] = prob4;
-    ccSlotProbabilities[7] = prob4;
     
     return true;
 }
 
 void SetDefaultPanelValues()
 {
-    // Initialize MIXER panel with default values
-    displayPanels[1].values[0] = 0.02f;  // Frequency (0.2Hz / 10Hz max = 0.02)
-    displayPanels[1].values[1] = 1.0f;   // Amplitude (full effect)
-    displayPanels[1].values[3] = 0.8f;   // Volume (default 0.8 to prevent distortion)
-    
-    // Initialize tuning panel with default values
-    displayPanels[4].values[0] = 0.0f;  // Tuning selector (12-TET)
-    displayPanels[4].values[1] = 0.09f;  // Pitch bend range (200 cents)
-    displayPanels[4].values[2] = 1.0f;  // MIDI output enabled
-    displayPanels[4].values[3] = 1.0f;  // Internal oscillators enabled
+    // Set default values in UserState and apply them
+    // Defaults are already in UserState constructor, but we apply them here to hardware
+    SetParamValue(PARAM_PAN_FREQ, 0.02f);      // 0.2Hz
+    SetParamValue(PARAM_PAN_AMP, 1.0f);        // Full amplitude
+    SetParamValue(PARAM_VOLUME, 0.8f);         // 80% volume
+    SetParamValue(PARAM_TUNING_INDEX, 0.0f);   // 12-TET
+    SetParamValue(PARAM_TUNING_MIDI_ENABLE, 1.0f); // MIDI enabled
 }
 
 void ClearPanelArea()
@@ -680,8 +1052,8 @@ void ApplyPanning(float* data) {
     PanEqualPowerStereo(pan2, data[2], &L3, &R3);
     PanEqualPowerStereo(pan3, data[3], &L4, &R4);
 
-    // Sum all voices and apply volume control from MIXER panel knob 4
-    float mixVolume = displayPanels[1].values[3]; // MIXER panel (index 1), knob 4 (index 3)
+    // Sum all voices and apply volume control from UserState
+    float mixVolume = appState.volume;
     data[0] = (L1 + L2 + L3 + L4) * mixVolume;
     data[1] = (R1 + R2 + R3 + R4) * mixVolume;
     hw.seed.dac.WriteValue(DacHandle::Channel::ONE, ((panOutput + 1.0f) / 2.0f) * 4095);
@@ -1079,10 +1451,10 @@ int main(void)
     // Initialize sequencer parameters
     sequencer.Init();
     
-    // Initialize BPM knob value based on current BPM
-    // Map BPM to 0-1 range for knob display
+    // Initialize BPM state value based on current BPM
+    // Map BPM to 0-1 range for state storage
     float bpmKnobValue = static_cast<float>(sequencer.clockBpm - CLOCK_BPM_MIN) / (CLOCK_BPM_MAX - CLOCK_BPM_MIN);
-    displayPanels[3].values[3] = bpmKnobValue; // TRIGSEQ panel, knob 4 (BPM)
+    appState.seqBpm = bpmKnobValue;
 
     UpdateOled();
 
@@ -1275,7 +1647,7 @@ std::string FormatParameterValue(char panelId, int paramIndex, float value)
             case 2: // CC5-6
             case 3: // CC7-8
                 {
-                    uint8_t probability = (displayPanels[5].values[paramIndex] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[paramIndex] * 100.0f);
+                    uint8_t probability = (value < 0.01f) ? 0 : static_cast<uint8_t>(value * 100.0f);
                     return (probability == 0) ? "OFF" : std::to_string(probability) + "%";
                 }
             default: return "OFF";
@@ -1340,8 +1712,8 @@ void UpdateOled()
         // Clear the meter area first (draw black line to erase previous meter)
         hw.display.DrawLine(knobPositions[i], meterY, knobPositions[i] + maxMeterWidth, meterY, false);
         
-        // Draw the stored panel value (not current knob position)
-        float val = displayPanels[panelMode].values[i];
+        // Draw the value from UserState via bindings
+        float val = GetKnobValue(panelMode, i);
         int meterWidth = static_cast<int>(val * maxMeterWidth);  // Scale 0.0-1.0 to 0-22 pixels
         meterWidth = std::max(0, std::min(meterWidth, maxMeterWidth));  // Clamp to 0-22 range
         
@@ -1352,8 +1724,9 @@ void UpdateOled()
     
     // Display parameter values below meters
     for (int i = 0; i < 4; i++) {
-        std::string paramValue = FormatParameterValue(currentPanel.id, i, currentPanel.values[i]);
-        WriteFixedString(hw, knobPositions[i], paramValueY, 5, font_s, paramValue.c_str());
+        float paramValue = GetKnobValue(panelMode, i);
+        std::string paramValueStr = FormatParameterValue(currentPanel.id, i, paramValue);
+        WriteFixedString(hw, knobPositions[i], paramValueY, 5, font_s, paramValueStr.c_str());
     }
     
     // Show trigger sequence pattern when in TRIGSEQ mode
@@ -1402,7 +1775,8 @@ void UpdateOled()
         // Show current probabilities for each slot pair
         const char* slotLabels[4] = {"CC1-2", "CC3-4", "CC5-6", "CC7-8"};
         for (int i = 0; i < 4; i++) {
-            uint8_t probability = (displayPanels[5].values[i] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[i] * 100.0f);
+            float value = GetKnobValue(5, i);  // Panel 5 = SAMPLER
+            uint8_t probability = (value < 0.01f) ? 0 : static_cast<uint8_t>(value * 100.0f);
             std::string display = (probability == 0) ? "OFF" : std::to_string(probability) + "%";
             WriteFixedStringF(hw, knobPositions[i], 24, 6, font_s, "%s:%s", slotLabels[i], display.c_str());
         }
@@ -1578,200 +1952,51 @@ void ProcessKnobs()
     }
 
     if (inputIndex > -1) {
-        // Update panel values for the currently selected panel
+        // Update panel values for the currently selected panel (legacy)
         currentPanel.values[inputIndex] = inputs[inputIndex];
         displayPanels[panelMode].values[inputIndex] = inputs[inputIndex];
+        
+        // Update UserState via bindings (new system)
+        const PanelKnobBinding& binding = displayPanels[panelMode].bindings;
+        ParamId paramId = PARAM_NONE;
+        switch(inputIndex) {
+            case 0: paramId = binding.knob1; break;
+            case 1: paramId = binding.knob2; break;
+            case 2: paramId = binding.knob3; break;
+            case 3: paramId = binding.knob4; break;
+        }
+        if (paramId != PARAM_NONE) {
+            SetParamValue(paramId, inputs[inputIndex]);
+        }
+        
         knobChanged = true;
     }
 
     if (currentPanel.id == 'e')
     {
-        for (int i = 0; i < 4; i++)
-        {
-            switch(inputIndex)
-            {
-                case 0:
-                    // Attack: logarithmic scaling 0.0001s to 5.0s
-                    {
-                        float attackTime = 0.0001f * powf(5000.0f, inputs[0]);
-                        envelopes[i].env.SetTime(ADSR_SEG_ATTACK, attackTime);
-                    }
-                    break;
-                case 1:
-                    // Decay/Release: logarithmic scaling 0.0001s to 3.0s
-                    {
-                        float decayTime = 0.0001f * powf(3000.0f, inputs[1]);
-                        envelopes[i].env.SetTime(ADSR_SEG_DECAY, decayTime);
-                        envelopes[i].env.SetTime(ADSR_SEG_RELEASE, decayTime);
-                    }
-                    break;
-                case 2:
-                    // Sustain: logarithmic scaling 0.01 to 1.0
-                    {
-                        float sustainLevel = 0.01f * powf(100.0f, inputs[2]);
-                        envelopes[i].env.SetSustainLevel(sustainLevel);
-                    }
-                    break;
-                case 3:
-                    // Minimum level (used in envelope processing)
-                    voicesMinLevel = inputs[3];
-                    break;
-                default:
-                    break;
-            }
-        }
+        // ADSR panel - all parameter updates handled by SetParamValue() via bindings
     }
     else if (currentPanel.id == 'm')
     {
-        switch(inputIndex)
-        {
-            case 0:
-                // Update manual pan frequency: 0 to 10Hz range
-                panFreq = inputs[0] * 10.0f;
-                break;
-            case 1:
-                // Pan amplitude control: 0 = all voices centered, 1 = full panning effect
-                panAmp = inputs[1];
-                break;
-            case 3:
-                // Volume control: 0 = silence, 1 = unity gain
-                // This will be applied in ApplyPanning function
-                break;
-            default:
-                break;
-        }
+        // MIXER panel - all parameter updates handled by SetParamValue() via bindings
     }
     // Removed Pluck panel processing to save memory
     else if (currentPanel.id == 'o')
     {
-        switch(inputIndex)
-        {
-            case 0:
-                // Waveform control: 0.0 = sine, 0.33 = triangle, 0.66 = square, 1.0 = saw
-                for (int i = 0; i < 4; i++) {
-                    voiceInterpOsc[i].SetWaveformParam(inputs[0]);
-                }
-                break;
-            default:
-                break;
-        }
+        // OSC panel - all parameter updates handled by SetParamValue() via bindings
     }
     else if (currentPanel.id == 's')
     {
-        // Process parameters continuously
+        // SEQUENCER panel - all parameter updates handled by SetParamValue() via bindings
         sequencer.sequenceEnabled = sequencer.sequencerMode; // Enable sequence when sequencer mode is active
-        
-        // Only regenerate pattern when density knob changes
-        if (inputIndex == 0) {
-            // Update density property based on knob 0 (0.0f to 16.0f range)
-            sequencer.density = inputs[0] * 1.0f * static_cast<float>(TRIGGER_SEQUENCE_LENGTH);
-            
-            // Round the density value to ensure we get exact integer values
-            int numTriggers = static_cast<int>(sequencer.density);
-            numTriggers = std::max(0, std::min(numTriggers, static_cast<int>(TRIGGER_SEQUENCE_LENGTH)));
-            
-            // Generate Euclidean rhythm pattern
-            GenerateEuclideanRhythm(numTriggers, TRIGGER_SEQUENCE_LENGTH, sequencer.triggerSequence);
-            knobChanged = true;
-        }
-        
-        // Handle knob 2: Note ordering control
-        if (inputIndex == 1) {
-            bool newAscending = inputs[1] < 0.5f;
-            if (newAscending != sequencer.sequencerNotesAscending) {
-                sequencer.sequencerNotesAscending = newAscending;
-                SortSequencerNotes(); // Re-sort existing notes
-                knobChanged = true;
-            }
-        }
-        
-        // Handle knob 3: Note length control (10% to 80% of step duration)
-        if (inputIndex == 2) {
-            float newLengthPercent = 0.1f + inputs[2] * 0.8f; // Map 0-1 to 0.1-0.8
-            if (fabs(newLengthPercent - sequencer.sequencerNoteLengthPercent) > 0.01f) {
-                sequencer.sequencerNoteLengthPercent = newLengthPercent;
-                knobChanged = true;
-            }
-        }
-        
-        // Handle knob 4: BPM control
-        if (inputIndex == 3) {
-            // Map knob value (0-1) to BPM range (CLOCK_BPM_MIN to CLOCK_BPM_MAX)
-            int32_t newBpm = CLOCK_BPM_MIN + static_cast<int32_t>(inputs[3] * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
-            if (newBpm != sequencer.clockBpm) {
-                sequencer.clockBpm = newBpm;
-                
-                // Recalculate clock interval
-                // MIDI clock sends 24 pulses per quarter note
-                // Interval = 60000ms / (BPM * 24)
-                sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
-                
-                // Recalculate sequence step interval
-                // Each sequence step = 1/16th note = 6 MIDI clock pulses
-                // Interval = 60000ms / (BPM * 4) for 16th note timing
-                sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));
-                
-                knobChanged = true;
-            }
-        }
     }
     else if (currentPanel.id == 't')
     {
-        switch(inputIndex)
-        {
-            case 0:
-                // Tuning selector: map knob value to tuning index
-                {
-                    float tuningValue = inputs[0];
-                    uint8_t newTuningIndex = static_cast<uint8_t>(tuningValue * (NUM_TUNING_PRESETS - 1) + 0.5f);
-                    if (newTuningIndex != currentTuningIndex) {
-                        currentTuningIndex = newTuningIndex;
-                        knobChanged = true;
-                        // Apply tuning changes to sequencer notes
-                        ApplyTuningToSequencerNotes();
-                    }
-                }
-                break;
-            case 1:
-                break;
-            case 2:
-                // Enable/disable pitch bend MIDI output
-                {
-                    bool newSendMidi = inputs[2] > 0.5f;
-                    if (newSendMidi != sendPitchBendMidi) {
-                        sendPitchBendMidi = newSendMidi;
-                        knobChanged = true;
-                    }
-                }
-                break;
-            case 3:
-                break;
-            default:
-                break;
-        }
+        // TUNING panel - all parameter updates handled by SetParamValue() via bindings
     }
     else if (currentPanel.id == 'c')
     {
-        // Update ccSlotProbabilities from panel values - correct mapping
-        // Knob 1 (CC1-2): affects slots 0 and 1
-        uint8_t prob1 = (displayPanels[5].values[0] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[0] * 100.0f);
-        ccSlotProbabilities[0] = prob1;
-        ccSlotProbabilities[1] = prob1;
-        
-        // Knob 2 (CC3-4): affects slots 2 and 3
-        uint8_t prob2 = (displayPanels[5].values[1] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[1] * 100.0f);
-        ccSlotProbabilities[2] = prob2;
-        ccSlotProbabilities[3] = prob2;
-        
-        // Knob 3 (CC5-6): affects slots 4 and 5
-        uint8_t prob3 = (displayPanels[5].values[2] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[2] * 100.0f);
-        ccSlotProbabilities[4] = prob3;
-        ccSlotProbabilities[5] = prob3;
-        
-        // Knob 4 (CC7-8): affects slots 6 and 7
-        uint8_t prob4 = (displayPanels[5].values[3] < 0.01f) ? 0 : static_cast<uint8_t>(displayPanels[5].values[3] * 100.0f);
-        ccSlotProbabilities[6] = prob4;
-        ccSlotProbabilities[7] = prob4;
+        // SAMPLER panel - all parameter updates handled by SetParamValue() via bindings
     }
 
     for (int i = 0; i < 4; i++)
