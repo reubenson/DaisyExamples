@@ -215,9 +215,9 @@ bool longPressHandled = false;
 
 // MIDI Clock variables
 const int32_t CLOCK_BPM_MIN = 10;     // Minimum BPM
-const int32_t CLOCK_BPM_MAX = 1000;   // Maximum BPM
+const int32_t CLOCK_BPM_MAX = 600;   // Maximum BPM
 const int32_t CLOCK_BPM_DEFAULT = 120; // Default BPM
-const int32_t CLOCK_BPM_INCREMENT = 10; // BPM change per encoder tick
+const int32_t CLOCK_BPM_INCREMENT = 5; // BPM change per encoder tick
 
 int8_t encoderIncrement = 0;  // Track encoder rotation
 
@@ -237,8 +237,10 @@ void      BuildPattern(int level, std::vector<bool>& result, const std::vector<i
 // Sequencer parameters and state
 struct SequencerParams {
     // Hardware parameter objects
-    Parameter densityParam;
-    Parameter noteParam;
+    // Parameter noteParam;
+    
+    // Density property (0.0f to 16.0f)
+    float density = 0.0f;
     
     // Sequencer mode and state
     bool sequencerMode = false;
@@ -272,8 +274,7 @@ struct SequencerParams {
     
     // Inline initialization (no function call overhead)
     void Init() {
-        densityParam.Init(hw.controls[0], 0.0f, 16.0f, Parameter::LINEAR);
-        noteParam.Init(hw.controls[1], 36.0f, 84.0f, Parameter::LINEAR);
+        // noteParam.Init(hw.controls[1], 36.0f, 84.0f, Parameter::LINEAR);
         sequencerNotes.clear();
         sequencerNoteIndex = 0;
         sequencerNotesAscending = true;
@@ -285,7 +286,7 @@ struct SequencerParams {
     
     // Inline helper (no function call overhead)
     inline int GetDensityValue() {
-        return static_cast<int>(densityParam.Process() + 0.5f);
+        return static_cast<int>(density + 0.5f);
     }
     
     inline void UpdateClockInterval() {
@@ -1304,9 +1305,6 @@ void CalculateKnobPositions(int knobWidth, int knobPadding, int knobPositions[4]
 
 void UpdateOled()
 {
-    // hw.display.Fill(false);
-
-    // Draw vertical panel name bar (x=0-15)
     // Draw vertical bar background
     hw.display.DrawRect(0, 0, 15, 63, false, true);  // Black background
     
@@ -1561,12 +1559,13 @@ void ProcessKnobs()
 {
     float inputs[4];
     int8_t inputIndex = -1; // assuming only one knob changes at a time
-    float knobThreshold = 0.0001; // lower values for slower movement
+    float knobThreshold = 0.00001; // lower values for slower movement
     float alpha = 0.25; // higher value for less smoothing
+    float knobMax = 0.96; // knobs don't seem to go above this value
 
     for (int i = 0; i < 4; i++)
     {
-        inputs[i] = hw.controls[i].Process();
+        inputs[i] = hw.controls[i].Process() / knobMax;
         
         // Apply exponential moving average filter
         smoothedKnobState[i] = (alpha * inputs[i]) + ((1.0f - alpha) * smoothedKnobState[i]);
@@ -1664,8 +1663,11 @@ void ProcessKnobs()
         
         // Only regenerate pattern when density knob changes
         if (inputIndex == 0) {
-            // Round the parameter value to ensure we get exact integer values
-            int numTriggers = sequencer.GetDensityValue();
+            // Update density property based on knob 0 (0.0f to 16.0f range)
+            sequencer.density = inputs[0] * 1.0f * static_cast<float>(TRIGGER_SEQUENCE_LENGTH);
+            
+            // Round the density value to ensure we get exact integer values
+            int numTriggers = static_cast<int>(sequencer.density);
             numTriggers = std::max(0, std::min(numTriggers, static_cast<int>(TRIGGER_SEQUENCE_LENGTH)));
             
             // Generate Euclidean rhythm pattern
