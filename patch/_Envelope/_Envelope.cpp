@@ -1264,7 +1264,7 @@ void InitEnvelopes(float samplerate)
 //     }
 // }
 
-void SendMidiMesssage(uint8_t normalizedValue, uint8_t channel, char* type)
+void SendMidiMesssage(uint8_t normalizedValue, uint8_t channel, const char* type)
 {
     if (strcmp(type, "NOTE_ON") == 0)
     {
