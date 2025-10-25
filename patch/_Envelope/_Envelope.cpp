@@ -107,7 +107,6 @@ int8_t lastCurrentNote = 0;
 int8_t nextVoiceIndex = 0;  // Round-robin voice allocator (0-3)
 uint32_t voiceAllocationCounter = 0;  // Counter to track voice allocation order
 
-// Shift Register Mode (disabled for now)
 bool shiftRegisterMode = false;
 
 // option to use internal oscillators for voices 1 and 3
@@ -115,7 +114,7 @@ bool useInternalOscillators = true;
 
 // Tuning system variables
 uint8_t currentTuningIndex = 0;  // Current tuning preset index
-// this value currently corresponds to the 2 semitone pitch bend range configured on Intellijel
+// this normalizedValue currently corresponds to the 2 semitone pitch bend range configured on Intellijel
 float pitchBendRange = 200.0f;    // Pitch bend range in cents (default ±200)
 bool sendPitchBendMidi = true;    // Enable/disable pitch bend MIDI output
 bool applyToInternalOsc = true;   // Enable/disable tuning for internal oscillators
@@ -181,13 +180,13 @@ uint32_t ccTriggerOffTime = 0;
 bool ccTriggerOffPending = false;
 
 // CC reset timing - for channel assignment on channel 16
-// to experimentally test for value - send trig to next input and confirm 8 pulses
-const uint32_t CC_RESET_DELAY_MS = 55; // drops values sometimes at 50
-uint8_t lastCCValue = 0; // Track the last CC value sent (start with lowest CC value)
+// to experimentally test for normalizedValue - send trig to next input and confirm 8 pulses
+const uint32_t CC_RESET_DELAY_MS = 55; // drops normalizedValues sometimes at 50
+uint8_t lastCCValue = 0; // Track the last CC normalizedValue sent (start with lowest CC normalizedValue)
 bool ccStateInitialized = false; // Track if CC state has been properly initialized
 
 // CC Subdivision System variables
-uint8_t ccSlotValues[8] = {0, 18, 36, 54, 73, 91, 109, 127}; // Equally distributed CC values 0-127
+uint8_t ccSlotValues[8] = {0, 18, 36, 54, 73, 91, 109, 127}; // Equally distributed CC normalizedValues 0-127
 uint8_t ccSlotProbabilities[8] = {100, 100, 100, 100, 100, 100, 100, 100}; // Default all probabilities to 100%
 uint8_t ccSlotCounters[8] = {0, 0, 0, 0, 0, 0, 0, 0}; // Track note count for each slot
 uint32_t globalNoteCounter = 0; // Increments on every note-on
@@ -197,7 +196,7 @@ struct CCQueueItem {
     uint8_t ccValue;
     uint32_t sendTime;
     uint32_t holdUntil; // Time when this CC should be released
-    bool isReset; // true if this is a reset to lowest value
+    bool isReset; // true if this is a reset to lowest normalizedValue
 };
 
 const size_t CC_QUEUE_SIZE = 8; // Reduced from 16 to save memory
@@ -206,7 +205,7 @@ size_t ccQueueHead = 0;
 size_t ccQueueTail = 0;
 size_t ccQueueCount = 0;
 uint32_t ccLatchTime = 0; // Time when CC was last sent
-bool ccIsLatched = false; // Whether CC is currently latched to a value
+bool ccIsLatched = false; // Whether CC is currently latched to a normalizedValue
 
 // Encoder long press timing
 const float ENCODER_SEQUENCER_TOGGLE_MS = 500.0f;
@@ -267,7 +266,7 @@ struct SequencerParams {
     uint8_t currentSequenceStep = 0;
     uint32_t lastSequenceStepTime = 0;
     uint32_t sequenceStepInterval = 0;
-    bool sequenceEnabled = true;
+    // bool sequenceEnabled = true;
     uint8_t triggerNote = 36;  // MIDI note for triggers (C2)
     uint8_t ccTriggerChannel = 12;
     uint8_t ccValueChannel = 15;
@@ -336,7 +335,7 @@ enum ParamId {
 };
 
 // UserState struct - single source of truth for all user-adjustable parameters
-// All values stored in normalized 0.0-1.0 range
+// All normalizedValues stored in normalized 0.0-1.0 range
 struct UserState {
     // ADSR parameters (stored directly in milliseconds)
     float adsrAttackMs;        // Attack time in milliseconds (0.1ms - 5000ms)
@@ -368,7 +367,7 @@ struct UserState {
     float ccProb4_5;            // 0.0-1.0 probability for CC slots 4 and 5
     float ccProb6_7;            // 0.0-1.0 probability for CC slots 6 and 7
     
-    // Constructor with default values
+    // Constructor with default normalizedValues
     UserState() :
         adsrAttackMs(0.1f),         // 0.1ms attack
         adsrDecayReleaseMs(2500.0f), // 2.5s decay/release (2500ms)
@@ -396,8 +395,8 @@ UserState appState;
 
 // State accessor functions
 float GetParamValue(ParamId paramId);
-void SetParamValue(ParamId paramId, float value);
-float GetKnobValue(int panelIndex, int knobIndex);  // Helper to get knob value from UserState
+void SetParamValue(ParamId paramId, float normalizedValue);
+float GetKnobValue(int panelIndex, int knobIndex);  // Helper to get knob normalizedValue from UserState
 
 // Panel knob binding structure
 struct PanelKnobBinding {
@@ -415,7 +414,7 @@ struct panelStruct
     std::string         input2Name;
     std::string         input3Name;
     std::string         input4Name;
-    float               values[4];      // Legacy - will be removed in cleanup
+    float               normalizedValues[4];      // Legacy - will be removed in cleanup
     PanelKnobBinding    bindings;       // New binding system
 };
 panelStruct displayPanels[7] = {
@@ -426,7 +425,7 @@ panelStruct displayPanels[7] = {
         input2Name: "D/R", 
         input3Name: "S",
         input4Name: "Min",
-        values: {0.0f, 0.0f, 0.0f, 0.0f},
+        normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
         bindings: {PARAM_ADSR_ATTACK, PARAM_ADSR_DECAY_RELEASE, PARAM_ADSR_SUSTAIN, PARAM_ADSR_MIN}
     },
     {
@@ -436,7 +435,7 @@ panelStruct displayPanels[7] = {
         input2Name: "Amp",
         input3Name: "",
         input4Name: "Vol",
-        values: {0.0f, 0.0f, 0.0f, 0.8f},
+        normalizedValues: {0.0f, 0.0f, 0.0f, 0.8f},
         bindings: {PARAM_PAN_FREQ, PARAM_PAN_AMP, PARAM_NONE, PARAM_VOLUME}
     },
     {
@@ -446,7 +445,7 @@ panelStruct displayPanels[7] = {
         input2Name: "",
         input3Name: "",
         input4Name: "",
-        values: {0.0f, 0.0f, 0.0f, 0.0f},
+        normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
         bindings: {PARAM_OSC_WAVEFORM, PARAM_NONE, PARAM_NONE, PARAM_NONE}
     },
     {
@@ -456,7 +455,7 @@ panelStruct displayPanels[7] = {
         input2Name: "",
         input3Name: "MIDI",
         input4Name: "",
-        values: {0.0f, 0.0f, 1.0f, 1.0f},
+        normalizedValues: {0.0f, 0.0f, 1.0f, 1.0f},
         bindings: {PARAM_TUNING_INDEX, PARAM_NONE, PARAM_TUNING_MIDI_ENABLE, PARAM_NONE}
     },
     {
@@ -466,7 +465,7 @@ panelStruct displayPanels[7] = {
         input2Name: "Order",
         input3Name: "Length",
         input4Name: "BPM",
-        values: {0.0f, 0.0f, 0.5f, 0.0f},
+        normalizedValues: {0.0f, 0.0f, 0.5f, 0.0f},
         bindings: {PARAM_SEQ_DENSITY, PARAM_SEQ_ORDER, PARAM_SEQ_LENGTH, PARAM_SEQ_BPM}
     },
     {
@@ -476,7 +475,7 @@ panelStruct displayPanels[7] = {
         input2Name: "CC3-4",
         input3Name: "CC5-6",
         input4Name: "CC7-8",
-        values: {0.0f, 0.0f, 0.0f, 0.0f},
+        normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
         bindings: {PARAM_CC_PROB_0_1, PARAM_CC_PROB_2_3, PARAM_CC_PROB_4_5, PARAM_CC_PROB_6_7}
     },
     {
@@ -486,7 +485,7 @@ panelStruct displayPanels[7] = {
         input2Name: "",
         input3Name: "",
         input4Name: "",
-        values: {0.0f, 0.0f, 0.0f, 0.0f},
+        normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
         bindings: {PARAM_NONE, PARAM_NONE, PARAM_NONE, PARAM_NONE}
     }
 };
@@ -496,9 +495,9 @@ int noteCount = 0;
 
 float previousKnobState [4];
 float smoothedKnobState[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-bool knobCaughtUp[4] = {false, false, false, false};  // Track if knob has caught up to parameter value
+bool knobCaughtUp[4] = {false, false, false, false};  // Track if knob has caught up to stored knob normalizedValue
 
-// Global knob values storage - stores all knob positions for all panels (0.0-1.0 normalized)
+// Global knob normalizedValues storage - stores all knob positions for all panels (0.0-1.0 normalized)
 float knobValues[7][4] = {
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 0: ADSR
     {0.0f, 0.0f, 0.0f, 0.8f},  // Panel 1: MIXER
@@ -542,7 +541,6 @@ struct envStruct
 
 envStruct envelopes[4];
 void      ProcessControls();
-// void      UpdateEnvelopes();
 void      ApplyVCAs();
 void      ApplyPanning(float* data);
 void      UpdateOled();
@@ -560,14 +558,10 @@ void      ClearDebugMessage();
 bool      IsDebugMessageExpired();
 
 // SD Card functions
-bool      SaveSettingsToSD();
-bool      LoadSettingsFromSD();
 void      SetDefaultPanelValues();
-void ShowPresetValues();
-
-// Test functions for SD card proof of concept
-bool      TestSaveToSD(int value);
-bool      TestLoadFromSD(int* value);
+void      ShowPresetValues();
+bool      TestSaveToSD();
+bool      TestLoadFromSD();
 
 // Shift Register Mode functions
 void      AddNoteToQueue(int8_t note, int8_t velocity);
@@ -689,76 +683,86 @@ float GetParamValue(ParamId paramId)
     }
 }
 
-void SetParamValue(ParamId paramId, float value)
+void SetParamValue(ParamId paramId, float normalizedValue)
 {
     switch(paramId) {
         // ADSR Panel
         case PARAM_ADSR_ATTACK:
-            // Clamp to 0.1ms - 5000ms range
-            appState.adsrAttackMs = std::max(0.1f, std::min(5000.0f, value));
-            // Apply to all envelopes (convert ms to seconds)
-            for (int i = 0; i < 4; i++) {
-                float attackTime = appState.adsrAttackMs / 1000.0f; // Convert ms to seconds
-                envelopes[i].env.SetTime(ADSR_SEG_ATTACK, attackTime);
+            {
+                // Convert normalized normalizedValue (0.0-1.0) to milliseconds
+                // Use exponential mapping for better control over short times
+                float attackMs = (normalizedValue * normalizedValue) * 5000.0f;
+                appState.adsrAttackMs = std::max(0.1f, std::min(5000.0f, attackMs));
+                
+                // Apply to all envelopes (convert ms to seconds)
+                for (int i = 0; i < 4; i++) {
+                    float attackTime = appState.adsrAttackMs / 1000.0f; // Convert ms to seconds
+                    envelopes[i].env.SetTime(ADSR_SEG_ATTACK, attackTime);
+                }
             }
             break;
             
         case PARAM_ADSR_DECAY_RELEASE:
-            // Clamp to 0.1ms - 3000ms range
-            appState.adsrDecayReleaseMs = std::max(0.1f, std::min(3000.0f, value));
-            // Apply to all envelopes (convert ms to seconds)
-            for (int i = 0; i < 4; i++) {
-                float decayTime = appState.adsrDecayReleaseMs / 1000.0f; // Convert ms to seconds
-                envelopes[i].env.SetTime(ADSR_SEG_DECAY, decayTime);
-                envelopes[i].env.SetTime(ADSR_SEG_RELEASE, decayTime);
+            {
+                // Convert normalized normalizedValue (0.0-1.0) to milliseconds
+                // Use exponential mapping for better control over short times
+                float decayMs = (normalizedValue * normalizedValue) * 3000.0f;
+                appState.adsrDecayReleaseMs = std::max(0.1f, std::min(3000.0f, decayMs));
+                
+                // Apply to all envelopes (convert ms to seconds)
+                for (int i = 0; i < 4; i++) {
+                    float decayTime = appState.adsrDecayReleaseMs / 1000.0f; // Convert ms to seconds
+                    envelopes[i].env.SetTime(ADSR_SEG_DECAY, decayTime);
+                    envelopes[i].env.SetTime(ADSR_SEG_RELEASE, decayTime);
+                }
             }
             break;
             
         case PARAM_ADSR_SUSTAIN:
             // Clamp to 0.0-1.0 range
-            appState.adsrSustain = std::max(0.0f, std::min(1.0f, value));
+            appState.adsrSustain = std::max(0.0f, std::min(1.0f, normalizedValue));
             // Apply to all envelopes
             for (int i = 0; i < 4; i++) {
-                float sustainLevel = 0.01f * powf(100.0f, value);
+                float sustainLevel = 0.01f * powf(100.0f, normalizedValue);
                 envelopes[i].env.SetSustainLevel(sustainLevel);
             }
             break;
             
         case PARAM_ADSR_MIN:
-            appState.adsrMin = value;
-            voicesMinLevel = value;
+            appState.adsrMin = normalizedValue;
+            voicesMinLevel = normalizedValue;
             break;
         
         // MIXER Panel
         case PARAM_PAN_FREQ:
-            appState.panFreq = value;
-            panFreq = value * 10.0f;  // Map to 0-10Hz
+            appState.panFreq = normalizedValue;
+            panFreq = normalizedValue * 10.0f;  // Map to 0-10Hz
             break;
             
         case PARAM_PAN_AMP:
-            appState.panAmp = value;
-            panAmp = value;
+            appState.panAmp = normalizedValue;
+            panAmp = normalizedValue;
             break;
             
         case PARAM_VOLUME:
-            appState.volume = value;
+            appState.volume = normalizedValue;
             // Volume is read directly in ApplyPanning
             break;
         
         // OSC Panel
         case PARAM_OSC_WAVEFORM:
-            appState.oscWaveform = value;
+            appState.oscWaveform = normalizedValue;
             // Apply to all oscillators
             for (int i = 0; i < 4; i++) {
-                voiceInterpOsc[i].SetWaveformParam(value);
+                voiceInterpOsc[i].SetWaveformParam(normalizedValue);
             }
             break;
         
         // TUNING Panel
         case PARAM_TUNING_INDEX:
             {
-                appState.tuningIndex = value;
-                uint8_t newTuningIndex = static_cast<uint8_t>(value * (NUM_TUNING_PRESETS - 1) + 0.5f);
+                appState.tuningIndex = normalizedValue;
+                uint8_t newTuningIndex = static_cast<uint8_t>(normalizedValue * (NUM_TUNING_PRESETS - 1) + 0.5f);
                 if (newTuningIndex != currentTuningIndex) {
                     currentTuningIndex = newTuningIndex;
                     ApplyTuningToSequencerNotes();
@@ -767,14 +771,14 @@ void SetParamValue(ParamId paramId, float value)
             break;
             
         case PARAM_TUNING_MIDI_ENABLE:
-            appState.tuningMidiEnable = value;
-            sendPitchBendMidi = (value > 0.5f);
+            appState.tuningMidiEnable = normalizedValue;
+            sendPitchBendMidi = (normalizedValue > 0.5f);
             break;
         
         // SEQUENCER Panel
         case PARAM_SEQ_DENSITY:
-            appState.seqDensity = value;
-            sequencer.density = value * static_cast<float>(TRIGGER_SEQUENCE_LENGTH);
+            appState.seqDensity = normalizedValue;
+            sequencer.density = normalizedValue * static_cast<float>(TRIGGER_SEQUENCE_LENGTH);
             {
                 int numTriggers = static_cast<int>(sequencer.density);
                 numTriggers = std::max(0, std::min(numTriggers, static_cast<int>(TRIGGER_SEQUENCE_LENGTH)));
@@ -784,8 +788,8 @@ void SetParamValue(ParamId paramId, float value)
             
         case PARAM_SEQ_ORDER:
             {
-                appState.seqOrder = value;
-                bool newAscending = value < 0.5f;
+                appState.seqOrder = normalizedValue;
+                bool newAscending = normalizedValue < 0.5f;
                 if (newAscending != sequencer.sequencerNotesAscending) {
                     sequencer.sequencerNotesAscending = newAscending;
                     SortSequencerNotes();
@@ -794,14 +798,14 @@ void SetParamValue(ParamId paramId, float value)
             break;
             
         case PARAM_SEQ_LENGTH:
-            appState.seqLength = value;
-            sequencer.sequencerNoteLengthPercent = 0.1f + value * 0.8f;  // Map to 0.1-0.9
+            appState.seqLength = normalizedValue;
+            sequencer.sequencerNoteLengthPercent = 0.1f + normalizedValue * 0.8f;  // Map to 0.1-0.9
             break;
             
         case PARAM_SEQ_BPM:
             {
-                appState.seqBpm = value;
-                int32_t newBpm = CLOCK_BPM_MIN + static_cast<int32_t>(value * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
+                appState.seqBpm = normalizedValue;
+                int32_t newBpm = CLOCK_BPM_MIN + static_cast<int32_t>(normalizedValue * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
                 if (newBpm != sequencer.clockBpm) {
                     sequencer.clockBpm = newBpm;
                     sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
@@ -812,36 +816,36 @@ void SetParamValue(ParamId paramId, float value)
         
         // SAMPLER Panel
         case PARAM_CC_PROB_0_1:
-            appState.ccProb0_1 = value;
+            appState.ccProb0_1 = normalizedValue;
             {
-                uint8_t prob = (value < 0.01f) ? 0 : static_cast<uint8_t>(value * 100.0f);
+                uint8_t prob = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
                 ccSlotProbabilities[0] = prob;
                 ccSlotProbabilities[1] = prob;
             }
             break;
             
         case PARAM_CC_PROB_2_3:
-            appState.ccProb2_3 = value;
+            appState.ccProb2_3 = normalizedValue;
             {
-                uint8_t prob = (value < 0.01f) ? 0 : static_cast<uint8_t>(value * 100.0f);
+                uint8_t prob = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
                 ccSlotProbabilities[2] = prob;
                 ccSlotProbabilities[3] = prob;
             }
             break;
             
         case PARAM_CC_PROB_4_5:
-            appState.ccProb4_5 = value;
+            appState.ccProb4_5 = normalizedValue;
             {
-                uint8_t prob = (value < 0.01f) ? 0 : static_cast<uint8_t>(value * 100.0f);
+                uint8_t prob = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
                 ccSlotProbabilities[4] = prob;
                 ccSlotProbabilities[5] = prob;
             }
             break;
             
         case PARAM_CC_PROB_6_7:
-            appState.ccProb6_7 = value;
+            appState.ccProb6_7 = normalizedValue;
             {
-                uint8_t prob = (value < 0.01f) ? 0 : static_cast<uint8_t>(value * 100.0f);
+                uint8_t prob = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
                 ccSlotProbabilities[6] = prob;
                 ccSlotProbabilities[7] = prob;
             }
@@ -853,192 +857,15 @@ void SetParamValue(ParamId paramId, float value)
     }
 }
 
-// Helper to get knob value from UserState via panel bindings
+// Helper to get knob normalizedValue from UserState via panel bindings
 float GetKnobValue(int panelIndex, int knobIndex)
 {
-    if (panelIndex < 0 || panelIndex >= 6 || knobIndex < 0 || knobIndex >= 4) {
+    if (panelIndex < 0 || panelIndex >= 7 || knobIndex < 0 || knobIndex >= 4) {
         return 0.0f;
     }
     
-    const PanelKnobBinding& binding = displayPanels[panelIndex].bindings;
-    ParamId paramId = PARAM_NONE;
-    
-    switch(knobIndex) {
-        case 0: paramId = binding.knob1; break;
-        case 1: paramId = binding.knob2; break;
-        case 2: paramId = binding.knob3; break;
-        case 3: paramId = binding.knob4; break;
-    }
-    
-    return GetParamValue(paramId);
-}
-
-bool SaveSettingsToSD()
-{
-    uint32_t sectorBuffer[512]; // 512 bytes = 128 uint32_t words
-    uint32_t sectorSize = sizeof(sectorBuffer);
-    uint32_t sectorNumber = 1001; // Use sector 1001 for preset data
-    char* buffer = (char*)sectorBuffer;
-    
-    // Clear sector buffer
-    memset(sectorBuffer, 0, sectorSize);
-    
-    // Write knob values using simple string operations
-    // This avoids snprintf issues and is much more reliable
-    strcpy(buffer, "");
-    
-    // Save all knob values for all panels (7 panels × 4 knobs = 28 values)
-    char temp[32];
-    for (int panel = 0; panel < 7; panel++) {
-        for (int knob = 0; knob < 4; knob++) {
-            snprintf(temp, sizeof(temp), "KNOB_%d_%d=%.3f\n", panel, knob, knobValues[panel][knob]);
-            strcat(buffer, temp);
-            
-            // Debug: Show what's being written
-            if (panel == 0 && knob < 2) {
-                SetDebugMessageF("w:%.2f", knobValues[panel][knob]);
-            }
-        }
-    }
-    
-    // Debug: Show first few characters of buffer
-    SetDebugMessageF("b:%c%c%c", buffer[0], buffer[1], buffer[2]);
-    
-    // Write sector to SD card with retry logic
-    uint8_t result = BSP_SD_WriteBlocks(sectorBuffer, sectorNumber, 1, 5000);
-    if (result != MSD_OK) {
-        // Retry once with alternate sector 1002
-        uint32_t retrySector = 1002;
-        result = BSP_SD_WriteBlocks(sectorBuffer, retrySector, 1, 5000);
-        if (result != MSD_OK) {
-            SetDebugMessageF("SD error: %d", result);
-            return false;
-        }
-    }
-    
-    // SetDebugMessage("SD: Settings saved!");
-    return true;
-}
-
-bool LoadSettingsFromSD()
-{
-    uint32_t sectorBuffer[512]; // 2048 bytes = 512 uint32_t words
-    uint32_t sectorSize = sizeof(sectorBuffer);
-    char* buffer = (char*)sectorBuffer;
-    
-    // Try both sectors 1001 and 1002
-    uint32_t sectorsToTry[] = {1001, 1002};
-    bool loadedAnyValues = false;
-    
-    for (int s = 0; s < 2; s++) {
-        uint32_t sectorNumber = sectorsToTry[s];
-        
-        // Read sector from SD card
-        uint8_t result = BSP_SD_ReadBlocks(sectorBuffer, sectorNumber, 1, 5000);
-        if (result != MSD_OK) {
-            continue; // Try next sector
-        }
-    
-        // Parse settings line by line
-        char* line = buffer;
-        bool sectorLoadedValues = false;
-        while (*line && line < buffer + sectorSize) {
-            char* endLine = strchr(line, '\n');
-            if (endLine) {
-                *endLine = '\0'; // Null terminate the line
-            }
-            
-            // Parse key=value pairs
-            char* equals = strchr(line, '=');
-            if (equals) {
-                *equals = '\0';
-                char* key = line;
-                char* value = equals + 1;
-                
-                // Load knob values (new format: KNOB_panel_knob=value)
-                if (strncmp(key, "KNOB_", 5) == 0) {
-                    // Parse panel and knob indices from key (e.g., "KNOB_0_1")
-                    int panel = atoi(key + 5);  // Skip "KNOB_"
-                    char* underscore = strchr(key + 5, '_');
-                    if (underscore) {
-                        int knob = atoi(underscore + 1);
-                        if (panel >= 0 && panel < 7 && knob >= 0 && knob < 4) {
-                            knobValues[panel][knob] = atof(value);
-                            sectorLoadedValues = true;
-                        }
-                    }
-                }
-            }
-            
-            // Move to next line
-            if (endLine) {
-                line = endLine + 1;
-            } else {
-                break;
-            }
-        }
-        
-          // If we found valid data in this sector, check if it's all zeros
-          if (sectorLoadedValues) {
-            // Check if the loaded preset is all zeros (invalid)
-            bool allZeros = true;
-            for (int panel = 0; panel < 7; panel++) {
-                for (int knob = 0; knob < 4; knob++) {
-                    if (knobValues[panel][knob] != 0.0f) {
-                        allZeros = false;
-                        break;
-                    }
-                }
-                if (!allZeros) break;
-            }
-            
-            // Only treat as valid if not all zeros
-            if (!allZeros) {
-                loadedAnyValues = true;
-                break;
-            } else {
-                // Reset knobValues since this was an invalid zero preset
-                memset(knobValues, 0, sizeof(knobValues));
-            }
-        }
-    }
-    
-    // If no values were loaded, treat as if no preset exists
-    if (!loadedAnyValues) {
-        SetDebugMessage("no");
-        return false;
-    }
-    
-    // SetDebugMessage("loaded");
-    
-    // Apply loaded knob values to parameters and hardware
-    for (int panel = 0; panel < 7; panel++) {
-        const PanelKnobBinding& binding = displayPanels[panel].bindings;
-        ParamId params[4] = {binding.knob1, binding.knob2, binding.knob3, binding.knob4};
-        
-        for (int knob = 0; knob < 4; knob++) {
-            if (params[knob] != PARAM_NONE) {
-                SetParamValue(params[knob], knobValues[panel][knob]);
-            }
-        }
-    }
-    
-    // Sync legacy displayPanels values array with loaded knob values
-    // This ensures display shows correct values on load
-    for (int panelIdx = 0; panelIdx < 7; panelIdx++) {
-        for (int knobIdx = 0; knobIdx < 4; knobIdx++) {
-            displayPanels[panelIdx].values[knobIdx] = knobValues[panelIdx][knobIdx];
-        }
-    }
-    
-    // Update currentPanel to reflect loaded values (copy from displayPanels)
-    currentPanel = displayPanels[panelMode];
-    // Explicitly sync currentPanel.values as well
-    for (int i = 0; i < 4; i++) {
-        currentPanel.values[i] = displayPanels[panelMode].values[i];
-    }
-    
-    return true;
+    // Return the normalized knob value (0.0-1.0) directly from knobValues storage
+    return knobValues[panelIndex][knobIndex];
 }
 
 void ShowPresetValues()
@@ -1052,10 +879,10 @@ void ShowPresetValues()
         knobPositions[i] = startX + i * (knobWidth + knobPadding);
     }
     
-    // Debug: Show what values we're displaying
+    // Debug: Show what normalizedValues we're displaying
     // SetDebugMessageF("v:%.1f", knobValues[0][0]);
     
-    // Show the first 4 knob values as numbers
+    // Show the first 4 knob normalizedValues as numbers
     WriteFixedStringF(hw, knobPositions[0], 24, 6, font_s, "%.2f", knobValues[0][0]);
     WriteFixedStringF(hw, knobPositions[1], 32, 6, font_s, "%.2f", knobValues[0][1]);
     WriteFixedStringF(hw, knobPositions[2], 40, 6, font_s, "%.2f", knobValues[0][2]);
@@ -1065,10 +892,10 @@ void ShowPresetValues()
 void SetDefaultPanelValues()
 {
     // SetDebugMessage("def"); // Debug: Confirm defaults are being set
-    // Set default knob values and apply them to parameters
+    // Set default knob normalizedValues and apply them to parameters
     // Panel 0: ADSR
     knobValues[0][0] = 0.0f;   // Attack (0.1ms)
-    knobValues[0][1] = 0.96f; // Decay/Release (2.5s) - normalized value for 2500ms
+    knobValues[0][1] = 0.96f; // Decay/Release (2.5s) - normalized normalizedValue for 2500ms
     knobValues[0][2] = 1.0f;  // Sustain (100%)
     knobValues[0][3] = 0.0f;  // Min (0%)
 
@@ -1113,7 +940,7 @@ void SetDefaultPanelValues()
     knobValues[6][2] = 0.0f;  // Unused
     knobValues[6][3] = 0.0f;  // Unused
     
-    // Apply knob values to parameters and hardware
+    // Apply knob normalizedValues to parameters and hardware
     for (int panel = 0; panel < 7; panel++) {
         const PanelKnobBinding& binding = displayPanels[panel].bindings;
         ParamId params[4] = {binding.knob1, binding.knob2, binding.knob3, binding.knob4};
@@ -1125,10 +952,10 @@ void SetDefaultPanelValues()
         }
     }
     
-    // Sync legacy displayPanels values array with knob values
+    // Sync legacy displayPanels normalizedValues array with knob normalizedValues
     for (int panelIdx = 0; panelIdx < 7; panelIdx++) {
         for (int knobIdx = 0; knobIdx < 4; knobIdx++) {
-            displayPanels[panelIdx].values[knobIdx] = knobValues[panelIdx][knobIdx];
+            displayPanels[panelIdx].normalizedValues[knobIdx] = knobValues[panelIdx][knobIdx];
         }
     }
 }
@@ -1141,13 +968,13 @@ void ClearPanelArea()
     hw.display.DrawRect(0, 24, 127, 55, false, true);  // Fill with black (false = black)
 }
 
-void PanEqualPowerStereo(float pan, float value, float* left, float* right)
+void PanEqualPowerStereo(float pan, float normalizedValue, float* left, float* right)
 {
     // Equal power panning: pan goes from -1 (full left) to +1 (full right)
     // Angle goes from 0 to π/2 as pan goes from -1 to +1
     float angle = (pan + 1.0f) * M_PI * 0.25f;
-    *left       = value * cosf(angle);
-    *right      = value * sinf(angle);
+    *left       = normalizedValue * cosf(angle);
+    *right      = normalizedValue * sinf(angle);
 }
 
 void ApplyPanning(float* data) {
@@ -1184,28 +1011,28 @@ void ApplyPanning(float* data) {
     hw.seed.dac.WriteValue(DacHandle::Channel::ONE, ((panOutput + 1.0f) / 2.0f) * 4095);
 }
 
-float IncrementTowards(float value, float target)
+float IncrementTowards(float normalizedValue, float target)
 {
     float incrementUp = 0.01f;
     float incrementDown = 0.00001f;
     // Removed unused variable to save memory
-    if (value < target)
+    if (normalizedValue < target)
     {
-        value += incrementUp;
-        if (value > target)
+        normalizedValue += incrementUp;
+        if (normalizedValue > target)
         {
-            value = target;
+            normalizedValue = target;
         }
     }
-    else if (value > target)
+    else if (normalizedValue > target)
     {
-        value -= incrementDown;
-        if (value < target)
+        normalizedValue -= incrementDown;
+        if (normalizedValue < target)
         {
-            value = target;
+            normalizedValue = target;
         }
     }
-    return value;
+    return normalizedValue;
 }
 
 // Convert MIDI note number to frequency in Hz
@@ -1230,7 +1057,7 @@ float MidiNoteToFrequency(int8_t note, int8_t channel)
     return frequency;
 }
 
-// Apply VCA to inputs based on envelope values
+// Apply VCA to inputs based on envelope normalizedValues
 void ApplyVCAs(float* data) {
     float envMax = 0.0f;
     float envVal = 0.0f;
@@ -1352,8 +1179,8 @@ void InitEnvelopes(float samplerate)
         // Initialize gate state to false (no notes playing initially)
         envelopes[i].gate = false;
         
-        // Note: ADSR values will be set by loaded preset or SetDefaultPanelValues()
-        // Don't hardcode values here as they would override loaded settings
+        // Note: ADSR normalizedValues will be set by loaded preset or SetDefaultPanelValues()
+        // Don't hardcode normalizedValues here as they would override loaded settings
     }
 }
 
@@ -1414,14 +1241,14 @@ void InitEnvelopes(float samplerate)
 //             {
 //                 case 76: // slide
 //                     // hw.seed.dac.WriteValue(DacHandle::Channel::ONE,
-//                     //     (p.value / 64.) * 4095);
+//                     //     (p.normalizedValue / 64.) * 4095);
                     
 //                     // CC 1 for cutoff.
-//                     // filt.SetFreq(mtof((float)p.value));
+//                     // filt.SetFreq(mtof((float)p.normalizedValue));
 //                     break;
 //                 case 2:
 //                     // CC 2 for res.
-//                     // filt.SetRes(((float)p.value / 127.0f));
+//                     // filt.SetRes(((float)p.normalizedValue / 127.0f));
 //                     break;
 //                 default: break;
 //             }
@@ -1430,36 +1257,36 @@ void InitEnvelopes(float samplerate)
 //     }
 // }
 
-void SendMidiMesssage(uint8_t value, uint8_t channel, char* type)
+void SendMidiMesssage(uint8_t normalizedValue, uint8_t channel, char* type)
 {
     if (strcmp(type, "NOTE_ON") == 0)
     {
-        uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + channel), value, 127};
+        uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + channel), normalizedValue, 127};
         hw.midi.SendMessage(bytes, 3);
     }
     else if (strcmp(type, "NOTE_OFF") == 0)
     {
-        uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + channel), value, 0};
+        uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + channel), normalizedValue, 0};
         hw.midi.SendMessage(bytes, 3);
     }
     else if (strcmp(type, "TRIGGER_ON") == 0)
     {
-        uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + channel), value, 127};
+        uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + channel), normalizedValue, 127};
         hw.midi.SendMessage(bytes, 3);
     }
     else if (strcmp(type, "TRIGGER_OFF") == 0)
     {
-        uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + channel), value, 0};
+        uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + channel), normalizedValue, 0};
         hw.midi.SendMessage(bytes, 3);
     }
     else if (strcmp(type, "CC") == 0)
     {
         uint8_t controller = 3; // this is configured in Intellijel 1U
-        uint8_t bytes[3] = {static_cast<uint8_t>(0xB0 + channel), controller, value};
+        uint8_t bytes[3] = {static_cast<uint8_t>(0xB0 + channel), controller, normalizedValue};
         hw.midi.SendMessage(bytes, 3);
         
         // Debug: Show CC message being sent
-        // SetDebugMessageF("Send CC:%d Ch:%d", value, channel);
+        // SetDebugMessageF("Send CC:%d Ch:%d", normalizedValue, channel);
     }
 }
 
@@ -1480,7 +1307,7 @@ void SendPitchBend(uint8_t channel, int16_t bendValue)
     
     hw.midi.SendMessage(bytes, 3);
     
-    // Store current pitch bend value for this channel
+    // Store current pitch bend normalizedValue for this channel
     currentPitchBendValues[channel] = bendValue;
 }
 
@@ -1553,39 +1380,27 @@ int main(void)
         } else {
             sdCardInitialized = true;
             // SetDebugMessage("SD");
-            // Test load single ADSR knob 0 value as integer
-            int loadedValue = 0;
-            SetDebugMessage("test load");
-            if (TestLoadFromSD(&loadedValue)) {
-                // Apply loaded value to ADSR knob 0
-                float floatValue = loadedValue / 100.0f; // Convert back to 0.0-1.0 range
-                SetParamValue(PARAM_ADSR_ATTACK, floatValue);
-                
-                // Also update knobValues so the display shows the loaded value
-                // knobValues[0][0] = 1.0f;
-                knobValues[0][0] = floatValue;
-                
-                SetDebugMessageF("applied: %d", loadedValue);
-                // SetDebugMessage("applied ok");
+            // Load all parameters
+            if (TestLoadFromSD()) {
+                // Apply loaded normalizedValues to all parameters
+                for (int panel = 0; panel < 7; panel++) {
+                    const PanelKnobBinding& binding = displayPanels[panel].bindings;
+                    ParamId params[4] = {binding.knob1, binding.knob2, binding.knob3, binding.knob4};
+                    
+                    for (int knob = 0; knob < 4; knob++) {
+                        if (params[knob] != PARAM_NONE) {
+                            SetParamValue(params[knob], knobValues[panel][knob]);
+                        }
+                    }
+                }
+                SetDebugMessage("applied");
             } else {
                 SetDebugMessage("load failed");
-                // SetDebugMessageF("loaded: %d", loadedValue);
             }
-            
-            // Load settings from SD card
-            // bool settingsLoaded = LoadSettingsFromSD();
-            // SetDebugMessageF("s: %d", settingsLoaded);
-
-            // SetDebugMessage("loaded");
-            // 
-            // Only set defaults if no settings were loaded from SD card
-            // if (!settingsLoaded) {
-            //     SetDefaultPanelValues();
-            // }
         }
     }
     
-    // Initialize pitch bend values to center (no bend)
+    // Initialize pitch bend normalizedValues to center (no bend)
     for (int i = 0; i < 16; i++) {
         currentPitchBendValues[i] = 8192;
     }
@@ -1604,7 +1419,7 @@ int main(void)
     // Initialize sequencer parameters
     sequencer.Init();
     
-    // Initialize BPM state value based on current BPM
+    // Initialize BPM state normalizedValue based on current BPM
     // Map BPM to 0-1 range for state storage
     float bpmKnobValue = static_cast<float>(sequencer.clockBpm - CLOCK_BPM_MIN) / (CLOCK_BPM_MAX - CLOCK_BPM_MIN);
     appState.seqBpm = bpmKnobValue;
@@ -1726,47 +1541,45 @@ int main(void)
     }
 }
 
-// Helper function to format parameter values based on panel context
-std::string FormatParameterValue(char panelId, int paramIndex, float value)
+// Helper function to format parameter normalizedValues based on panel context
+std::string FormatParameterValue(char panelId, int paramIndex, float normalizedValue)
 {
     if (panelId == 'e') {
         switch(paramIndex) {
-            case 0: // Attack time - value is already in milliseconds
+            case 0: // Attack time - convert normalized value to milliseconds
                 {
-                    if (value < 1.0f) return std::to_string(static_cast<int>(value * 1000)) + "us";
-                    else if (value < 1000.0f) return std::to_string(static_cast<int>(value)) + "ms";
-                    else return std::to_string(static_cast<int>(value / 1000)) + "s";
+                    float attackMs = 0.1f + (normalizedValue) * 4999.9f;
+                    return std::to_string(static_cast<int>(attackMs)) + "ms";
                 }
-            case 1: // Decay/Release time - value is already in milliseconds
+            case 1: // Decay/Release time - convert normalized value to milliseconds
                 {
-                    if (value < 1.0f) return std::to_string(static_cast<int>(value * 1000)) + "us";
-                    else if (value < 1000.0f) return std::to_string(static_cast<int>(value)) + "ms";
-                    else return std::to_string(static_cast<int>(value / 1000)) + "s";
+                    float decayMs = 0.1f + (normalizedValue) * 4999.9f;
+                    return std::to_string(static_cast<int>(decayMs)) + "ms";
                 }
             case 2: // Sustain level
-                return std::to_string(static_cast<int>(value * 100)) + "%";
+                return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
             case 3: // Minimum level
-                return std::to_string(static_cast<int>(value * 100)) + "%";
+                return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
             default: return "0%";
         }
     }
     else if (panelId == 'm') {
         switch(paramIndex) {
             case 0: // Frequency
-                return std::to_string(static_cast<int>(value * 10)) + "Hz";
+                return std::to_string(static_cast<int>(normalizedValue * 10)) + "Hz";
             case 1: // Amplitude
-                return std::to_string(static_cast<int>(value * 100)) + "%";
+                return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
             case 3: // Volume
-                return std::to_string(static_cast<int>(value * 100)) + "%";
+                return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
             default: return "0%";
         }
     }
     else if (panelId == 'o') {
         switch(paramIndex) {
             case 0: // Waveform
-                if (value < 0.25f) return "Sine";
-                else if (value < 0.5f) return "Tri";
-                else if (value < 0.75f) return "Sqr";
+                if (normalizedValue < 0.25f) return "Sine";
+                else if (normalizedValue < 0.5f) return "Tri";
+                else if (normalizedValue < 0.75f) return "Sqr";
                 else return "Saw";
             default: return "Sine";
         }
@@ -1774,15 +1587,15 @@ std::string FormatParameterValue(char panelId, int paramIndex, float value)
     else if (panelId == 's') {
         switch(paramIndex) {
             case 0: // Density
-                return std::to_string(static_cast<int>(value * 16)) + "/16";
+                return std::to_string(static_cast<int>(normalizedValue * 16)) + "/16";
             case 1: // Order
-                return value < 0.5f ? "ASC" : "DESC";
+                return normalizedValue < 0.5f ? "ASC" : "DESC";
             case 2: // Length
-                return std::to_string(static_cast<int>(value * 100)) + "%";
+                return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
             case 3: // BPM
                 {
                     // Map 0-1 to CLOCK_BPM_MIN-CLOCK_BPM_MAX
-                    int bpm = CLOCK_BPM_MIN + static_cast<int>(value * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
+                    int bpm = CLOCK_BPM_MIN + static_cast<int>(normalizedValue * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
                     return std::to_string(bpm);
                 }
             default: return "0";
@@ -1791,9 +1604,9 @@ std::string FormatParameterValue(char panelId, int paramIndex, float value)
     else if (panelId == 't') {
         switch(paramIndex) {
             case 0: // Tuning selector
-                return std::to_string(static_cast<int>(value * 9)) + "/9";
+                return std::to_string(static_cast<int>(normalizedValue * 9)) + "/9";
             case 2: // MIDI
-                return value > 0.5f ? "ON" : "OFF";
+                return normalizedValue > 0.5f ? "ON" : "OFF";
             default: return "OFF";
         }
     }
@@ -1804,7 +1617,7 @@ std::string FormatParameterValue(char panelId, int paramIndex, float value)
             case 2: // CC5-6
             case 3: // CC7-8
                 {
-                    uint8_t probability = (value < 0.01f) ? 0 : static_cast<uint8_t>(value * 100.0f);
+                    uint8_t probability = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
                     return (probability == 0) ? "OFF" : std::to_string(probability) + "%";
                 }
             default: return "OFF";
@@ -1812,7 +1625,7 @@ std::string FormatParameterValue(char panelId, int paramIndex, float value)
     }
     
     // Default fallback
-    return std::to_string(static_cast<int>(value * 100)) + "%";
+    return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
 }
 
 // Function to calculate knob positions dynamically, aligned to right edge
@@ -1848,7 +1661,7 @@ void UpdateOled()
     // Define layout parameters
     int knobWidth = 25;
     int knobPadding = 5;
-    int paramValueY = 12;  // Y position for parameter value labels
+    int paramValueY = 12;  // Y position for parameter normalizedValue labels
     
     int knobPositions[4];
     CalculateKnobPositions(knobWidth, knobPadding, knobPositions);
@@ -1869,15 +1682,15 @@ void UpdateOled()
         // Clear the meter area first (draw black line to erase previous meter)
         hw.display.DrawLine(knobPositions[i], meterY, knobPositions[i] + maxMeterWidth, meterY, false);
         
-        // Draw the value from UserState via bindings
+        // Draw the normalizedValue from UserState via bindings
         float val = GetKnobValue(panelMode, i);
         int meterWidth = static_cast<int>(val * maxMeterWidth);  // Scale 0.0-1.0 to 0-22 pixels
         meterWidth = std::max(0, std::min(meterWidth, maxMeterWidth));  // Clamp to 0-22 range
         
         if (meterWidth > 0) {
-            // If knob hasn't caught up, draw a dotted line to show target value
+            // If knob hasn't caught up, draw a dotted line to show target normalizedValue
             if (!knobCaughtUp[i]) {
-                // Draw dotted line for target value (every other pixel)
+                // Draw dotted line for target normalizedValue (every other pixel)
                 for (int x = 0; x < meterWidth; x += 2) {
                     hw.display.DrawPixel(knobPositions[i] + x, meterY, true);
                 }
@@ -1888,7 +1701,7 @@ void UpdateOled()
         }
     }
     
-    // Display parameter values below meters
+    // Display parameter normalizedValues below meters
     for (int i = 0; i < 4; i++) {
         float paramValue = GetKnobValue(panelMode, i);
         std::string paramValueStr = FormatParameterValue(currentPanel.id, i, paramValue);
@@ -1897,12 +1710,10 @@ void UpdateOled()
     
     // Show trigger sequence pattern when in TRIGSEQ mode
     if (currentPanel.id == 's') {
-        // Show current mode - REMOVE (now in bottom row)
-        
         // Show step counter with fixed width - move to avoid bottom-right area
         WriteFixedStringF(hw, knobPositions[0], 24, 8, font_s, "Step:%02d", sequencer.currentSequenceStep);
 
-        // Show density value with fixed width - move to avoid bottom-right area
+        // Show density normalizedValue with fixed width - move to avoid bottom-right area
         int numTriggers = 0;
         for (int i = 0; i < TRIGGER_SEQUENCE_LENGTH; i++) {
             if (sequencer.triggerSequence[i]) numTriggers++;
@@ -1919,15 +1730,11 @@ void UpdateOled()
         
         // Show sequencer-specific information
         if (sequencer.sequencerMode) {
-            // Show note ordering direction - move to avoid conflicts
+            // Show note ordering direction
             WriteFixedString(hw, knobPositions[3], 32, 4, font_s, sequencer.sequencerNotesAscending ? "ASC" : "DESC");
             
-            // Show number of held notes - move to avoid conflicts
+            // Show number of held notes
             WriteFixedStringF(hw, knobPositions[0], 40, 4, font_s, "N:%d", static_cast<int>(sequencer.sequencerNotes.size()));
-            
-            // Show note length percentage (10%-80% range) - REMOVE (conflicts with bottom-right)
-            
-            // Show current sequencer note index if there are notes - REMOVE (conflicts with bottom-right)
         }
     }
     // Show tuning information when in TUNING mode
@@ -1941,8 +1748,8 @@ void UpdateOled()
         // Show current probabilities for each slot pair
         const char* slotLabels[4] = {"CC1-2", "CC3-4", "CC5-6", "CC7-8"};
         for (int i = 0; i < 4; i++) {
-            float value = GetKnobValue(5, i);  // Panel 5 = SAMPLER
-            uint8_t probability = (value < 0.01f) ? 0 : static_cast<uint8_t>(value * 100.0f);
+            float normalizedValue = GetKnobValue(5, i);  // Panel 5 = SAMPLER
+            uint8_t probability = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
             std::string display = (probability == 0) ? "OFF" : std::to_string(probability) + "%";
             WriteFixedStringF(hw, knobPositions[i], 24, 6, font_s, "%s:%s", slotLabels[i], display.c_str());
         }
@@ -1951,7 +1758,7 @@ void UpdateOled()
         // WriteFixedStringF(hw, knobPositions[0], 32, 8, font_s, "Note:%d", globalNoteCounter);
         // WriteFixedStringF(hw, knobPositions[2], 32, 4, font_s, "Q:%d", ccQueueCount);
     }
-    // PRESET panel - show first 4 knob values
+    // PRESET panel - show first 4 knob normalizedValues
     else if (currentPanel.id == 'p') {
         ShowPresetValues();
     }
@@ -1991,32 +1798,6 @@ void UpdateOled()
             // No special mode active - clear the area
             WriteFixedString(hw, 116, 56, 5, font_s, "  ");
         }
-    }
-    
-    // draw current knob values
-    for (int i = 0; i < 4; i++)
-    {
-        // hw.display.SetCursor(0 + (i * 20), 25);
-        // Removed unused variable to save memory
-
-        // bug: val oscillates between 0 and the actual value???
-        // currently this seems to only get called when it is incorrectly reading 0 ... ?
-        // if (val > 0.01f){
-            // char printme[50];
-            // snprintf(printme, sizeof(printme), "val: %d", static_cast<int>(val * 200));
-            // DisplayMessage(printme);
-            // int rectHeight = static_cast<int>(val * 20);
-            // hw.display.DrawRect(i * 20, 40, i * 20 + 10, 40 - rectHeight, true, true);
-        // }
-
-
-        // hw.display.Update();
-        // str = std::to_string(currentPanel.values[i]);
-        // cstr = &str[0];
-        // hw.display.WriteString(cstr, Font_6x8, true);
-        // str = std::to_string(currentPanel.values[i]);
-        // cstr = &str[0];
-        // hw.display.WriteString("a", Font_6x8, true);
     }
     
     hw.display.Update();
@@ -2083,11 +1864,9 @@ void ProcessEncoder()
         {
             // Check if we're in PRESET panel
             if (currentPanel.id == 'p') {
-                // In PRESET panel - test save single ADSR knob 0 value as integer
+                // In PRESET panel - save all parameters
                 if (sdCardInitialized) {
-                    float knobValue = hw.controls[0].Process() / 0.96f;
-                    int intValue = (int)(knobValue * 100); // Convert to 0-100 range
-                    TestSaveToSD(intValue);
+                    TestSaveToSD();
                 } else {
                     SetDebugMessage("SD not init");
                 }
@@ -2120,9 +1899,9 @@ void ProcessKnobs()
 {
     float inputs[4];
     int8_t inputIndex = -1; // assuming only one knob changes at a time
-    float knobThreshold = 0.0001; // lower values for slower movement
-    float alpha = 0.25; // higher value for less smoothing
-    float knobMax = 0.96; // knobs don't seem to go above this value
+    float knobThreshold = 0.0001; // lower normalizedValues for slower movement
+    float alpha = 0.25; // higher normalizedValue for less smoothing
+    float knobMax = 0.96; // knobs don't seem to go above this normalizedValue
 
     for (int i = 0; i < 4; i++)
     {
@@ -2131,7 +1910,7 @@ void ProcessKnobs()
         // Apply exponential moving average filter
         smoothedKnobState[i] = (alpha * inputs[i]) + ((1.0f - alpha) * smoothedKnobState[i]);
         
-        // Compare smoothed values against threshold
+        // Compare smoothed normalizedValues against threshold
         if (fabs(smoothedKnobState[i] - previousKnobState[i]) > knobThreshold)
         {
             inputIndex = i;
@@ -2151,13 +1930,13 @@ void ProcessKnobs()
         
         // Implement catch-up logic to prevent parameter jumps when switching panels
         if (paramId != PARAM_NONE) {
-            float currentParamValue = GetParamValue(paramId);
+            float storedKnobValue = knobValues[panelMode][inputIndex];
             float knobPosition = inputs[inputIndex];
             
-            // Check if knob has caught up to the stored parameter value
+            // Check if knob has caught up to the stored knob normalizedValue
             if (!knobCaughtUp[inputIndex]) {
-                // Check if knob is within threshold of target value
-                if (fabs(knobPosition - currentParamValue) < KNOB_CATCHUP_THRESHOLD) {
+                // Check if knob is within threshold of target normalizedValue
+                if (fabs(knobPosition - storedKnobValue) < KNOB_CATCHUP_THRESHOLD) {
                     // Knob has caught up - enable tracking
                     knobCaughtUp[inputIndex] = true;
                 } else {
@@ -2171,12 +1950,12 @@ void ProcessKnobs()
             // Knob is caught up - update parameter normally
             SetParamValue(paramId, inputs[inputIndex]);
             
-            // Update knob values storage
+            // Update knob normalizedValues storage
             knobValues[panelMode][inputIndex] = inputs[inputIndex];
             
-            // Update panel values for the currently selected panel (legacy)
-            currentPanel.values[inputIndex] = inputs[inputIndex];
-            displayPanels[panelMode].values[inputIndex] = inputs[inputIndex];
+            // Update panel normalizedValues for the currently selected panel (legacy)
+            currentPanel.normalizedValues[inputIndex] = inputs[inputIndex];
+            displayPanels[panelMode].normalizedValues[inputIndex] = inputs[inputIndex];
             
             knobChanged = true;
         }
@@ -2198,7 +1977,7 @@ void ProcessKnobs()
     else if (currentPanel.id == 's')
     {
         // SEQUENCER panel - all parameter updates handled by SetParamValue() via bindings
-        sequencer.sequenceEnabled = sequencer.sequencerMode; // Enable sequence when sequencer mode is active
+        // sequencer.sequenceEnabled = sequencer.sequencerMode; // Enable sequence when sequencer mode is active
     }
     else if (currentPanel.id == 't')
     {
@@ -2211,18 +1990,18 @@ void ProcessKnobs()
 
     for (int i = 0; i < 4; i++)
     {
-        previousKnobState[i] = smoothedKnobState[i]; // Update with smoothed values for next comparison
+        previousKnobState[i] = smoothedKnobState[i]; // Update with smoothed normalizedValues for next comparison
     }
     
-    // Auto-save to SD card when knobs change (with debouncing) - DISABLED
-    // if (knobChanged && sdCardInitialized) {
-    //     uint32_t currentTime = hw.seed.system.GetNow();
-    //     if (currentTime - lastSaveTime >= SAVE_DEBOUNCE_MS) {
-    //         SaveSettingsToSD();
-    //         SetDebugMessageF("saved");
-    //         lastSaveTime = currentTime;
-    //     }
-    // }
+    // Auto-save to SD card when knobs change
+    if (knobChanged && sdCardInitialized) {
+        uint32_t currentTime = hw.seed.system.GetNow();
+        if (currentTime - lastSaveTime >= SAVE_DEBOUNCE_MS) {
+            TestSaveToSD();
+            SetDebugMessageF("saved");
+            lastSaveTime = currentTime;
+        }
+    }
 }
 
 
@@ -2636,7 +2415,7 @@ void ProcessCCSlots()
         AddCCToQueue(triggeredValues[i], false);
     }
     
-    // If no CCs were triggered and we have a high CC value, force latch down
+    // If no CCs were triggered and we have a high CC normalizedValue, force latch down
     if (triggeredSlots == 0 && lastCCValue > 0) {
         ResetCCState();
     }
@@ -3060,29 +2839,56 @@ void ProcessSequencerMidiSource() {
     sequencerMidiSource.Process();
 }
 
-// Test functions for SD card proof of concept - INTEGER VERSION
-bool TestSaveToSD(int value) {
-    uint32_t buffer[512];
+// Common preset storage constants
+static const int PRESET_SECTOR = 2000;
+static const int PRESET_BUFFER_LENGTH = 128;
+static const int PRESET_TIMEOUT_MS = 5000;
+static const int PRESET_MAX_RETRIES = 3;
+
+bool TestSaveToSD() {
+    uint32_t buffer[PRESET_BUFFER_LENGTH];
     memset(buffer, 0, sizeof(buffer));
-    buffer[0] = (uint32_t)value; // Store int directly in first uint32_t
     
-    uint8_t result = BSP_SD_WriteBlocks(buffer, 2000, 1, 5000);
-    if (result != MSD_OK) {
-        SetDebugMessageF("save fail: %d", result);
-        return false;
+    // Store all 28 knob normalizedValues (7 panels × 4 knobs)
+    int idx = 0;
+    for (int panel = 0; panel < 7; panel++) {
+        for (int knob = 0; knob < 4; knob++) {
+            int intValue = (int)(knobValues[panel][knob] * 100);
+            buffer[idx++] = (uint32_t)intValue;
+        }
     }
-    SetDebugMessageF("saved: %d", value);
-    return true;
+    
+    // Brute force retry on write failure
+    uint8_t result;
+    for (int retry = 0; retry < PRESET_MAX_RETRIES; retry++) {
+        result = BSP_SD_WriteBlocks(buffer, PRESET_SECTOR, 1, PRESET_TIMEOUT_MS);
+        if (result == MSD_OK) {
+            SetDebugMessage("saved");
+            return true;
+        }
+    }
+    
+    SetDebugMessageF("save fail: %d", result);
+    return false;
 }
 
-bool TestLoadFromSD(int* value) {
-    uint32_t buffer[512];
-    uint8_t result = BSP_SD_ReadBlocks(buffer, 2000, 1, 5000);
+bool TestLoadFromSD() {
+    uint32_t buffer[PRESET_BUFFER_LENGTH];
+    uint8_t result = BSP_SD_ReadBlocks(buffer, PRESET_SECTOR, 1, PRESET_TIMEOUT_MS);
     if (result != MSD_OK) {
         SetDebugMessageF("load fail: %d", result);
         return false;
     }
-    *value = (int)buffer[0]; // Read int directly from first uint32_t
-    SetDebugMessage("loaded ok");
+    
+    // Load all 28 knob normalizedValues
+    int idx = 0;
+    for (int panel = 0; panel < panelModesCount; panel++) {
+        for (int knob = 0; knob < 4; knob++) {
+            int intValue = (int)buffer[idx++];
+            knobValues[panel][knob] = intValue / 100.0f;
+        }
+    }
+    
+    SetDebugMessage("loaded");
     return true;
 }
