@@ -338,11 +338,11 @@ enum ParamId {
 // UserState struct - single source of truth for all user-adjustable parameters
 // All values stored in normalized 0.0-1.0 range
 struct UserState {
-    // ADSR parameters (normalized 0.0-1.0)
-    float adsrAttack;           // 0.0-1.0 maps to 0.0001s-5.0s logarithmically
-    float adsrDecayRelease;     // 0.0-1.0 maps to 0.0001s-3.0s logarithmically
-    float adsrSustain;          // 0.0-1.0 maps to 0.01-1.0 logarithmically
-    float adsrMin;              // 0.0-1.0 minimum envelope level
+    // ADSR parameters (stored directly in milliseconds)
+    float adsrAttackMs;        // Attack time in milliseconds (0.1ms - 5000ms)
+    float adsrDecayReleaseMs;   // Decay/Release time in milliseconds (0.1ms - 3000ms)
+    float adsrSustain;          // Sustain level 0.0-1.0
+    float adsrMin;              // Minimum envelope level 0.0-1.0
     
     // MIXER parameters
     float panFreq;              // 0.0-1.0 maps to 0-10Hz
@@ -370,9 +370,9 @@ struct UserState {
     
     // Constructor with default values
     UserState() :
-        adsrAttack(0.0f),           // 0.1ms
-        adsrDecayRelease(0.96f),    // 2.5s to match InitEnvelopes default
-        adsrSustain(1.0f),          // Full sustain
+        adsrAttackMs(0.1f),         // 0.1ms attack
+        adsrDecayReleaseMs(2500.0f), // 2.5s decay/release (2500ms)
+        adsrSustain(1.0f),           // Full sustain
         adsrMin(0.0f),
         panFreq(0.02f),         // Default 0.2Hz
         panAmp(1.0f),           // Default full amplitude
@@ -497,6 +497,17 @@ int noteCount = 0;
 float previousKnobState [4];
 float smoothedKnobState[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 bool knobCaughtUp[4] = {false, false, false, false};  // Track if knob has caught up to parameter value
+
+// Global knob values storage - stores all knob positions for all panels (0.0-1.0 normalized)
+float knobValues[7][4] = {
+    {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 0: ADSR
+    {0.0f, 0.0f, 0.0f, 0.8f},  // Panel 1: MIXER
+    {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 2: OSC
+    {0.0f, 0.0f, 1.0f, 1.0f},  // Panel 3: TUNING
+    {0.0f, 0.0f, 0.5f, 0.0f},  // Panel 4: SEQUENCER
+    {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 5: SAMPLER
+    {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 6: PRESET
+};
 const float KNOB_CATCHUP_THRESHOLD = 0.05f;  // How close knob must be to catch up (5%)
 
 struct voiceStruct
@@ -552,6 +563,11 @@ bool      IsDebugMessageExpired();
 bool      SaveSettingsToSD();
 bool      LoadSettingsFromSD();
 void      SetDefaultPanelValues();
+void ShowPresetValues();
+
+// Test functions for SD card proof of concept
+bool      TestSaveToSD(int value);
+bool      TestLoadFromSD(int* value);
 
 // Shift Register Mode functions
 void      AddNoteToQueue(int8_t note, int8_t velocity);
@@ -639,8 +655,8 @@ float GetParamValue(ParamId paramId)
 {
     switch(paramId) {
         // ADSR Panel
-        case PARAM_ADSR_ATTACK:         return appState.adsrAttack;
-        case PARAM_ADSR_DECAY_RELEASE:  return appState.adsrDecayRelease;
+        case PARAM_ADSR_ATTACK:         return appState.adsrAttackMs;
+        case PARAM_ADSR_DECAY_RELEASE:  return appState.adsrDecayReleaseMs;
         case PARAM_ADSR_SUSTAIN:        return appState.adsrSustain;
         case PARAM_ADSR_MIN:            return appState.adsrMin;
         
@@ -675,34 +691,32 @@ float GetParamValue(ParamId paramId)
 
 void SetParamValue(ParamId paramId, float value)
 {
-    // Clamp value to 0.0-1.0 range
-    value = std::max(0.0f, std::min(1.0f, value));
-    
     switch(paramId) {
         // ADSR Panel
         case PARAM_ADSR_ATTACK:
-            appState.adsrAttack = value;
-            // Apply to all envelopes
-            // Range: 0.0001s to 5.0s (ratio = 50000)
+            // Clamp to 0.1ms - 5000ms range
+            appState.adsrAttackMs = std::max(0.1f, std::min(5000.0f, value));
+            // Apply to all envelopes (convert ms to seconds)
             for (int i = 0; i < 4; i++) {
-                float attackTime = 0.0001f * powf(50000.0f, value);
+                float attackTime = appState.adsrAttackMs / 1000.0f; // Convert ms to seconds
                 envelopes[i].env.SetTime(ADSR_SEG_ATTACK, attackTime);
             }
             break;
             
         case PARAM_ADSR_DECAY_RELEASE:
-            appState.adsrDecayRelease = value;
-            // Apply to all envelopes
-            // Range: 0.0001s to 3.0s (ratio = 30000)
+            // Clamp to 0.1ms - 3000ms range
+            appState.adsrDecayReleaseMs = std::max(0.1f, std::min(3000.0f, value));
+            // Apply to all envelopes (convert ms to seconds)
             for (int i = 0; i < 4; i++) {
-                float decayTime = 0.0001f * powf(30000.0f, value);
+                float decayTime = appState.adsrDecayReleaseMs / 1000.0f; // Convert ms to seconds
                 envelopes[i].env.SetTime(ADSR_SEG_DECAY, decayTime);
                 envelopes[i].env.SetTime(ADSR_SEG_RELEASE, decayTime);
             }
             break;
             
         case PARAM_ADSR_SUSTAIN:
-            appState.adsrSustain = value;
+            // Clamp to 0.0-1.0 range
+            appState.adsrSustain = std::max(0.0f, std::min(1.0f, value));
             // Apply to all envelopes
             for (int i = 0; i < 4; i++) {
                 float sustainLevel = 0.01f * powf(100.0f, value);
@@ -869,65 +883,37 @@ bool SaveSettingsToSD()
     // Clear sector buffer
     memset(sectorBuffer, 0, sectorSize);
     
-    // Write settings from UserState using simple string operations
+    // Write knob values using simple string operations
     // This avoids snprintf issues and is much more reliable
     strcpy(buffer, "");
     
-    // ADSR parameters
+    // Save all knob values for all panels (7 panels × 4 knobs = 28 values)
     char temp[32];
-    snprintf(temp, sizeof(temp), "ADSR_A=%.3f\n", appState.adsrAttack);
-    strcat(buffer, temp);
-    snprintf(temp, sizeof(temp), "ADSR_D=%.3f\n", appState.adsrDecayRelease);
-    strcat(buffer, temp);
-    snprintf(temp, sizeof(temp), "ADSR_S=%.3f\n", appState.adsrSustain);
-    strcat(buffer, temp);
-    snprintf(temp, sizeof(temp), "ADSR_M=%.3f\n", appState.adsrMin);
-    strcat(buffer, temp);
+    for (int panel = 0; panel < 7; panel++) {
+        for (int knob = 0; knob < 4; knob++) {
+            snprintf(temp, sizeof(temp), "KNOB_%d_%d=%.3f\n", panel, knob, knobValues[panel][knob]);
+            strcat(buffer, temp);
+            
+            // Debug: Show what's being written
+            if (panel == 0 && knob < 2) {
+                SetDebugMessageF("w:%.2f", knobValues[panel][knob]);
+            }
+        }
+    }
     
-    // MIXER parameters
-    // snprintf(temp, sizeof(temp), "PAN_F=%.3f\n", appState.panFreq);
-    // strcat(buffer, temp);
-    // snprintf(temp, sizeof(temp), "PAN_A=%.3f\n", appState.panAmp);
-    // strcat(buffer, temp);
-    // snprintf(temp, sizeof(temp), "VOL=%.3f\n", appState.volume);
-    // strcat(buffer, temp);
+    // Debug: Show first few characters of buffer
+    SetDebugMessageF("b:%c%c%c", buffer[0], buffer[1], buffer[2]);
     
-    // // OSC parameters
-    // snprintf(temp, sizeof(temp), "OSC_W=%.3f\n", appState.oscWaveform);
-    // strcat(buffer, temp);
-    
-    // // TUNING parameters
-    // snprintf(temp, sizeof(temp), "TUN_I=%.3f\n", appState.tuningIndex);
-    // strcat(buffer, temp);
-    // snprintf(temp, sizeof(temp), "TUN_M=%.3f\n", appState.tuningMidiEnable);
-    // strcat(buffer, temp);
-    
-    // // SEQUENCER parameters
-    // snprintf(temp, sizeof(temp), "SEQ_D=%.3f\n", appState.seqDensity);
-    // strcat(buffer, temp);
-    // snprintf(temp, sizeof(temp), "SEQ_O=%.3f\n", appState.seqOrder);
-    // strcat(buffer, temp);
-    // snprintf(temp, sizeof(temp), "SEQ_L=%.3f\n", appState.seqLength);
-    // strcat(buffer, temp);
-    // snprintf(temp, sizeof(temp), "SEQ_B=%.3f\n", appState.seqBpm);
-    // strcat(buffer, temp);
-    
-    // // SAMPLER parameters (CC probabilities)
-    // snprintf(temp, sizeof(temp), "CC_01=%.3f\n", appState.ccProb0_1);
-    // strcat(buffer, temp);
-    // snprintf(temp, sizeof(temp), "CC_23=%.3f\n", appState.ccProb2_3);
-    // strcat(buffer, temp);
-    // snprintf(temp, sizeof(temp), "CC_45=%.3f\n", appState.ccProb4_5);
-    // strcat(buffer, temp);
-    // snprintf(temp, sizeof(temp), "CC_67=%.3f\n", appState.ccProb6_7);
-    // strcat(buffer, temp);
-    
-    // Write sector to SD card
+    // Write sector to SD card with retry logic
     uint8_t result = BSP_SD_WriteBlocks(sectorBuffer, sectorNumber, 1, 5000);
     if (result != MSD_OK) {
-        // SetDebugMessage("f");
-        SetDebugMessageF("SD error: %d", result);
-        return false;
+        // Retry once with alternate sector 1002
+        uint32_t retrySector = 1002;
+        result = BSP_SD_WriteBlocks(sectorBuffer, retrySector, 1, 5000);
+        if (result != MSD_OK) {
+            SetDebugMessageF("SD error: %d", result);
+            return false;
+        }
     }
     
     // SetDebugMessage("SD: Settings saved!");
@@ -938,130 +924,110 @@ bool LoadSettingsFromSD()
 {
     uint32_t sectorBuffer[512]; // 2048 bytes = 512 uint32_t words
     uint32_t sectorSize = sizeof(sectorBuffer);
-    uint32_t sectorNumber = 1001; // Use sector 1001 for preset data
     char* buffer = (char*)sectorBuffer;
     
-    // Read sector from SD card
-    uint8_t result = BSP_SD_ReadBlocks(sectorBuffer, sectorNumber, 1, 5000);
-    if (result != MSD_OK) {
-        return false;
-    }
-    
-    // Parse settings line by line
-    char* line = buffer;
+    // Try both sectors 1001 and 1002
+    uint32_t sectorsToTry[] = {1001, 1002};
     bool loadedAnyValues = false;
-    while (*line && line < buffer + sectorSize) {
-        char* endLine = strchr(line, '\n');
-        if (endLine) {
-            *endLine = '\0'; // Null terminate the line
-        }
+    
+    for (int s = 0; s < 2; s++) {
+        uint32_t sectorNumber = sectorsToTry[s];
         
-        // Parse key=value pairs
-        char* equals = strchr(line, '=');
-        if (equals) {
-            *equals = '\0';
-            char* key = line;
-            char* value = equals + 1;
+        // Read sector from SD card
+        uint8_t result = BSP_SD_ReadBlocks(sectorBuffer, sectorNumber, 1, 5000);
+        if (result != MSD_OK) {
+            continue; // Try next sector
+        }
+    
+        // Parse settings line by line
+        char* line = buffer;
+        bool sectorLoadedValues = false;
+        while (*line && line < buffer + sectorSize) {
+            char* endLine = strchr(line, '\n');
+            if (endLine) {
+                *endLine = '\0'; // Null terminate the line
+            }
             
-            // Load into UserState (new format)
-            if (strcmp(key, "ADSR_A") == 0) {
-                appState.adsrAttack = atof(value);
-                loadedAnyValues = true;
-                // SetDebugMessageF("loaded %s", key);
-            } else if (strcmp(key, "ADSR_D") == 0) {
-                appState.adsrDecayRelease = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "ADSR_S") == 0) {
-                appState.adsrSustain = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "ADSR_M") == 0) {
-                appState.adsrMin = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "PAN_F") == 0) {
-                appState.panFreq = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "PAN_A") == 0) {
-                appState.panAmp = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "VOL") == 0) {
-                appState.volume = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "OSC_W") == 0) {
-                appState.oscWaveform = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "TUN_I") == 0) {
-                appState.tuningIndex = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "TUN_M") == 0) {
-                appState.tuningMidiEnable = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "SEQ_D") == 0) {
-                appState.seqDensity = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "SEQ_O") == 0) {
-                appState.seqOrder = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "SEQ_L") == 0) {
-                appState.seqLength = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "SEQ_B") == 0) {
-                appState.seqBpm = atof(value);
-                loadedAnyValues = true;
-                // SetDebugMessageF("loaded %s", value);
-            } else if (strcmp(key, "CC_01") == 0) {
-                appState.ccProb0_1 = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "CC_23") == 0) {
-                appState.ccProb2_3 = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "CC_45") == 0) {
-                appState.ccProb4_5 = atof(value);
-                loadedAnyValues = true;
-            } else if (strcmp(key, "CC_67") == 0) {
-                appState.ccProb6_7 = atof(value);
-                loadedAnyValues = true;
+            // Parse key=value pairs
+            char* equals = strchr(line, '=');
+            if (equals) {
+                *equals = '\0';
+                char* key = line;
+                char* value = equals + 1;
+                
+                // Load knob values (new format: KNOB_panel_knob=value)
+                if (strncmp(key, "KNOB_", 5) == 0) {
+                    // Parse panel and knob indices from key (e.g., "KNOB_0_1")
+                    int panel = atoi(key + 5);  // Skip "KNOB_"
+                    char* underscore = strchr(key + 5, '_');
+                    if (underscore) {
+                        int knob = atoi(underscore + 1);
+                        if (panel >= 0 && panel < 7 && knob >= 0 && knob < 4) {
+                            knobValues[panel][knob] = atof(value);
+                            sectorLoadedValues = true;
+                        }
+                    }
+                }
+            }
+            
+            // Move to next line
+            if (endLine) {
+                line = endLine + 1;
+            } else {
+                break;
             }
         }
         
-        // Move to next line
-        if (endLine) {
-            line = endLine + 1;
-        } else {
-            break;
+          // If we found valid data in this sector, check if it's all zeros
+          if (sectorLoadedValues) {
+            // Check if the loaded preset is all zeros (invalid)
+            bool allZeros = true;
+            for (int panel = 0; panel < 7; panel++) {
+                for (int knob = 0; knob < 4; knob++) {
+                    if (knobValues[panel][knob] != 0.0f) {
+                        allZeros = false;
+                        break;
+                    }
+                }
+                if (!allZeros) break;
+            }
+            
+            // Only treat as valid if not all zeros
+            if (!allZeros) {
+                loadedAnyValues = true;
+                break;
+            } else {
+                // Reset knobValues since this was an invalid zero preset
+                memset(knobValues, 0, sizeof(knobValues));
+            }
         }
     }
     
     // If no values were loaded, treat as if no preset exists
     if (!loadedAnyValues) {
+        SetDebugMessage("no");
         return false;
     }
     
-    // Apply loaded UserState to hardware objects and global variables
-    SetParamValue(PARAM_ADSR_ATTACK, appState.adsrAttack);
-    SetParamValue(PARAM_ADSR_DECAY_RELEASE, appState.adsrDecayRelease);
-    SetParamValue(PARAM_ADSR_SUSTAIN, appState.adsrSustain);
-    SetParamValue(PARAM_ADSR_MIN, appState.adsrMin);
-    SetParamValue(PARAM_PAN_FREQ, appState.panFreq);
-    SetParamValue(PARAM_PAN_AMP, appState.panAmp);
-    SetParamValue(PARAM_VOLUME, appState.volume);
-    SetParamValue(PARAM_OSC_WAVEFORM, appState.oscWaveform);
-    SetParamValue(PARAM_TUNING_INDEX, appState.tuningIndex);
-    SetParamValue(PARAM_TUNING_MIDI_ENABLE, appState.tuningMidiEnable);
-    SetParamValue(PARAM_SEQ_DENSITY, appState.seqDensity);
-    SetParamValue(PARAM_SEQ_ORDER, appState.seqOrder);
-    SetParamValue(PARAM_SEQ_LENGTH, appState.seqLength);
-    SetParamValue(PARAM_SEQ_BPM, appState.seqBpm);
-    SetParamValue(PARAM_CC_PROB_0_1, appState.ccProb0_1);
-    SetParamValue(PARAM_CC_PROB_2_3, appState.ccProb2_3);
-    SetParamValue(PARAM_CC_PROB_4_5, appState.ccProb4_5);
-    SetParamValue(PARAM_CC_PROB_6_7, appState.ccProb6_7);
+    // SetDebugMessage("loaded");
     
-    // Sync legacy displayPanels values array with loaded UserState
+    // Apply loaded knob values to parameters and hardware
+    for (int panel = 0; panel < 7; panel++) {
+        const PanelKnobBinding& binding = displayPanels[panel].bindings;
+        ParamId params[4] = {binding.knob1, binding.knob2, binding.knob3, binding.knob4};
+        
+        for (int knob = 0; knob < 4; knob++) {
+            if (params[knob] != PARAM_NONE) {
+                SetParamValue(params[knob], knobValues[panel][knob]);
+            }
+        }
+    }
+    
+    // Sync legacy displayPanels values array with loaded knob values
     // This ensures display shows correct values on load
-    for (int panelIdx = 0; panelIdx < 6; panelIdx++) {
+    for (int panelIdx = 0; panelIdx < 7; panelIdx++) {
         for (int knobIdx = 0; knobIdx < 4; knobIdx++) {
-            float value = GetKnobValue(panelIdx, knobIdx);
-            displayPanels[panelIdx].values[knobIdx] = value;
+            displayPanels[panelIdx].values[knobIdx] = knobValues[panelIdx][knobIdx];
         }
     }
     
@@ -1075,40 +1041,94 @@ bool LoadSettingsFromSD()
     return true;
 }
 
+void ShowPresetValues()
+{
+    // Calculate knob positions (same as UpdateOled)
+    int knobWidth = 5;
+    int knobPadding = 15;
+    int knobPositions[4];
+    int startX = 0;
+    for (int i = 0; i < 4; i++) {
+        knobPositions[i] = startX + i * (knobWidth + knobPadding);
+    }
+    
+    // Debug: Show what values we're displaying
+    // SetDebugMessageF("v:%.1f", knobValues[0][0]);
+    
+    // Show the first 4 knob values as numbers
+    WriteFixedStringF(hw, knobPositions[0], 24, 6, font_s, "%.2f", knobValues[0][0]);
+    WriteFixedStringF(hw, knobPositions[1], 32, 6, font_s, "%.2f", knobValues[0][1]);
+    WriteFixedStringF(hw, knobPositions[2], 40, 6, font_s, "%.2f", knobValues[0][2]);
+    WriteFixedStringF(hw, knobPositions[3], 48, 6, font_s, "%.2f", knobValues[0][3]);
+}
+
 void SetDefaultPanelValues()
 {
-    // Set default values in UserState and apply them to hardware
-    // ADSR defaults - match what InitEnvelopes originally set (2.5s decay)
-    // With corrected formula: 0.0001 * powf(30000, value)
-    // For 2.5s: x = log(25000) / log(30000) = 0.96
-    SetParamValue(PARAM_ADSR_ATTACK, 0.0f);      // 0.1ms attack
-    SetParamValue(PARAM_ADSR_DECAY_RELEASE, 0.96f); // 2.5s decay/release
-    SetParamValue(PARAM_ADSR_SUSTAIN, 1.0f);     // Full sustain
-    SetParamValue(PARAM_ADSR_MIN, 0.0f);         // No minimum
+    // SetDebugMessage("def"); // Debug: Confirm defaults are being set
+    // Set default knob values and apply them to parameters
+    // Panel 0: ADSR
+    knobValues[0][0] = 0.0f;   // Attack (0.1ms)
+    knobValues[0][1] = 0.96f; // Decay/Release (2.5s) - normalized value for 2500ms
+    knobValues[0][2] = 1.0f;  // Sustain (100%)
+    knobValues[0][3] = 0.0f;  // Min (0%)
+
+    // SetDebugMessageF("d:%.2f", knobValues[0][1]); // Should show 0.96    
+    SetDebugMessageF("d:%.2f", knobValues[0][1]); // Should show 0.96
+    SetDebugMessageF("a:%.2f", knobValues[0][0]); // Should show 0.00
+    SetDebugMessageF("b:%.2f", knobValues[0][2]); // Should show 1.00
+
+    // Panel 1: MIXER
+    knobValues[1][0] = 0.02f; // Pan Freq (0.2Hz)
+    knobValues[1][1] = 1.0f;  // Pan Amp (full)
+    knobValues[1][2] = 0.0f;  // Unused
+    knobValues[1][3] = 0.8f;  // Volume (80%)
     
-    SetParamValue(PARAM_PAN_FREQ, 0.02f);      // 0.2Hz
-    SetParamValue(PARAM_PAN_AMP, 1.0f);        // Full amplitude
-    SetParamValue(PARAM_VOLUME, 0.8f);         // 80% volume
-    SetParamValue(PARAM_TUNING_INDEX, 0.0f);   // 12-TET
-    SetParamValue(PARAM_TUNING_MIDI_ENABLE, 1.0f); // MIDI enabled
+    // Panel 2: OSC
+    knobValues[2][0] = 0.0f;  // Waveform (sine)
+    knobValues[2][1] = 0.0f;  // Unused
+    knobValues[2][2] = 0.0f;  // Unused
+    knobValues[2][3] = 0.0f;  // Unused
     
-    // Sequencer defaults
-    SetParamValue(PARAM_SEQ_DENSITY, 0.0f);    // No triggers
-    SetParamValue(PARAM_SEQ_ORDER, 0.0f);      // Ascending
-    SetParamValue(PARAM_SEQ_LENGTH, 0.5f);     // 50% length
-    SetParamValue(PARAM_SEQ_BPM, (CLOCK_BPM_DEFAULT - CLOCK_BPM_MIN) / static_cast<float>(CLOCK_BPM_MAX - CLOCK_BPM_MIN)); // 120 BPM
+    // Panel 3: TUNING
+    knobValues[3][0] = 0.0f;  // Tuning Index (12-TET)
+    knobValues[3][1] = 0.0f;  // Unused
+    knobValues[3][2] = 1.0f;  // MIDI Enable
+    knobValues[3][3] = 0.0f;  // Unused
     
-    // CC Probability defaults
-    SetParamValue(PARAM_CC_PROB_0_1, 0.0f);
-    SetParamValue(PARAM_CC_PROB_2_3, 0.0f);
-    SetParamValue(PARAM_CC_PROB_4_5, 0.0f);
-    SetParamValue(PARAM_CC_PROB_6_7, 0.0f);
+    // Panel 4: SEQUENCER
+    knobValues[4][0] = 0.0f;  // Density (no triggers)
+    knobValues[4][1] = 0.0f;  // Order (ascending)
+    knobValues[4][2] = 0.5f;  // Length (50%)
+    knobValues[4][3] = (CLOCK_BPM_DEFAULT - CLOCK_BPM_MIN) / static_cast<float>(CLOCK_BPM_MAX - CLOCK_BPM_MIN); // BPM (120)
     
-    // Sync legacy displayPanels values array with UserState
-    for (int panelIdx = 0; panelIdx < 6; panelIdx++) {
+    // Panel 5: SAMPLER
+    knobValues[5][0] = 0.0f;  // CC Prob 0-1
+    knobValues[5][1] = 0.0f;  // CC Prob 2-3
+    knobValues[5][2] = 0.0f;  // CC Prob 4-5
+    knobValues[5][3] = 0.0f;  // CC Prob 6-7
+    
+    // Panel 6: PRESET
+    knobValues[6][0] = 0.0f;  // Unused
+    knobValues[6][1] = 0.0f;  // Unused
+    knobValues[6][2] = 0.0f;  // Unused
+    knobValues[6][3] = 0.0f;  // Unused
+    
+    // Apply knob values to parameters and hardware
+    for (int panel = 0; panel < 7; panel++) {
+        const PanelKnobBinding& binding = displayPanels[panel].bindings;
+        ParamId params[4] = {binding.knob1, binding.knob2, binding.knob3, binding.knob4};
+        
+        for (int knob = 0; knob < 4; knob++) {
+            if (params[knob] != PARAM_NONE) {
+                SetParamValue(params[knob], knobValues[panel][knob]);
+            }
+        }
+    }
+    
+    // Sync legacy displayPanels values array with knob values
+    for (int panelIdx = 0; panelIdx < 7; panelIdx++) {
         for (int knobIdx = 0; knobIdx < 4; knobIdx++) {
-            float value = GetKnobValue(panelIdx, knobIdx);
-            displayPanels[panelIdx].values[knobIdx] = value;
+            displayPanels[panelIdx].values[knobIdx] = knobValues[panelIdx][knobIdx];
         }
     }
 }
@@ -1526,14 +1546,35 @@ int main(void)
     } else {
         // Initialize BSP SD card
         uint8_t bsp_result = BSP_SD_Init();
+        // SetDebugMessageF("test: %d", bsp_result);
         if (bsp_result != MSD_OK) {
-            // SetDebugMessage("SD: BSP Init failed");
             // Set defaults when BSP SD init fails
             SetDefaultPanelValues();
         } else {
             sdCardInitialized = true;
+            // SetDebugMessage("SD");
+            // Test load single ADSR knob 0 value as integer
+            int loadedValue = 0;
+            SetDebugMessage("test load");
+            if (TestLoadFromSD(&loadedValue)) {
+                // Apply loaded value to ADSR knob 0
+                float floatValue = loadedValue / 100.0f; // Convert back to 0.0-1.0 range
+                SetParamValue(PARAM_ADSR_ATTACK, floatValue);
+                
+                // Also update knobValues so the display shows the loaded value
+                // knobValues[0][0] = 1.0f;
+                knobValues[0][0] = floatValue;
+                
+                SetDebugMessageF("applied: %d", loadedValue);
+                // SetDebugMessage("applied ok");
+            } else {
+                SetDebugMessage("load failed");
+                // SetDebugMessageF("loaded: %d", loadedValue);
+            }
+            
             // Load settings from SD card
             // bool settingsLoaded = LoadSettingsFromSD();
+            // SetDebugMessageF("s: %d", settingsLoaded);
 
             // SetDebugMessage("loaded");
             // 
@@ -1690,19 +1731,17 @@ std::string FormatParameterValue(char panelId, int paramIndex, float value)
 {
     if (panelId == 'e') {
         switch(paramIndex) {
-            case 0: // Attack time - apply logarithmic formula
+            case 0: // Attack time - value is already in milliseconds
                 {
-                    float attackTime = 0.0001f * powf(50000.0f, value);
-                    if (attackTime < 0.001f) return std::to_string(static_cast<int>(attackTime * 1000000)) + "us";
-                    else if (attackTime < 1.0f) return std::to_string(static_cast<int>(attackTime * 1000)) + "ms";
-                    else return std::to_string(static_cast<int>(attackTime)) + "s";
+                    if (value < 1.0f) return std::to_string(static_cast<int>(value * 1000)) + "us";
+                    else if (value < 1000.0f) return std::to_string(static_cast<int>(value)) + "ms";
+                    else return std::to_string(static_cast<int>(value / 1000)) + "s";
                 }
-            case 1: // Decay/Release time - apply logarithmic formula
+            case 1: // Decay/Release time - value is already in milliseconds
                 {
-                    float decayTime = 0.0001f * powf(30000.0f, value);
-                    if (decayTime < 0.001f) return std::to_string(static_cast<int>(decayTime * 1000000)) + "us";
-                    else if (decayTime < 1.0f) return std::to_string(static_cast<int>(decayTime * 1000)) + "ms";
-                    else return std::to_string(static_cast<int>(decayTime)) + "s";
+                    if (value < 1.0f) return std::to_string(static_cast<int>(value * 1000)) + "us";
+                    else if (value < 1000.0f) return std::to_string(static_cast<int>(value)) + "ms";
+                    else return std::to_string(static_cast<int>(value / 1000)) + "s";
                 }
             case 2: // Sustain level
                 return std::to_string(static_cast<int>(value * 100)) + "%";
@@ -1912,11 +1951,9 @@ void UpdateOled()
         // WriteFixedStringF(hw, knobPositions[0], 32, 8, font_s, "Note:%d", globalNoteCounter);
         // WriteFixedStringF(hw, knobPositions[2], 32, 4, font_s, "Q:%d", ccQueueCount);
     }
-    // PRESET panel - show save instructions
+    // PRESET panel - show first 4 knob values
     else if (currentPanel.id == 'p') {
-        // WriteFixedString(hw, knobPositions[0], 24, 12, font_s, "Press encoder");
-        // WriteFixedString(hw, knobPositions[1], 32, 8, font_s, "to save");
-        // WriteFixedString(hw, knobPositions[2], 40, 8, font_s, "preset");
+        ShowPresetValues();
     }
     
     // === BOTTOM ROW: General State Info (always visible) ===
@@ -2046,15 +2083,13 @@ void ProcessEncoder()
         {
             // Check if we're in PRESET panel
             if (currentPanel.id == 'p') {
-                // In PRESET panel - save preset instead of toggling sequencer
-
-                // if (sdCardInitialized) {
-                //     SetDebugMessage("f");
-                // }
-                if (sdCardInitialized && SaveSettingsToSD()) {
-                    // SetDebugMessage("save");
+                // In PRESET panel - test save single ADSR knob 0 value as integer
+                if (sdCardInitialized) {
+                    float knobValue = hw.controls[0].Process() / 0.96f;
+                    int intValue = (int)(knobValue * 100); // Convert to 0-100 range
+                    TestSaveToSD(intValue);
                 } else {
-                    
+                    SetDebugMessage("SD not init");
                 }
                 UpdateOled();
             } else {
@@ -2135,6 +2170,9 @@ void ProcessKnobs()
             
             // Knob is caught up - update parameter normally
             SetParamValue(paramId, inputs[inputIndex]);
+            
+            // Update knob values storage
+            knobValues[panelMode][inputIndex] = inputs[inputIndex];
             
             // Update panel values for the currently selected panel (legacy)
             currentPanel.values[inputIndex] = inputs[inputIndex];
@@ -3020,4 +3058,31 @@ SequencerMidiSource sequencerMidiSource;
 // Wrapper function for sequencer source
 void ProcessSequencerMidiSource() {
     sequencerMidiSource.Process();
+}
+
+// Test functions for SD card proof of concept - INTEGER VERSION
+bool TestSaveToSD(int value) {
+    uint32_t buffer[512];
+    memset(buffer, 0, sizeof(buffer));
+    buffer[0] = (uint32_t)value; // Store int directly in first uint32_t
+    
+    uint8_t result = BSP_SD_WriteBlocks(buffer, 2000, 1, 5000);
+    if (result != MSD_OK) {
+        SetDebugMessageF("save fail: %d", result);
+        return false;
+    }
+    SetDebugMessageF("saved: %d", value);
+    return true;
+}
+
+bool TestLoadFromSD(int* value) {
+    uint32_t buffer[512];
+    uint8_t result = BSP_SD_ReadBlocks(buffer, 2000, 1, 5000);
+    if (result != MSD_OK) {
+        SetDebugMessageF("load fail: %d", result);
+        return false;
+    }
+    *value = (int)buffer[0]; // Read int directly from first uint32_t
+    SetDebugMessage("loaded ok");
+    return true;
 }
