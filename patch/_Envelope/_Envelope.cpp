@@ -179,6 +179,13 @@ bool triggerOffPending = false;
 uint32_t ccTriggerOffTime = 0;
 bool ccTriggerOffPending = false;
 
+// Non-blocking SD card save state
+bool sdSavePending = false;
+bool sdSaveInProgress = false;
+uint32_t sdSaveRequestTime = 0;
+uint32_t sdSaveBuffer[128]; // Use literal size instead of PRESET_BUFFER_LENGTH
+bool sdSaveBufferReady = false;
+
 // CC reset timing - for channel assignment on channel 16
 // to experimentally test for normalizedValue - send trig to next input and confirm 8 pulses
 const uint32_t CC_RESET_DELAY_MS = 55; // drops normalizedValues sometimes at 50
@@ -560,8 +567,8 @@ bool      IsDebugMessageExpired();
 // SD Card functions
 void      SetDefaultPanelValues();
 void      ShowPresetValues();
-bool      TestSaveToSD();
-bool      TestLoadFromSD();
+bool      SavePreset();
+bool      LoadPreset();
 
 // Shift Register Mode functions
 void      AddNoteToQueue(int8_t note, int8_t velocity);
@@ -1381,7 +1388,7 @@ int main(void)
             sdCardInitialized = true;
             // SetDebugMessage("SD");
             // Load all parameters
-            if (TestLoadFromSD()) {
+            if (LoadPreset()) {
                 // Apply loaded normalizedValues to all parameters
                 for (int panel = 0; panel < 7; panel++) {
                     const PanelKnobBinding& binding = displayPanels[panel].bindings;
@@ -1647,6 +1654,10 @@ void CalculateKnobPositions(int knobWidth, int knobPadding, int knobPositions[4]
 
 void UpdateOled()
 {
+    // Clear the panel-specific area to prevent overlap when switching panels
+    // Reserve bottom row (y=56-63) for general parameters
+    ClearPanelArea();
+    
     // Draw vertical bar background
     hw.display.DrawRect(0, 0, 15, 63, false, true);  // Black background
     
@@ -1822,9 +1833,6 @@ void ProcessEncoder()
         
         currentPanel = displayPanels[panelMode];
         
-        // Clear panel area to prevent overlap when switching panels
-        ClearPanelArea();
-        
         // Reset knob catch-up state when switching panels
         // This prevents parameters from jumping when knobs are at different positions
         const PanelKnobBinding& binding = displayPanels[panelMode].bindings;
@@ -1866,7 +1874,7 @@ void ProcessEncoder()
             if (currentPanel.id == 'p') {
                 // In PRESET panel - save all parameters
                 if (sdCardInitialized) {
-                    TestSaveToSD();
+                    SavePreset();
                 } else {
                     SetDebugMessage("SD not init");
                 }
@@ -1993,15 +2001,15 @@ void ProcessKnobs()
         previousKnobState[i] = smoothedKnobState[i]; // Update with smoothed normalizedValues for next comparison
     }
     
-    // Auto-save to SD card when knobs change
-    if (knobChanged && sdCardInitialized) {
-        uint32_t currentTime = hw.seed.system.GetNow();
-        if (currentTime - lastSaveTime >= SAVE_DEBOUNCE_MS) {
-            TestSaveToSD();
-            SetDebugMessageF("saved");
-            lastSaveTime = currentTime;
-        }
-    }
+    // Auto-save to SD card when knobs change - DISABLED to prevent audio dropouts
+    // Users can manually save via encoder press in PRESET panel
+    // if (knobChanged && sdCardInitialized) {
+    //     uint32_t currentTime = hw.seed.system.GetNow();
+    //     if (currentTime - lastSaveTime >= SAVE_DEBOUNCE_MS) {
+    //         RequestSaveToSD();
+    //         lastSaveTime = currentTime;
+    //     }
+    // }
 }
 
 
@@ -2845,7 +2853,7 @@ static const int PRESET_BUFFER_LENGTH = 128;
 static const int PRESET_TIMEOUT_MS = 5000;
 static const int PRESET_MAX_RETRIES = 3;
 
-bool TestSaveToSD() {
+bool SavePreset() {
     uint32_t buffer[PRESET_BUFFER_LENGTH];
     memset(buffer, 0, sizeof(buffer));
     
@@ -2858,10 +2866,10 @@ bool TestSaveToSD() {
         }
     }
     
-    // Brute force retry on write failure
+    // Retry on write failure (retry count = 1)
     uint8_t result;
-    for (int retry = 0; retry < PRESET_MAX_RETRIES; retry++) {
-        result = BSP_SD_WriteBlocks(buffer, PRESET_SECTOR, 1, PRESET_TIMEOUT_MS);
+    for (int retry = 0; retry < 2; retry++) { // 2 attempts = 1 retry
+        result = BSP_SD_WriteBlocks(buffer, PRESET_SECTOR, 1, 2000); // 2 second timeout
         if (result == MSD_OK) {
             SetDebugMessage("saved");
             return true;
@@ -2872,7 +2880,7 @@ bool TestSaveToSD() {
     return false;
 }
 
-bool TestLoadFromSD() {
+bool LoadPreset() {
     uint32_t buffer[PRESET_BUFFER_LENGTH];
     uint8_t result = BSP_SD_ReadBlocks(buffer, PRESET_SECTOR, 1, PRESET_TIMEOUT_MS);
     if (result != MSD_OK) {
