@@ -2406,8 +2406,8 @@ void ProcessCCSlots()
     int triggeredSlots = 0;
     uint8_t triggeredValues[8];
     
-    // Check each slot's probability
-    for (int i = 0; i < 8; i++) {
+    // Check each slot's probability (reverse order to prioritize CC8)
+    for (int i = 7; i >= 0; i--) {
         if (ShouldFireWithProbability(ccSlotProbabilities[i])) {
             triggeredValues[triggeredSlots] = ccSlotValues[i];
             triggeredSlots++;
