@@ -170,25 +170,17 @@ uint32_t debugMessageTime = 0;  // When debug message was set
 const uint32_t DEBUG_MESSAGE_DURATION_MS = 2000;  // How long to show debug message (2 seconds)
 
 // Trigger off timing
-// int8_t currentNote = 0;
-uint32_t triggerOffTime = 0;
-const uint32_t TRIGGER_OFF_DELAY_MS = 50; // 10ms delay for trigger off
-bool triggerOffPending = false;
+// uint32_t triggerOffTime = 0;
+// const uint32_t TRIGGER_OFF_DELAY_MS = 50;
+// bool triggerOffPending = false;
 
 // CC-triggered trigger timing (separate from note-triggered triggers)
 uint32_t ccTriggerOffTime = 0;
 bool ccTriggerOffPending = false;
 
-// Non-blocking SD card save state
-bool sdSavePending = false;
-bool sdSaveInProgress = false;
-uint32_t sdSaveRequestTime = 0;
-uint32_t sdSaveBuffer[128]; // Use literal size instead of PRESET_BUFFER_LENGTH
-bool sdSaveBufferReady = false;
-
 // CC reset timing - for channel assignment on channel 16
 // to experimentally test for normalizedValue - send trig to next input and confirm 8 pulses
-const uint32_t CC_RESET_DELAY_MS = 55; // drops normalizedValues sometimes at 50
+const uint32_t CC_RESET_DELAY_MS = 15; // drops signal sometimes below 15ms
 uint8_t lastCCValue = 0; // Track the last CC normalizedValue sent (start with lowest CC normalizedValue)
 bool ccStateInitialized = false; // Track if CC state has been properly initialized
 
@@ -206,7 +198,7 @@ struct CCQueueItem {
     bool isReset; // true if this is a reset to lowest normalizedValue
 };
 
-const size_t CC_QUEUE_SIZE = 8; // Reduced from 16 to save memory
+const size_t CC_QUEUE_SIZE = 16; // Reduced from 16 to save memory
 CCQueueItem ccQueue[CC_QUEUE_SIZE];
 size_t ccQueueHead = 0;
 size_t ccQueueTail = 0;
@@ -1485,19 +1477,19 @@ int main(void)
             lastDisplayUpdate = currentTime;
         }
         
-        // Check for trigger off timing
-        if (triggerOffPending && currentTime >= triggerOffTime)
-        {
-            // Send trigger off on channel 15 (matches the trigger on sent earlier)
-            SendMidiMesssage(sequencer.triggerNote, sequencer.ccTriggerChannel, "TRIGGER_OFF");
-            triggerOffPending = false;
-        }
+        // // Check for trigger off timing
+        // if (triggerOffPending && currentTime >= triggerOffTime)
+        // {
+        //     // Send trigger off on channel 15 (matches the trigger on sent earlier)
+        //     SendMidiMesssage(sequencer.triggerNote, sequencer.ccTriggerChannel, "TRIGGER_OFF");
+        //     triggerOffPending = false;
+        // }
         
         // Check for CC-triggered trigger off timing
         if (ccTriggerOffPending && currentTime >= ccTriggerOffTime)
         {
             // Send CC-triggered trigger off on channel 15
-            SendMidiMesssage(sequencer.triggerNote, sequencer.ccTriggerChannel, "TRIGGER_OFF");
+            // SendMidiMesssage(sequencer.triggerNote, sequencer.ccTriggerChannel, "TRIGGER_OFF");
             ccTriggerOffPending = false;
         }
         
@@ -2351,24 +2343,28 @@ void ProcessCCQueue() {
         // SetDebugMessage("CC Init");
     }
     
-    // Process all ready items in the queue
-    while (ccQueueCount > 0) {
+    // Process only the next ready item in the queue (one at a time to respect timing)
+    if (ccQueueCount > 0) {
         CCQueueItem& item = ccQueue[ccQueueHead];
         
         if (currentTime >= item.sendTime) {
-            SendMidiMesssage(item.ccValue, 15, "CC");
-            lastCCValue = item.ccValue;
-            ccLatchTime = currentTime;
-            ccIsLatched = true;
-            
-            SendMidiMesssage(sequencer.triggerNote, sequencer.ccTriggerChannel, "TRIGGER_ON");
-            ccTriggerOffTime = currentTime + TRIGGER_OFF_DELAY_MS;
-            ccTriggerOffPending = true;
-            
-            ccQueueHead = (ccQueueHead + 1) % CC_QUEUE_SIZE;
-            ccQueueCount--;
-        } else {
-            break;
+            // Check if enough time has passed since last trigger-on to prevent double-triggering
+            uint32_t timeSinceLastTrigger = currentTime - ccLatchTime;
+            if (timeSinceLastTrigger >= CC_RESET_DELAY_MS || !ccIsLatched) {
+                SendMidiMesssage(item.ccValue, 15, "CC");
+                lastCCValue = item.ccValue;
+                ccLatchTime = currentTime;
+                ccIsLatched = true;
+
+                SendMidiMesssage(sequencer.triggerNote, sequencer.ccTriggerChannel, "TRIGGER_OFF");
+                SendMidiMesssage(sequencer.triggerNote, sequencer.ccTriggerChannel, "TRIGGER_ON");
+                // ccTriggerOffTime = currentTime + TRIGGER_OFF_DELAY_MS;
+                ccTriggerOffTime = currentTime + CC_RESET_DELAY_MS;
+                ccTriggerOffPending = true;
+                
+                ccQueueHead = (ccQueueHead + 1) % CC_QUEUE_SIZE;
+                ccQueueCount--;
+            }
         }
     }
     
@@ -2421,6 +2417,7 @@ void ProcessCCSlots()
     // Queue all triggered CCs
     for (int i = 0; i < triggeredSlots; i++) {
         AddCCToQueue(triggeredValues[i], false);
+        // AddCCToQueue(ccSlotValues[7], true);
     }
     
     // If no CCs were triggered and we have a high CC normalizedValue, force latch down
@@ -2809,7 +2806,7 @@ private:
             ProcessHandlerChainNoteOn(event);
             
             // Process CC slots based on subdivision logic
-            ProcessCCSlots();
+            // ProcessCCSlots();
             
             // Advance to next note in sequencer array
             sequencer.sequencerNoteIndex = (sequencer.sequencerNoteIndex + 1) % sequencer.sequencerNotes.size();
