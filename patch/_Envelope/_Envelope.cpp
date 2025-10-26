@@ -24,6 +24,7 @@ DaisyPatch      hw;
 Fm2             osc1, osc2;
 Oscillator      pan, lfo1, lfo2, lfo3;
 SdmmcHandler    sdcard;
+Compressor      compressor;
 
 // Custom oscillator class for waveform interpolation
 class InterpolatedOscillator {
@@ -89,6 +90,9 @@ public:
 };
 
 InterpolatedOscillator voiceInterpOsc[4];  // Oscillators for all 4 voices
+Fm2 voiceFm2Osc[4];                        // FM2 oscillators for all 4 voices
+FormantOscillator voiceFormantOsc[4];             // Formant oscillators for all 4 voices
+HarmonicOscillator<> voiceHarmonicOsc[4];    // Harmonic oscillators for all 4 voices (default 16 harmonics)
 
 int panelMode;
 float voicesMinLevel = 0.0f;
@@ -313,6 +317,14 @@ enum ParamId {
     
     // OSC Panel
     PARAM_OSC_WAVEFORM,
+    PARAM_OSC_MODE,
+    PARAM_OSC_FM2_RATIO,
+    PARAM_OSC_FM2_INDEX,
+    PARAM_OSC_FORMANT_FREQ,
+    PARAM_OSC_FORMANT_PHASE,
+    PARAM_OSC_HARMONIC_IDX,
+    PARAM_OSC_HARMONIC_DECAY,
+    PARAM_OSC_HARMONIC_SKEW,
     
     // TUNING Panel
     PARAM_TUNING_INDEX,
@@ -329,6 +341,12 @@ enum ParamId {
     PARAM_CC_PROB_2_3,
     PARAM_CC_PROB_4_5,
     PARAM_CC_PROB_6_7,
+    
+    // COMP Panel
+    PARAM_COMP_RATIO,
+    PARAM_COMP_THRESHOLD,
+    PARAM_COMP_ATTACK,
+    PARAM_COMP_RELEASE,
     
     PARAM_NONE  // Used for unbound knobs
 };
@@ -349,6 +367,14 @@ struct UserState {
     
     // OSC parameters
     float oscWaveform;          // 0.0-1.0 (sine->tri->square->saw)
+    float oscMode;              // 0.0-1.0 oscillator mode (0=Interpolated, 1=FM2, 2=Formant, 3=Harmonic)
+    float fm2Ratio;             // 0.0-1.0 maps to 0.125-8.0
+    float fm2Index;             // 0.0-1.0 maps to 0.0-1.0
+    float formantFreq;          // 0.0-1.0 maps to 10-1000 Hz
+    float formantPhaseShift;   // 0.0-1.0 maps to 0.0-1.0
+    float harmonicIdx;          // 0.0-1.0 maps to 1-16 as integers
+    float harmonicDecay;        // 0.0-1.0 maps to 0-10 decay rate
+    float harmonicSkew;         // 0.0-1.0 skew position (0=fundamental, 1=high harmonics)
     
     // TUNING parameters
     float tuningIndex;          // 0.0-1.0 maps to tuning preset index
@@ -366,6 +392,12 @@ struct UserState {
     float ccProb4_5;            // 0.0-1.0 probability for CC slots 4 and 5
     float ccProb6_7;            // 0.0-1.0 probability for CC slots 6 and 7
     
+    // COMP parameters
+    float compRatio;            // 0.0-1.0 maps to 1.0-40.0 compression ratio
+    float compThreshold;       // 0.0-1.0 maps to 0.0 to -80.0 dB
+    float compAttack;          // 0.0-1.0 maps to 0.001-10.0 seconds
+    float compRelease;         // 0.0-1.0 maps to 0.001-10.0 seconds
+    
     // Constructor with default normalizedValues
     UserState() :
         adsrAttackMs(0.1f),         // 0.1ms attack
@@ -376,6 +408,14 @@ struct UserState {
         panAmp(1.0f),           // Default full amplitude
         volume(0.8f),           // Default 80% volume
         oscWaveform(0.0f),      // Default sine wave
+        oscMode(0.0f),          // Default Interpolated oscillator
+        fm2Ratio(0.26f),        // Default 1.0 ratio (0.26 normalizes to 1.0)
+        fm2Index(0.5f),         // Default 0.5 index
+        formantFreq(0.5f),      // Default 500 Hz
+        formantPhaseShift(0.5f), // Default 0.5 phase shift
+        harmonicIdx(0.0f),      // Default harmonic index 1 (0.0 normalizes to 1)
+        harmonicDecay(0.3f),    // Default decay rate
+        harmonicSkew(0.0f),     // Default no skew (emphasize fundamental)
         tuningIndex(0.0f),      // Default 12-TET
         tuningMidiEnable(1.0f), // Default enabled
         seqDensity(0.0f),
@@ -385,7 +425,11 @@ struct UserState {
         ccProb0_1(0.0f),
         ccProb2_3(0.0f),
         ccProb4_5(0.0f),
-        ccProb6_7(0.0f)
+        ccProb6_7(0.0f),
+        compRatio(0.25f),        // Default 4:1 ratio (0.25 = (4-1)/(40-1) ≈ 0.077)
+        compThreshold(0.6f),    // Default -12 dB (0.6 in normalized range)
+        compAttack(0.01f),      // Default 0.001s attack
+        compRelease(0.05f)      // Default 0.1s release
     {}
 };
 
@@ -416,7 +460,7 @@ struct panelStruct
     float               normalizedValues[4];      // Legacy - will be removed in cleanup
     PanelKnobBinding    bindings;       // New binding system
 };
-panelStruct displayPanels[7] = {
+panelStruct displayPanels[8] = {
     { 
         name: "ADSR",
         id: 'e',
@@ -443,9 +487,9 @@ panelStruct displayPanels[7] = {
         input1Name: "Waveform",
         input2Name: "",
         input3Name: "",
-        input4Name: "",
+        input4Name: "Mode",
         normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
-        bindings: {PARAM_OSC_WAVEFORM, PARAM_NONE, PARAM_NONE, PARAM_NONE}
+        bindings: {PARAM_OSC_WAVEFORM, PARAM_NONE, PARAM_NONE, PARAM_OSC_MODE}
     },
     {
         name: "TUNING",
@@ -478,6 +522,16 @@ panelStruct displayPanels[7] = {
         bindings: {PARAM_CC_PROB_0_1, PARAM_CC_PROB_2_3, PARAM_CC_PROB_4_5, PARAM_CC_PROB_6_7}
     },
     {
+        name: "COMP",
+        id: 'x',
+        input1Name: "Ratio",
+        input2Name: "Thresh",
+        input3Name: "Atk",
+        input4Name: "Rel",
+        normalizedValues: {0.25f, 0.6f, 0.01f, 0.05f},
+        bindings: {PARAM_COMP_RATIO, PARAM_COMP_THRESHOLD, PARAM_COMP_ATTACK, PARAM_COMP_RELEASE}
+    },
+    {
         name: "PRESET",
         id: 'p',
         input1Name: "",
@@ -497,14 +551,15 @@ float smoothedKnobState[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 bool knobCaughtUp[4] = {false, false, false, false};  // Track if knob has caught up to stored knob normalizedValue
 
 // Global knob normalizedValues storage - stores all knob positions for all panels (0.0-1.0 normalized)
-float knobValues[7][4] = {
+float knobValues[8][4] = {
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 0: ADSR
     {0.0f, 0.0f, 0.0f, 0.8f},  // Panel 1: MIXER
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 2: OSC
     {0.0f, 0.0f, 1.0f, 1.0f},  // Panel 3: TUNING
     {0.0f, 0.0f, 0.5f, 0.0f},  // Panel 4: SEQUENCER
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 5: SAMPLER
-    {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 6: PRESET
+    {0.25f, 0.6f, 0.01f, 0.05f}, // Panel 6: COMP
+    {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 7: PRESET
 };
 const float KNOB_CATCHUP_THRESHOLD = 0.05f;  // How close knob must be to catch up (5%)
 
@@ -542,6 +597,7 @@ envStruct envelopes[4];
 void      ProcessControls();
 void      ApplyVCAs();
 void      ApplyPanning(float* data);
+void      ApplyCompression(float* data);
 void      UpdateOled();
 // void      plucksApply();
 void      InitPan(float samplerate);
@@ -660,6 +716,14 @@ float GetParamValue(ParamId paramId)
         
         // OSC Panel
         case PARAM_OSC_WAVEFORM:        return appState.oscWaveform;
+        case PARAM_OSC_MODE:            return appState.oscMode;
+        case PARAM_OSC_FM2_RATIO:       return appState.fm2Ratio;
+        case PARAM_OSC_FM2_INDEX:       return appState.fm2Index;
+        case PARAM_OSC_FORMANT_FREQ:    return appState.formantFreq;
+        case PARAM_OSC_FORMANT_PHASE:   return appState.formantPhaseShift;
+        case PARAM_OSC_HARMONIC_IDX:    return appState.harmonicIdx;
+        case PARAM_OSC_HARMONIC_DECAY:  return appState.harmonicDecay;
+        case PARAM_OSC_HARMONIC_SKEW:   return appState.harmonicSkew;
         
         // TUNING Panel
         case PARAM_TUNING_INDEX:        return appState.tuningIndex;
@@ -676,6 +740,12 @@ float GetParamValue(ParamId paramId)
         case PARAM_CC_PROB_2_3:         return appState.ccProb2_3;
         case PARAM_CC_PROB_4_5:         return appState.ccProb4_5;
         case PARAM_CC_PROB_6_7:         return appState.ccProb6_7;
+        
+        // COMP Panel
+        case PARAM_COMP_RATIO:         return appState.compRatio;
+        case PARAM_COMP_THRESHOLD:     return appState.compThreshold;
+        case PARAM_COMP_ATTACK:        return appState.compAttack;
+        case PARAM_COMP_RELEASE:       return appState.compRelease;
         
         case PARAM_NONE:
         default:                        return 0.0f;
@@ -754,6 +824,140 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             // Apply to all oscillators
             for (int i = 0; i < 4; i++) {
                 voiceInterpOsc[i].SetWaveformParam(normalizedValue);
+            }
+            break;
+            
+        case PARAM_OSC_MODE:
+            appState.oscMode = normalizedValue;
+            // Store mode for audio callback to use
+            // No action needed here, the audio callback will check the mode
+            break;
+            
+        case PARAM_OSC_FM2_RATIO:
+            {
+                appState.fm2Ratio = normalizedValue;
+                // Map 0.0-1.0 to 0.125-8.0 (logarithmic scale for musical ratios)
+                float ratio = 0.125f * powf(64.0f, normalizedValue);
+                ratio = std::max(0.125f, std::min(8.0f, ratio));
+                for (int i = 0; i < 4; i++) {
+                    voiceFm2Osc[i].SetRatio(ratio);
+                }
+            }
+            break;
+            
+        case PARAM_OSC_FM2_INDEX:
+            {
+                appState.fm2Index = normalizedValue;
+                float index = normalizedValue; // 0.0-1.0
+                for (int i = 0; i < 4; i++) {
+                    voiceFm2Osc[i].SetIndex(index);
+                }
+            }
+            break;
+            
+        case PARAM_OSC_FORMANT_FREQ:
+            {
+                appState.formantFreq = normalizedValue;
+                // Map 0.0-1.0 to 10-1000 Hz (logarithmic scale)
+                float freq = 10.0f * powf(100.0f, normalizedValue);
+                freq = std::max(10.0f, std::min(1000.0f, freq));
+                for (int i = 0; i < 4; i++) {
+                    voiceFormantOsc[i].SetFormantFreq(freq);
+                }
+            }
+            break;
+            
+        case PARAM_OSC_FORMANT_PHASE:
+            {
+                appState.formantPhaseShift = normalizedValue;
+                // Phase shift 0.0-1.0
+                for (int i = 0; i < 4; i++) {
+                    voiceFormantOsc[i].SetPhaseShift(normalizedValue);
+                }
+            }
+            break;
+            
+        case PARAM_OSC_HARMONIC_IDX:
+            {
+                appState.harmonicIdx = normalizedValue;
+                // Map 0.0-1.0 to 1-16 (integers)
+                int idx = 1 + static_cast<int>(normalizedValue * 15.99f);
+                idx = std::max(1, std::min(16, idx));
+                for (int i = 0; i < 4; i++) {
+                    voiceHarmonicOsc[i].SetFirstHarmIdx(idx);
+                    
+                    // Calculate exponential decay distribution with skew
+                    float decay = appState.harmonicDecay * 10.0f; // Map to 0-10
+                    float skew = appState.harmonicSkew;
+                    float amplitudes[16];
+                    for (int h = 0; h < 16; h++) {
+                        float t = h / 15.0f;
+                        // Exponential decay curves
+                        float lowCurve = expf(-t * decay);
+                        float highCurve = expf(-(1.0f - t) * decay);
+                        float weight = lowCurve * (1.0f - skew) + highCurve * skew;
+                        amplitudes[h] = weight;
+                    }
+                    // Normalize amplitudes to prevent clipping
+                    float sum = 0.0f;
+                    for (int h = 0; h < 16; h++) sum += amplitudes[h];
+                    if (sum > 0.0f) {
+                        for (int h = 0; h < 16; h++) amplitudes[h] /= sum;
+                    }
+                    voiceHarmonicOsc[i].SetAmplitudes(amplitudes);
+                }
+            }
+            break;
+            
+        case PARAM_OSC_HARMONIC_DECAY:
+            {
+                appState.harmonicDecay = normalizedValue;
+                // Update distribution curve with new decay rate
+                for (int i = 0; i < 4; i++) {
+                    float decay = normalizedValue * 10.0f; // Map to 0-10
+                    float skew = appState.harmonicSkew;
+                    float amplitudes[16];
+                    for (int h = 0; h < 16; h++) {
+                        float t = h / 15.0f;
+                        float lowCurve = expf(-t * decay);
+                        float highCurve = expf(-(1.0f - t) * decay);
+                        float weight = lowCurve * (1.0f - skew) + highCurve * skew;
+                        amplitudes[h] = weight;
+                    }
+                    // Normalize
+                    float sum = 0.0f;
+                    for (int h = 0; h < 16; h++) sum += amplitudes[h];
+                    if (sum > 0.0f) {
+                        for (int h = 0; h < 16; h++) amplitudes[h] /= sum;
+                    }
+                    voiceHarmonicOsc[i].SetAmplitudes(amplitudes);
+                }
+            }
+            break;
+            
+        case PARAM_OSC_HARMONIC_SKEW:
+            {
+                appState.harmonicSkew = normalizedValue;
+                // Update distribution curve with new skew
+                for (int i = 0; i < 4; i++) {
+                    float decay = appState.harmonicDecay * 10.0f;
+                    float skew = normalizedValue;
+                    float amplitudes[16];
+                    for (int h = 0; h < 16; h++) {
+                        float t = h / 15.0f;
+                        float lowCurve = expf(-t * decay);
+                        float highCurve = expf(-(1.0f - t) * decay);
+                        float weight = lowCurve * (1.0f - skew) + highCurve * skew;
+                        amplitudes[h] = weight;
+                    }
+                    // Normalize
+                    float sum = 0.0f;
+                    for (int h = 0; h < 16; h++) sum += amplitudes[h];
+                    if (sum > 0.0f) {
+                        for (int h = 0; h < 16; h++) amplitudes[h] /= sum;
+                    }
+                    voiceHarmonicOsc[i].SetAmplitudes(amplitudes);
+                }
             }
             break;
         
@@ -850,6 +1054,43 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             }
             break;
         
+        // COMP Panel
+        case PARAM_COMP_RATIO:
+            {
+                appState.compRatio = normalizedValue;
+                // Map 0.0-1.0 to 1.0-40.0 compression ratio
+                float ratio = 1.0f + normalizedValue * 39.0f;
+                compressor.SetRatio(ratio);
+            }
+            break;
+            
+        case PARAM_COMP_THRESHOLD:
+            {
+                appState.compThreshold = normalizedValue;
+                // Map 0.0-1.0 to 0.0 to -80.0 dB threshold
+                float threshold = -80.0f * normalizedValue;
+                compressor.SetThreshold(threshold);
+            }
+            break;
+            
+        case PARAM_COMP_ATTACK:
+            {
+                appState.compAttack = normalizedValue;
+                // Map 0.0-1.0 to 0.001-10.0 seconds with logarithmic curve
+                float attack = 0.001f * powf(10000.0f, normalizedValue);
+                compressor.SetAttack(attack);
+            }
+            break;
+            
+        case PARAM_COMP_RELEASE:
+            {
+                appState.compRelease = normalizedValue;
+                // Map 0.0-1.0 to 0.001-10.0 seconds with logarithmic curve
+                float release = 0.001f * powf(10000.0f, normalizedValue);
+                compressor.SetRelease(release);
+            }
+            break;
+        
         case PARAM_NONE:
         default:
             break;
@@ -859,7 +1100,7 @@ void SetParamValue(ParamId paramId, float normalizedValue)
 // Helper to get knob normalizedValue from UserState via panel bindings
 float GetKnobValue(int panelIndex, int knobIndex)
 {
-    if (panelIndex < 0 || panelIndex >= 7 || knobIndex < 0 || knobIndex >= 4) {
+    if (panelIndex < 0 || panelIndex >= 8 || knobIndex < 0 || knobIndex >= 4) {
         return 0.0f;
     }
     
@@ -933,14 +1174,20 @@ void SetDefaultPanelValues()
     knobValues[5][2] = 0.0f;  // CC Prob 4-5
     knobValues[5][3] = 0.0f;  // CC Prob 6-7
     
-    // Panel 6: PRESET
-    knobValues[6][0] = 0.0f;  // Unused
-    knobValues[6][1] = 0.0f;  // Unused
-    knobValues[6][2] = 0.0f;  // Unused
-    knobValues[6][3] = 0.0f;  // Unused
+    // Panel 6: COMP
+    knobValues[6][0] = 0.25f;  // Ratio (4:1)
+    knobValues[6][1] = 0.6f;   // Threshold (-12 dB)
+    knobValues[6][2] = 0.01f;  // Attack (0.001s)
+    knobValues[6][3] = 0.05f;  // Release (0.1s)
+    
+    // Panel 7: PRESET
+    knobValues[7][0] = 0.0f;  // Unused
+    knobValues[7][1] = 0.0f;  // Unused
+    knobValues[7][2] = 0.0f;  // Unused
+    knobValues[7][3] = 0.0f;  // Unused
     
     // Apply knob normalizedValues to parameters and hardware
-    for (int panel = 0; panel < 7; panel++) {
+    for (int panel = 0; panel < panelModesCount; panel++) {
         const PanelKnobBinding& binding = displayPanels[panel].bindings;
         ParamId params[4] = {binding.knob1, binding.knob2, binding.knob3, binding.knob4};
         
@@ -952,7 +1199,7 @@ void SetDefaultPanelValues()
     }
     
     // Sync legacy displayPanels normalizedValues array with knob normalizedValues
-    for (int panelIdx = 0; panelIdx < 7; panelIdx++) {
+    for (int panelIdx = 0; panelIdx < panelModesCount; panelIdx++) {
         for (int knobIdx = 0; knobIdx < 4; knobIdx++) {
             displayPanels[panelIdx].normalizedValues[knobIdx] = knobValues[panelIdx][knobIdx];
         }
@@ -1010,6 +1257,14 @@ void ApplyPanning(float* data) {
     hw.seed.dac.WriteValue(DacHandle::Channel::ONE, ((panOutput + 1.0f) / 2.0f) * 4095);
 }
 
+void ApplyCompression(float* data) {
+    // Compress each individual voice before mixing
+    data[0] = compressor.Process(data[0]);
+    data[1] = compressor.Process(data[1]);
+    data[2] = compressor.Process(data[2]);
+    data[3] = compressor.Process(data[3]);
+}
+
 float IncrementTowards(float normalizedValue, float target)
 {
     float incrementUp = 0.01f;
@@ -1054,6 +1309,33 @@ float MidiNoteToFrequency(int8_t note, int8_t channel)
     }
     
     return frequency;
+}
+
+// Process oscillator based on selected mode
+float ProcessOscillator(int voiceIndex) {
+    int mode = static_cast<int>(appState.oscMode * 3.99f); // 0-3
+    mode = std::max(0, std::min(3, mode)); // Clamp to 0-3
+    
+    switch(mode) {
+        case 0: // Interpolated
+            return voiceInterpOsc[voiceIndex].Process();
+        case 1: // FM2
+            return voiceFm2Osc[voiceIndex].Process();
+        case 2: // Formant
+            return voiceFormantOsc[voiceIndex].Process();
+        case 3: // Harmonic
+            return voiceHarmonicOsc[voiceIndex].Process();
+        default:
+            return voiceInterpOsc[voiceIndex].Process();
+    }
+}
+
+void SetOscillatorFrequency(int voiceIndex, float freq) {
+    // Set frequency for all oscillator types so mode switching doesn't lose the pitch
+    voiceInterpOsc[voiceIndex].SetFreq(freq);
+    voiceFm2Osc[voiceIndex].SetFrequency(freq);
+    voiceFormantOsc[voiceIndex].SetCarrierFreq(freq);
+    voiceHarmonicOsc[voiceIndex].SetFreq(freq);
 }
 
 // Apply VCA to inputs based on envelope normalizedValues
@@ -1126,14 +1408,17 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
         // Use internal oscillators for voices 1 and 3 if enabled
         if (useInternalOscillators) {
-            results[1] = voiceInterpOsc[1].Process();
-            results[3] = voiceInterpOsc[3].Process();
+            results[1] = ProcessOscillator(1);
+            results[3] = ProcessOscillator(3);
         }
 
-        // Panel 1
+        // Panel 1 - Envelope/Gain
         ApplyVCAs(results);
 
-        // Panel 2
+        // Panel 2 - Compression (before panning)
+        ApplyCompression(results);
+
+        // Panel 3 - Panning and mixing
         ApplyPanning(results);
 
         // plucksApply(results);
@@ -1148,13 +1433,13 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         // Output voices 0 and 2 oscillators to audio outputs 3 and 4 when enabled
         if (useInternalOscillators) {
             if (envelopes[0].gate) {
-                out[2][i] = voiceInterpOsc[0].Process();
+                out[2][i] = ProcessOscillator(0);
             } else {
                 out[2][i] = 0.0f;
             }
             
             if (envelopes[2].gate) {
-                out[3][i] = voiceInterpOsc[2].Process();
+                out[3][i] = ProcessOscillator(2);
             } else {
                 out[3][i] = 0.0f;
             }
@@ -1382,7 +1667,7 @@ int main(void)
             // Load all parameters
             if (LoadPreset()) {
                 // Apply loaded normalizedValues to all parameters
-                for (int panel = 0; panel < 7; panel++) {
+                for (int panel = 0; panel < panelModesCount; panel++) {
                     const PanelKnobBinding& binding = displayPanels[panel].bindings;
                     ParamId params[4] = {binding.knob1, binding.knob2, binding.knob3, binding.knob4};
                     
@@ -1446,6 +1731,14 @@ int main(void)
     // 
     InitPan(samplerate);
     
+    // Initialize compressor
+    compressor.Init(samplerate);
+    compressor.SetRatio(4.0f);           // Default 4:1 ratio
+    compressor.SetThreshold(-12.0f);     // Default -12 dB
+    compressor.SetAttack(0.003f);        // Default 3ms attack
+    compressor.SetRelease(0.1f);         // Default 100ms release
+    compressor.AutoMakeup(true);         // Enable auto makeup gain
+    
     // Initialize interpolated oscillators for all 4 voices
     for (int i = 0; i < 4; i++) {
         voiceInterpOsc[i].Init(samplerate);
@@ -1453,6 +1746,41 @@ int main(void)
         voiceInterpOsc[i].SetAmp(1.0f);
         voiceInterpOsc[i].SetWaveformParam(0.0f);  // Start with sine wave
     }
+    
+    // Initialize FM2 oscillators
+    for (int i = 0; i < 4; i++) {
+        voiceFm2Osc[i].Init(samplerate);
+        voiceFm2Osc[i].SetFrequency(440.0f);
+        voiceFm2Osc[i].SetRatio(1.0f);
+        voiceFm2Osc[i].SetIndex(1.0f);
+    }
+    
+    // Initialize Formant oscillators
+    for (int i = 0; i < 4; i++) {
+        voiceFormantOsc[i].Init(samplerate);
+        voiceFormantOsc[i].SetCarrierFreq(440.0f);
+        voiceFormantOsc[i].SetFormantFreq(2000.0f);
+        voiceFormantOsc[i].SetPhaseShift(0.5f);
+    }
+    
+    // Initialize Harmonic oscillators
+    for (int i = 0; i < 4; i++) {
+        voiceHarmonicOsc[i].Init(samplerate);
+        voiceHarmonicOsc[i].SetFreq(440.0f);
+        voiceHarmonicOsc[i].SetFirstHarmIdx(1);
+        float amplitudes[16] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        voiceHarmonicOsc[i].SetAmplitudes(amplitudes);
+    }
+    
+    // Initialize OSC parameters with sensible defaults
+    SetParamValue(PARAM_OSC_WAVEFORM, 0.0f);        // Start with sine
+    SetParamValue(PARAM_OSC_FM2_RATIO, 0.26f);       // 1:1 ratio
+    SetParamValue(PARAM_OSC_FM2_INDEX, 0.5f);        // Medium index
+    SetParamValue(PARAM_OSC_FORMANT_FREQ, 0.5f);     // 500Hz
+    SetParamValue(PARAM_OSC_FORMANT_PHASE, 0.5f);   // Center phase
+    SetParamValue(PARAM_OSC_HARMONIC_IDX, 0.0f);    // First harmonic
+    SetParamValue(PARAM_OSC_HARMONIC_DECAY, 0.3f);  // Decay rate
+    SetParamValue(PARAM_OSC_HARMONIC_SKEW, 0.0f);   // No skew (fundamental emphasis)
 
     // Start the ADC and Audio Peripherals on the Hardware
     hw.StartAdc();
@@ -1575,12 +1903,86 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
     }
     else if (panelId == 'o') {
         switch(paramIndex) {
-            case 0: // Waveform
-                if (normalizedValue < 0.25f) return "Sine";
-                else if (normalizedValue < 0.5f) return "Tri";
-                else if (normalizedValue < 0.75f) return "Sqr";
-                else return "Saw";
-            default: return "Sine";
+            case 0: // Knob 1 - Mode specific
+                {
+                    int mode = static_cast<int>(appState.oscMode * 3.99f);
+                    mode = std::max(0, std::min(3, mode));
+                    switch(mode) {
+                        case 0: // Interpolated - waveform
+                            if (normalizedValue < 0.25f) return "Sine";
+                            else if (normalizedValue < 0.5f) return "Tri";
+                            else if (normalizedValue < 0.75f) return "Sqr";
+                            else return "Saw";
+                        case 1: // FM2 - ratio
+                            {
+                                float ratio = 0.125f * powf(64.0f, normalizedValue);
+                                ratio = std::max(0.125f, std::min(8.0f, ratio));
+                                return std::to_string(static_cast<int>(ratio * 100.0f)) + "%";
+                            }
+                        case 2: // Formant - frequency
+                            {
+                                float freq = 10.0f * powf(100.0f, normalizedValue);
+                                freq = std::max(10.0f, std::min(1000.0f, freq));
+                                return std::to_string(static_cast<int>(freq)) + "Hz";
+                            }
+                        case 3: // Harmonic - idx
+                            {
+                                int idx = 1 + static_cast<int>(normalizedValue * 15.99f);
+                                idx = std::max(1, std::min(16, idx));
+                                return "H" + std::to_string(idx);
+                            }
+                        default:
+                            return "Sine";
+                    }
+                }
+            case 1: // Knob 2 - Mode specific
+                {
+                    int mode = static_cast<int>(appState.oscMode * 3.99f);
+                    mode = std::max(0, std::min(3, mode));
+                    switch(mode) {
+                        case 0: // Interpolated - empty
+                            return "";
+                        case 1: // FM2 - index
+                            return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
+                        case 2: // Formant - phase
+                            return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
+                        case 3: // Harmonic - decay
+                            {
+                                float decay = normalizedValue * 10.0f;
+                                return std::to_string(static_cast<int>(decay * 10.0f)) + "x";
+                            }
+                        default:
+                            return "";
+                    }
+                }
+            case 2: // Knob 3 - Mode specific
+                {
+                    int mode = static_cast<int>(appState.oscMode * 3.99f);
+                    mode = std::max(0, std::min(3, mode));
+                    switch(mode) {
+                        case 0: // Interpolated - empty
+                        case 1: // FM2 - empty
+                        case 2: // Formant - empty
+                            return "";
+                        case 3: // Harmonic - skew
+                            return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
+                        default:
+                            return "";
+                    }
+                }
+            case 3: // Oscillator Mode
+                {
+                    int mode = static_cast<int>(normalizedValue * 3.99f); // 0-3
+                    mode = std::max(0, std::min(3, mode));
+                    switch(mode) {
+                        case 0: return "Inter";
+                        case 1: return "FM2";
+                        case 2: return "Form";
+                        case 3: return "Harm";
+                        default: return "Inter";
+                    }
+                }
+            default: return "Inter";
         }
     }
     else if (panelId == 's') {
@@ -1644,6 +2046,37 @@ void CalculateKnobPositions(int knobWidth, int knobPadding, int knobPositions[4]
     }
 }
 
+// Get dynamic OSC panel label names based on current mode
+void GetOscLabels(int mode, std::string& label1, std::string& label2, std::string& label3) {
+    switch(mode) {
+        case 0: // Interpolated
+            label1 = "Wave";
+            label2 = "";
+            label3 = "";
+            break;
+        case 1: // FM2
+            label1 = "Ratio";
+            label2 = "Index";
+            label3 = "";
+            break;
+        case 2: // Formant
+            label1 = "Freq";
+            label2 = "Phase";
+            label3 = "";
+            break;
+        case 3: // Harmonic
+            label1 = "Idx";
+            label2 = "Decay";
+            label3 = "Skew";
+            break;
+        default:
+            label1 = "Wave";
+            label2 = "";
+            label3 = "";
+            break;
+    }
+}
+
 void UpdateOled()
 {
     // Clear the panel-specific area to prevent overlap when switching panels
@@ -1671,10 +2104,26 @@ void UpdateOled()
     
     // knob input labels at the top
     int labelY = 0;  // Position at very top
-    WriteFixedString(hw, knobPositions[0], labelY, 5, font_s, currentPanel.input1Name.c_str());
-    WriteFixedString(hw, knobPositions[1], labelY, 5, font_s, currentPanel.input2Name.c_str());
-    WriteFixedString(hw, knobPositions[2], labelY, 5, font_s, currentPanel.input3Name.c_str());
-    WriteFixedString(hw, knobPositions[3], labelY, 5, font_s, currentPanel.input4Name.c_str());
+    
+    // For OSC panel, use dynamic labels and values based on mode
+    bool isOscPanel = (currentPanel.id == 'o');
+    int oscMode = 0;
+    
+    if (isOscPanel) {
+        oscMode = static_cast<int>(appState.oscMode * 3.99f);
+        oscMode = std::max(0, std::min(3, oscMode));
+        std::string label1, label2, label3;
+        GetOscLabels(oscMode, label1, label2, label3);
+        WriteFixedString(hw, knobPositions[0], labelY, 5, font_s, label1.c_str());
+        WriteFixedString(hw, knobPositions[1], labelY, 5, font_s, label2.c_str());
+        WriteFixedString(hw, knobPositions[2], labelY, 5, font_s, label3.c_str());
+        WriteFixedString(hw, knobPositions[3], labelY, 5, font_s, currentPanel.input4Name.c_str());
+    } else {
+        WriteFixedString(hw, knobPositions[0], labelY, 5, font_s, currentPanel.input1Name.c_str());
+        WriteFixedString(hw, knobPositions[1], labelY, 5, font_s, currentPanel.input2Name.c_str());
+        WriteFixedString(hw, knobPositions[2], labelY, 5, font_s, currentPanel.input3Name.c_str());
+        WriteFixedString(hw, knobPositions[3], labelY, 5, font_s, currentPanel.input4Name.c_str());
+    }
     
     // Draw horizontal meters below labels
     int meterY = 8;  // Position below labels
@@ -1685,8 +2134,29 @@ void UpdateOled()
         // Clear the meter area first (draw black line to erase previous meter)
         hw.display.DrawLine(knobPositions[i], meterY, knobPositions[i] + maxMeterWidth, meterY, false);
         
-        // Draw the normalizedValue from UserState via bindings
+        // For OSC panel, get the appropriate parameter value based on mode
         float val = GetKnobValue(panelMode, i);
+        if (isOscPanel && i < 3) {
+            // Get parameter value based on mode
+            switch(oscMode) {
+                case 0: // Interpolated
+                    if (i == 0) val = appState.oscWaveform;
+                    break;
+                case 1: // FM2
+                    if (i == 0) val = appState.fm2Ratio;
+                    else if (i == 1) val = appState.fm2Index;
+                    break;
+                case 2: // Formant
+                    if (i == 0) val = appState.formantFreq;
+                    else if (i == 1) val = appState.formantPhaseShift;
+                    break;
+                case 3: // Harmonic
+                    if (i == 0) val = appState.harmonicIdx;
+                    else if (i == 1) val = appState.harmonicDecay;
+                    else if (i == 2) val = appState.harmonicSkew;
+                    break;
+            }
+        }
         int meterWidth = static_cast<int>(val * maxMeterWidth);  // Scale 0.0-1.0 to 0-22 pixels
         meterWidth = std::max(0, std::min(meterWidth, maxMeterWidth));  // Clamp to 0-22 range
         
@@ -1707,6 +2177,29 @@ void UpdateOled()
     // Display parameter normalizedValues below meters
     for (int i = 0; i < 4; i++) {
         float paramValue = GetKnobValue(panelMode, i);
+        
+        // For OSC panel, override with mode-specific parameters for display
+        if (isOscPanel && i < 3) {
+            switch(oscMode) {
+                case 0: // Interpolated
+                    if (i == 0) paramValue = appState.oscWaveform;
+                    break;
+                case 1: // FM2
+                    if (i == 0) paramValue = appState.fm2Ratio;
+                    else if (i == 1) paramValue = appState.fm2Index;
+                    break;
+                case 2: // Formant
+                    if (i == 0) paramValue = appState.formantFreq;
+                    else if (i == 1) paramValue = appState.formantPhaseShift;
+                    break;
+                case 3: // Harmonic
+                    if (i == 0) paramValue = appState.harmonicIdx;
+                    else if (i == 1) paramValue = appState.harmonicDecay;
+                    else if (i == 2) paramValue = appState.harmonicSkew;
+                    break;
+            }
+        }
+        
         std::string paramValueStr = FormatParameterValue(currentPanel.id, i, paramValue);
         WriteFixedString(hw, knobPositions[i], paramValueY, 5, font_s, paramValueStr.c_str());
     }
@@ -1928,6 +2421,33 @@ void ProcessKnobs()
             case 3: paramId = binding.knob4; break;
         }
         
+        // For OSC panel, route knobs to mode-specific parameters
+        if (currentPanel.id == 'o' && inputIndex < 3) {
+            int mode = static_cast<int>(appState.oscMode * 3.99f);
+            mode = std::max(0, std::min(3, mode));
+            
+            ParamId modeSpecificParam = PARAM_NONE;
+            switch(mode) {
+                case 0: // Interpolated
+                    if (inputIndex == 0) modeSpecificParam = PARAM_OSC_WAVEFORM;
+                    break;
+                case 1: // FM2
+                    if (inputIndex == 0) modeSpecificParam = PARAM_OSC_FM2_RATIO;
+                    else if (inputIndex == 1) modeSpecificParam = PARAM_OSC_FM2_INDEX;
+                    break;
+                case 2: // Formant
+                    if (inputIndex == 0) modeSpecificParam = PARAM_OSC_FORMANT_FREQ;
+                    else if (inputIndex == 1) modeSpecificParam = PARAM_OSC_FORMANT_PHASE;
+                    break;
+                case 3: // Harmonic
+                    if (inputIndex == 0) modeSpecificParam = PARAM_OSC_HARMONIC_IDX;
+                    else if (inputIndex == 1) modeSpecificParam = PARAM_OSC_HARMONIC_DECAY;
+                    else if (inputIndex == 2) modeSpecificParam = PARAM_OSC_HARMONIC_SKEW;
+                    break;
+            }
+            paramId = modeSpecificParam;
+        }
+        
         // Implement catch-up logic to prevent parameter jumps when switching panels
         if (paramId != PARAM_NONE) {
             float storedKnobValue = knobValues[panelMode][inputIndex];
@@ -2096,7 +2616,7 @@ static void ApplyShiftRegisterState()
             // Update internal oscillator frequencies BEFORE setting gate to avoid clicks
             if (useInternalOscillators) {
                 float freq = MidiNoteToFrequency(static_cast<int8_t>(state.note), static_cast<int8_t>(i));
-                voiceInterpOsc[i].SetFreq(freq);
+                SetOscillatorFrequency(i, freq);
             }
             
             // Send pitch bend for shift register mode if tuning is enabled
@@ -2280,7 +2800,7 @@ void ApplyTuningToSequencerNotes()
             // Update internal oscillator frequency if enabled
             if (useInternalOscillators) {
                 float freq = MidiNoteToFrequency(voices[i].note, static_cast<int8_t>(i));
-                voiceInterpOsc[i].SetFreq(freq);
+                SetOscillatorFrequency(i, freq);
             }
         }
     }
@@ -2632,7 +3152,7 @@ public:
         // Update internal oscillator frequencies BEFORE setting gate to avoid clicks
         if (useInternalOscillators) {
             float freq = MidiNoteToFrequency(event.note, voiceIndex);
-            voiceInterpOsc[voiceIndex].SetFreq(freq);
+            SetOscillatorFrequency(voiceIndex, freq);
         }
         
         // Update voice state
@@ -2854,9 +3374,9 @@ bool SavePreset() {
     uint32_t buffer[PRESET_BUFFER_LENGTH];
     memset(buffer, 0, sizeof(buffer));
     
-    // Store all 28 knob normalizedValues (7 panels × 4 knobs)
+    // Store all 32 knob normalizedValues (8 panels × 4 knobs)
     int idx = 0;
-    for (int panel = 0; panel < 7; panel++) {
+    for (int panel = 0; panel < panelModesCount; panel++) {
         for (int knob = 0; knob < 4; knob++) {
             int intValue = (int)(knobValues[panel][knob] * 100);
             buffer[idx++] = (uint32_t)intValue;
@@ -2885,7 +3405,7 @@ bool LoadPreset() {
         return false;
     }
     
-    // Load all 28 knob normalizedValues
+    // Load all knob normalizedValues (8 panels × 4 knobs)
     int idx = 0;
     for (int panel = 0; panel < panelModesCount; panel++) {
         for (int knob = 0; knob < 4; knob++) {
