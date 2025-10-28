@@ -113,8 +113,15 @@ uint32_t voiceAllocationCounter = 0;  // Counter to track voice allocation order
 
 bool shiftRegisterMode = false;
 
-// option to use internal oscillators for voices 1 and 3
-bool useInternalOscillators = true;
+// option to use internal oscillators for each voice
+bool useInternalOscillators[4] = {true, true, true, true};
+
+// Signal detection state
+bool signalDetectionEnabled = false;
+uint32_t signalDetectionSampleCount = 0;
+const uint32_t SIGNAL_DETECTION_SAMPLES = 4800;  // ~100ms at 48kHz
+float signalDetectionAccum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+float signalDetectionPeak[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
 // Tuning system variables
 uint8_t currentTuningIndex = 0;  // Current tuning preset index
@@ -1363,11 +1370,50 @@ void ApplyVCAs(float* data) {
     // hw.seed.dac.WriteValue(DacHandle::Channel::TWO, cvOut1 * 4095);
 }
 
+// due to hardware quirks, this only works with patch cables inserted into the unused inputs
+void HandleSignalDetection(AudioHandle::InputBuffer in, size_t size) {
+    // Wait a bit for audio to stabilize before starting detection
+    static uint32_t callbackCount = 0;
+    if (!signalDetectionEnabled && callbackCount++ > 1000) {
+        signalDetectionEnabled = true;  // Start detection after ~50 callbacks (audio has stabilized)
+    }
+    
+    // Signal detection phase - accumulate RMS values during first 100ms
+    // Use RMS (root mean square) to better detect sinusoidal signals
+    if (signalDetectionEnabled && signalDetectionSampleCount < SIGNAL_DETECTION_SAMPLES) {
+        for (size_t i = 0; i < size && signalDetectionSampleCount < SIGNAL_DETECTION_SAMPLES; i++) {
+            for (int ch = 0; ch < 4; ch++) {
+                float sample = in[ch][i];
+                signalDetectionAccum[ch] += sample * sample;  // Accumulate squared values for RMS
+            }
+            signalDetectionSampleCount++;
+        }
+        
+        // After collecting enough samples, determine which inputs have signal
+        if (signalDetectionSampleCount >= SIGNAL_DETECTION_SAMPLES) {
+            const float signalThreshold = 0.2f;  // RMS threshold for signal detection
+            float avgSamples = static_cast<float>(SIGNAL_DETECTION_SAMPLES);
+            
+            for (int ch = 0; ch < 4; ch++) {
+                // Calculate RMS: sqrt of average of squared values
+                float rms = std::sqrt(signalDetectionAccum[ch] / avgSamples);
+                // If signal detected, disable internal oscillator for this voice
+                if (rms > signalThreshold) {
+                    useInternalOscillators[ch] = false;
+                }
+            }
+            signalDetectionEnabled = false;  // Done with detection
+        }
+    }
+}
+
 void AudioCallback(AudioHandle::InputBuffer  in,
                    AudioHandle::OutputBuffer out,
                    size_t                    size)
 {
     ProcessControls();
+    
+    HandleSignalDetection(in, size);
     
     // Process envelopes at audio rate for consistent timing
     for(int j = 0; j < 4; j++)
@@ -1397,6 +1443,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     
 
     float results[4];
+    float oscOutputs[4];  // Cache oscillator outputs before processing for outputs 2 and 3
 
     for(size_t i = 0; i < size; i++)
     {
@@ -1406,10 +1453,12 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             results[j] = in[j][i];
         }
 
-        // Use internal oscillators for voices 1 and 3 if enabled
-        if (useInternalOscillators) {
-            results[1] = ProcessOscillator(1);
-            results[3] = ProcessOscillator(3);
+        // Use internal oscillators for each voice if enabled
+        for (int ch = 0; ch < 4; ch++) {
+            if (useInternalOscillators[ch]) {
+                oscOutputs[ch] = ProcessOscillator(ch);
+                results[ch] = oscOutputs[ch];
+            }
         }
 
         // Panel 1 - Envelope/Gain
@@ -1430,22 +1479,27 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         out[0][i] = results[0];
         out[1][i] = results[1];
         
-        // Output voices 0 and 2 oscillators to audio outputs 3 and 4 when enabled
-        if (useInternalOscillators) {
-            if (envelopes[0].gate) {
-                out[2][i] = ProcessOscillator(0);
+        // Output voices 0 and 2 to audio outputs 3 and 4 when their gates are open
+        // Use cached oscillator outputs (before VCA/compression/panning processing)
+        if (envelopes[0].gate) {
+            if (useInternalOscillators[0]) {
+                out[2][i] = oscOutputs[0];
             } else {
-                out[2][i] = 0.0f;
-            }
-            
-            if (envelopes[2].gate) {
-                out[3][i] = ProcessOscillator(2);
-            } else {
-                out[3][i] = 0.0f;
+                // Output raw input signal
+                out[2][i] = in[0][i];
             }
         } else {
-            // When internal oscillators are disabled, output silence on channels 3 and 4
             out[2][i] = 0.0f;
+        }
+        
+        if (envelopes[2].gate) {
+            if (useInternalOscillators[2]) {
+                out[3][i] = oscOutputs[2];
+            } else {
+                // Output raw input signal
+                out[3][i] = in[2][i];
+            }
+        } else {
             out[3][i] = 0.0f;
         }
     }
@@ -1782,6 +1836,14 @@ int main(void)
     SetParamValue(PARAM_OSC_HARMONIC_DECAY, 0.3f);  // Decay rate
     SetParamValue(PARAM_OSC_HARMONIC_SKEW, 0.0f);   // No skew (fundamental emphasis)
 
+    // Initialize signal detection - reset accumulators but don't enable yet
+    for (int i = 0; i < 4; i++) {
+        signalDetectionAccum[i] = 0.0f;
+        signalDetectionPeak[i] = 0.0f;
+    }
+    signalDetectionSampleCount = 0;
+    signalDetectionEnabled = false;  // Will be enabled after audio stabilizes
+    
     // Start the ADC and Audio Peripherals on the Hardware
     hw.StartAdc();
     hw.SetAudioBlockSize(blocksize);
@@ -2614,8 +2676,8 @@ static void ApplyShiftRegisterState()
         if(state.active)
         {
             // Update internal oscillator frequencies BEFORE setting gate to avoid clicks
-            if (useInternalOscillators) {
-                float freq = MidiNoteToFrequency(static_cast<int8_t>(state.note), static_cast<int8_t>(i));
+            if (useInternalOscillators[i]) {
+                float freq = MidiNoteToFrequency(static_cast<int8_t>(state.note), 1);  // Use 1 to avoid voice 0 special case
                 SetOscillatorFrequency(i, freq);
             }
             
@@ -2798,8 +2860,8 @@ void ApplyTuningToSequencerNotes()
             }
             
             // Update internal oscillator frequency if enabled
-            if (useInternalOscillators) {
-                float freq = MidiNoteToFrequency(voices[i].note, static_cast<int8_t>(i));
+            if (useInternalOscillators[i]) {
+                float freq = MidiNoteToFrequency(voices[i].note, 1);  // Use 1 to avoid voice 0 special case
                 SetOscillatorFrequency(i, freq);
             }
         }
@@ -3150,8 +3212,8 @@ public:
         hw.midi.SendMessage(bytes, 3);
         
         // Update internal oscillator frequencies BEFORE setting gate to avoid clicks
-        if (useInternalOscillators) {
-            float freq = MidiNoteToFrequency(event.note, voiceIndex);
+        if (useInternalOscillators[voiceIndex]) {
+            float freq = MidiNoteToFrequency(event.note, 1);  // Use 1 to avoid voice 0 special case
             SetOscillatorFrequency(voiceIndex, freq);
         }
         
