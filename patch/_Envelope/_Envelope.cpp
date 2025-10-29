@@ -198,6 +198,7 @@ bool ccStateInitialized = false; // Track if CC state has been properly initiali
 // CC Subdivision System variables
 uint8_t ccSlotValues[8] = {0, 18, 36, 54, 73, 91, 109, 127}; // Equally distributed CC normalizedValues 0-127
 uint8_t ccSlotProbabilities[8] = {100, 100, 100, 100, 100, 100, 100, 100}; // Default all probabilities to 100%
+uint8_t ccSlotMultipliers[8] = {1, 1, 1, 1, 1, 1, 1, 1}; // Multiplier for each slot (1, 2, 4, or 8)
 uint8_t ccSlotCounters[8] = {0, 0, 0, 0, 0, 0, 0, 0}; // Track note count for each slot
 uint32_t globalNoteCounter = 0; // Increments on every note-on
 
@@ -281,6 +282,11 @@ struct SequencerParams {
     uint8_t ccTriggerChannel = 12;
     uint8_t ccValueChannel = 15;
     
+    // Subdivision timing for CC multiplier feature
+    uint8_t currentSubdivision = 0; // 0-7, tracks which of 8 subdivisions we're on
+    uint32_t lastSubdivisionTime = 0;
+    uint32_t subdivisionInterval = 0; // Calculated as sequenceStepInterval / 8
+    
     // Inline initialization (no function call overhead)
     void Init() {
         // noteParam.Init(hw.controls[1], 36.0f, 84.0f, Parameter::LINEAR);
@@ -290,6 +296,12 @@ struct SequencerParams {
         sequencerNoteLengthPercent = 0.5f;
         clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
         lastClockTime = hw.seed.system.GetNow();
+        
+        // Initialize subdivision timing
+        currentSubdivision = 0;
+        lastSubdivisionTime = 0;
+        subdivisionInterval = 0; // Will be calculated after sequenceStepInterval is set
+        
         InitTriggerSequence();
     }
     
@@ -349,6 +361,12 @@ enum ParamId {
     PARAM_CC_PROB_4_5,
     PARAM_CC_PROB_6_7,
     
+    // SAMPLER Panel (CC Multipliers)
+    PARAM_CC_MULT_0_1,
+    PARAM_CC_MULT_2_3,
+    PARAM_CC_MULT_4_5,
+    PARAM_CC_MULT_6_7,
+    
     // COMP Panel
     PARAM_COMP_RATIO,
     PARAM_COMP_THRESHOLD,
@@ -399,6 +417,12 @@ struct UserState {
     float ccProb4_5;            // 0.0-1.0 probability for CC slots 4 and 5
     float ccProb6_7;            // 0.0-1.0 probability for CC slots 6 and 7
     
+    // SAMPLER parameters (CC multipliers)
+    float ccMult0_1;            // 0.0-1.0 maps to multiplier 1,2,4,8 for CC slots 0 and 1
+    float ccMult2_3;            // 0.0-1.0 maps to multiplier 1,2,4,8 for CC slots 2 and 3
+    float ccMult4_5;            // 0.0-1.0 maps to multiplier 1,2,4,8 for CC slots 4 and 5
+    float ccMult6_7;            // 0.0-1.0 maps to multiplier 1,2,4,8 for CC slots 6 and 7
+    
     // COMP parameters
     float compRatio;            // 0.0-1.0 maps to 1.0-40.0 compression ratio
     float compThreshold;       // 0.0-1.0 maps to 0.0 to -80.0 dB
@@ -433,6 +457,10 @@ struct UserState {
         ccProb2_3(0.0f),
         ccProb4_5(0.0f),
         ccProb6_7(0.0f),
+        ccMult0_1(0.0f),        // Default multiplier 1 (0.0 maps to multiplier 1)
+        ccMult2_3(0.0f),
+        ccMult4_5(0.0f),
+        ccMult6_7(0.0f),
         compRatio(0.25f),        // Default 4:1 ratio (0.25 = (4-1)/(40-1) ≈ 0.077)
         compThreshold(0.6f),    // Default -12 dB (0.6 in normalized range)
         compAttack(0.01f),      // Default 0.001s attack
@@ -467,7 +495,7 @@ struct panelStruct
     float               normalizedValues[4];      // Legacy - will be removed in cleanup
     PanelKnobBinding    bindings;       // New binding system
 };
-panelStruct displayPanels[8] = {
+panelStruct displayPanels[9] = {
     { 
         name: "ADSR",
         id: 'e',
@@ -529,6 +557,16 @@ panelStruct displayPanels[8] = {
         bindings: {PARAM_CC_PROB_0_1, PARAM_CC_PROB_2_3, PARAM_CC_PROB_4_5, PARAM_CC_PROB_6_7}
     },
     {
+        name: "MULT",
+        id: 'u',
+        input1Name: "M1-2",
+        input2Name: "M3-4",
+        input3Name: "M5-6",
+        input4Name: "M7-8",
+        normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
+        bindings: {PARAM_CC_MULT_0_1, PARAM_CC_MULT_2_3, PARAM_CC_MULT_4_5, PARAM_CC_MULT_6_7}
+    },
+    {
         name: "COMP",
         id: 'x',
         input1Name: "Ratio",
@@ -558,15 +596,16 @@ float smoothedKnobState[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 bool knobCaughtUp[4] = {false, false, false, false};  // Track if knob has caught up to stored knob normalizedValue
 
 // Global knob normalizedValues storage - stores all knob positions for all panels (0.0-1.0 normalized)
-float knobValues[8][4] = {
+float knobValues[9][4] = {
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 0: ADSR
     {0.0f, 0.0f, 0.0f, 0.8f},  // Panel 1: MIXER
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 2: OSC
     {0.0f, 0.0f, 1.0f, 1.0f},  // Panel 3: TUNING
     {0.0f, 0.0f, 0.5f, 0.0f},  // Panel 4: SEQUENCER
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 5: SAMPLER
-    {0.25f, 0.6f, 0.01f, 0.05f}, // Panel 6: COMP
-    {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 7: PRESET
+    {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 6: MULT 
+    {0.25f, 0.6f, 0.01f, 0.05f}, // Panel 7: COMP
+    {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 8: PRESET
 };
 const float KNOB_CATCHUP_THRESHOLD = 0.05f;  // How close knob must be to catch up (5%)
 
@@ -610,6 +649,7 @@ void      UpdateOled();
 void      InitPan(float samplerate);
 void      SendPitchBend(uint8_t channel, int16_t bendValue);
 void      ProcessCCSlots();
+void      ProcessCCSlotsWithSubdivision(uint8_t subdivision);
 void      AddCCToQueue(uint8_t ccValue, bool isReset = false);
 void      ProcessCCQueue();
 
@@ -620,7 +660,6 @@ void      ClearDebugMessage();
 bool      IsDebugMessageExpired();
 
 // SD Card functions
-void      SetDefaultPanelValues();
 void      ShowPresetValues();
 bool      SavePreset();
 bool      LoadPreset();
@@ -742,11 +781,17 @@ float GetParamValue(ParamId paramId)
         case PARAM_SEQ_LENGTH:          return appState.seqLength;
         case PARAM_SEQ_BPM:             return appState.seqBpm;
         
-        // SAMPLER Panel
+        // SAMPLER Panel (CC Probabilities)
         case PARAM_CC_PROB_0_1:         return appState.ccProb0_1;
         case PARAM_CC_PROB_2_3:         return appState.ccProb2_3;
         case PARAM_CC_PROB_4_5:         return appState.ccProb4_5;
         case PARAM_CC_PROB_6_7:         return appState.ccProb6_7;
+        
+        // SAMPLER Panel (CC Multipliers)
+        case PARAM_CC_MULT_0_1:         return appState.ccMult0_1;
+        case PARAM_CC_MULT_2_3:         return appState.ccMult2_3;
+        case PARAM_CC_MULT_4_5:         return appState.ccMult4_5;
+        case PARAM_CC_MULT_6_7:         return appState.ccMult6_7;
         
         // COMP Panel
         case PARAM_COMP_RATIO:         return appState.compRatio;
@@ -1020,6 +1065,7 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                     sequencer.clockBpm = newBpm;
                     sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
                     sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));
+                    sequencer.subdivisionInterval = sequencer.sequenceStepInterval / 8;
                 }
             }
             break;
@@ -1058,6 +1104,63 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                 uint8_t prob = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
                 ccSlotProbabilities[6] = prob;
                 ccSlotProbabilities[7] = prob;
+            }
+            break;
+            
+        // SAMPLER Panel (CC Multipliers)
+        case PARAM_CC_MULT_0_1:
+            appState.ccMult0_1 = normalizedValue;
+            {
+                // Map 0.0-1.0 to discrete multipliers: 1, 2, 4, 8
+                uint8_t mult;
+                if (normalizedValue < 0.25f) mult = 1;
+                else if (normalizedValue < 0.5f) mult = 2;
+                else if (normalizedValue < 0.75f) mult = 4;
+                else mult = 8;
+                ccSlotMultipliers[0] = mult;
+                ccSlotMultipliers[1] = mult;
+            }
+            break;
+            
+        case PARAM_CC_MULT_2_3:
+            appState.ccMult2_3 = normalizedValue;
+            {
+                // Map 0.0-1.0 to discrete multipliers: 1, 2, 4, 8
+                uint8_t mult;
+                if (normalizedValue < 0.25f) mult = 1;
+                else if (normalizedValue < 0.5f) mult = 2;
+                else if (normalizedValue < 0.75f) mult = 4;
+                else mult = 8;
+                ccSlotMultipliers[2] = mult;
+                ccSlotMultipliers[3] = mult;
+            }
+            break;
+            
+        case PARAM_CC_MULT_4_5:
+            appState.ccMult4_5 = normalizedValue;
+            {
+                // Map 0.0-1.0 to discrete multipliers: 1, 2, 4, 8
+                uint8_t mult;
+                if (normalizedValue < 0.25f) mult = 1;
+                else if (normalizedValue < 0.5f) mult = 2;
+                else if (normalizedValue < 0.75f) mult = 4;
+                else mult = 8;
+                ccSlotMultipliers[4] = mult;
+                ccSlotMultipliers[5] = mult;
+            }
+            break;
+            
+        case PARAM_CC_MULT_6_7:
+            appState.ccMult6_7 = normalizedValue;
+            {
+                // Map 0.0-1.0 to discrete multipliers: 1, 2, 4, 8
+                uint8_t mult;
+                if (normalizedValue < 0.25f) mult = 1;
+                else if (normalizedValue < 0.5f) mult = 2;
+                else if (normalizedValue < 0.75f) mult = 4;
+                else mult = 8;
+                ccSlotMultipliers[6] = mult;
+                ccSlotMultipliers[7] = mult;
             }
             break;
         
@@ -1134,83 +1237,6 @@ void ShowPresetValues()
     WriteFixedStringF(hw, knobPositions[1], 32, 6, font_s, "%.2f", knobValues[0][1]);
     WriteFixedStringF(hw, knobPositions[2], 40, 6, font_s, "%.2f", knobValues[0][2]);
     WriteFixedStringF(hw, knobPositions[3], 48, 6, font_s, "%.2f", knobValues[0][3]);
-}
-
-void SetDefaultPanelValues()
-{
-    // SetDebugMessage("def"); // Debug: Confirm defaults are being set
-    // Set default knob normalizedValues and apply them to parameters
-    // Panel 0: ADSR
-    knobValues[0][0] = 0.0f;   // Attack (0.1ms)
-    knobValues[0][1] = 0.96f; // Decay/Release (2.5s) - normalized normalizedValue for 2500ms
-    knobValues[0][2] = 1.0f;  // Sustain (100%)
-    knobValues[0][3] = 0.0f;  // Min (0%)
-
-    // SetDebugMessageF("d:%.2f", knobValues[0][1]); // Should show 0.96    
-    SetDebugMessageF("d:%.2f", knobValues[0][1]); // Should show 0.96
-    SetDebugMessageF("a:%.2f", knobValues[0][0]); // Should show 0.00
-    SetDebugMessageF("b:%.2f", knobValues[0][2]); // Should show 1.00
-
-    // Panel 1: MIXER
-    knobValues[1][0] = 0.02f; // Pan Freq (0.2Hz)
-    knobValues[1][1] = 1.0f;  // Pan Amp (full)
-    knobValues[1][2] = 0.0f;  // Unused
-    knobValues[1][3] = 0.8f;  // Volume (80%)
-    
-    // Panel 2: OSC
-    knobValues[2][0] = 0.0f;  // Waveform (sine)
-    knobValues[2][1] = 0.0f;  // Unused
-    knobValues[2][2] = 0.0f;  // Unused
-    knobValues[2][3] = 0.0f;  // Unused
-    
-    // Panel 3: TUNING
-    knobValues[3][0] = 0.0f;  // Tuning Index (12-TET)
-    knobValues[3][1] = 0.0f;  // Unused
-    knobValues[3][2] = 1.0f;  // MIDI Enable
-    knobValues[3][3] = 0.0f;  // Unused
-    
-    // Panel 4: SEQUENCER
-    knobValues[4][0] = 0.0f;  // Density (no triggers)
-    knobValues[4][1] = 0.0f;  // Order (ascending)
-    knobValues[4][2] = 0.5f;  // Length (50%)
-    knobValues[4][3] = (CLOCK_BPM_DEFAULT - CLOCK_BPM_MIN) / static_cast<float>(CLOCK_BPM_MAX - CLOCK_BPM_MIN); // BPM (120)
-    
-    // Panel 5: SAMPLER
-    knobValues[5][0] = 0.0f;  // CC Prob 0-1
-    knobValues[5][1] = 0.0f;  // CC Prob 2-3
-    knobValues[5][2] = 0.0f;  // CC Prob 4-5
-    knobValues[5][3] = 0.0f;  // CC Prob 6-7
-    
-    // Panel 6: COMP
-    knobValues[6][0] = 0.25f;  // Ratio (4:1)
-    knobValues[6][1] = 0.6f;   // Threshold (-12 dB)
-    knobValues[6][2] = 0.01f;  // Attack (0.001s)
-    knobValues[6][3] = 0.05f;  // Release (0.1s)
-    
-    // Panel 7: PRESET
-    knobValues[7][0] = 0.0f;  // Unused
-    knobValues[7][1] = 0.0f;  // Unused
-    knobValues[7][2] = 0.0f;  // Unused
-    knobValues[7][3] = 0.0f;  // Unused
-    
-    // Apply knob normalizedValues to parameters and hardware
-    for (int panel = 0; panel < panelModesCount; panel++) {
-        const PanelKnobBinding& binding = displayPanels[panel].bindings;
-        ParamId params[4] = {binding.knob1, binding.knob2, binding.knob3, binding.knob4};
-        
-        for (int knob = 0; knob < 4; knob++) {
-            if (params[knob] != PARAM_NONE) {
-                SetParamValue(params[knob], knobValues[panel][knob]);
-            }
-        }
-    }
-    
-    // Sync legacy displayPanels normalizedValues array with knob normalizedValues
-    for (int panelIdx = 0; panelIdx < panelModesCount; panelIdx++) {
-        for (int knobIdx = 0; knobIdx < 4; knobIdx++) {
-            displayPanels[panelIdx].normalizedValues[knobIdx] = knobValues[panelIdx][knobIdx];
-        }
-    }
 }
 
 void ClearPanelArea()
@@ -1371,6 +1397,7 @@ void ApplyVCAs(float* data) {
 }
 
 // due to hardware quirks, this only works with patch cables inserted into the unused inputs
+// and is affected by whether the microcontroller is in plugged in
 void HandleSignalDetection(AudioHandle::InputBuffer in, size_t size) {
     // Wait a bit for audio to stabilize before starting detection
     static uint32_t callbackCount = 0;
@@ -1391,8 +1418,16 @@ void HandleSignalDetection(AudioHandle::InputBuffer in, size_t size) {
         
         // After collecting enough samples, determine which inputs have signal
         if (signalDetectionSampleCount >= SIGNAL_DETECTION_SAMPLES) {
-            const float signalThreshold = 0.2f;  // RMS threshold for signal detection
+            const float signalThreshold = 0.30f;  // RMS threshold for signal detection
             float avgSamples = static_cast<float>(SIGNAL_DETECTION_SAMPLES);
+
+            char debugMsg[100];
+            snprintf(debugMsg, 100, "RMS:%d/%d/%d/%d", 
+                static_cast<int>(std::sqrt(signalDetectionAccum[0] / avgSamples) * 1000),
+                static_cast<int>(std::sqrt(signalDetectionAccum[1] / avgSamples) * 1000),
+                static_cast<int>(std::sqrt(signalDetectionAccum[2] / avgSamples) * 1000),
+                static_cast<int>(std::sqrt(signalDetectionAccum[3] / avgSamples) * 1000));
+            SetDebugMessage(debugMsg);
             
             for (int ch = 0; ch < 4; ch++) {
                 // Calculate RMS: sqrt of average of squared values
@@ -1516,84 +1551,8 @@ void InitEnvelopes(float samplerate)
         
         // Initialize gate state to false (no notes playing initially)
         envelopes[i].gate = false;
-        
-        // Note: ADSR normalizedValues will be set by loaded preset or SetDefaultPanelValues()
-        // Don't hardcode normalizedValues here as they would override loaded settings
     }
 }
-
-// void PassthroughMidiMessage(MidiEvent m)
-// {
-//     int8_t channelOffset = 0; // probably don't need this
-
-//     switch(m.type)
-//     {
-//         case NoteOn:
-//         {
-//             NoteOnEvent p = m.AsNoteOn();
-
-//             // Send pitch bend before note-on if tuning is enabled
-//             if (sendPitchBendMidi) {
-//                 const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
-//                 float centsDeviation = CalculateCentsDeviation(p.note, tuning);
-//                 int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
-//                 SendPitchBend(m.channel + channelOffset, pitchBendValue);
-//             }
-
-//             uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + m.channel + channelOffset), p.note, p.velocity};
-
-//             // if (m.channel == 0)
-//             // {
-//             //     bytes[0] = 0x90;
-//             //     // osc1.SetFrequency(mtof(p.note) / 4.0);
-//             // } else if (m.channel == 1)
-//             // {
-//             //     bytes[0] = 0x91;
-//             //     // osc2.SetFrequency(mtof(p.note) / 4.0);
-//             // }
-//             hw.midi.SendMessage(bytes, 3);
-//         }
-//         break;
-//         case NoteOff:
-//         {
-//             NoteOffEvent p = m.AsNoteOff();
-//             // for (int i = 0; i < 4; i++) {
-//             uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + m.channel + channelOffset), p.note, p.velocity};
-//                 // hw.midi.SendMessage(bytes, 3);
-//             // }
-//             // if (m.channel == 0)
-//             // {
-//             //     bytes[0] = 0x80;
-//             // } else if (m.channel == 1)
-//             // {
-//             //     bytes[0] = 0x81;
-//             // }
-//             hw.midi.SendMessage(bytes, 3);
-//             // DisplayMessage("NoteOff");
-//         }
-//         break;
-//         case ControlChange:
-//         {
-//             ControlChangeEvent p = m.AsControlChange();
-//             switch(p.control_number)
-//             {
-//                 case 76: // slide
-//                     // hw.seed.dac.WriteValue(DacHandle::Channel::ONE,
-//                     //     (p.normalizedValue / 64.) * 4095);
-                    
-//                     // CC 1 for cutoff.
-//                     // filt.SetFreq(mtof((float)p.normalizedValue));
-//                     break;
-//                 case 2:
-//                     // CC 2 for res.
-//                     // filt.SetRes(((float)p.normalizedValue / 127.0f));
-//                     break;
-//                 default: break;
-//             }
-//         }
-//         default: break;
-//     }
-// }
 
 void SendMidiMesssage(uint8_t normalizedValue, uint8_t channel, const char* type)
 {
@@ -1704,36 +1663,25 @@ int main(void)
     SdmmcHandler::Config sd_cfg;
     sd_cfg.Defaults();
     SdmmcHandler::Result sd_result = sdcard.Init(sd_cfg);
-    if (sd_result != SdmmcHandler::Result::OK) {
-        // SetDebugMessage("SD: Init failed");
-        // Set defaults when SD card fails
-        SetDefaultPanelValues();
-    } else {
-        // Initialize BSP SD card
+    
+    const char* initMessage = "init failed";
+    if (sd_result == SdmmcHandler::Result::OK) {
         uint8_t bsp_result = BSP_SD_Init();
-        // SetDebugMessageF("test: %d", bsp_result);
-        if (bsp_result != MSD_OK) {
-            // Set defaults when BSP SD init fails
-            SetDefaultPanelValues();
-        } else {
+        if (bsp_result == MSD_OK) {
             sdCardInitialized = true;
-            // SetDebugMessage("SD");
-            // Load all parameters
-            if (LoadPreset()) {
-                // Apply loaded normalizedValues to all parameters
-                for (int panel = 0; panel < panelModesCount; panel++) {
-                    const PanelKnobBinding& binding = displayPanels[panel].bindings;
-                    ParamId params[4] = {binding.knob1, binding.knob2, binding.knob3, binding.knob4};
-                    
-                    for (int knob = 0; knob < 4; knob++) {
-                        if (params[knob] != PARAM_NONE) {
-                            SetParamValue(params[knob], knobValues[panel][knob]);
-                        }
-                    }
-                }
-                SetDebugMessage("applied");
-            } else {
-                SetDebugMessage("load failed");
+            initMessage = LoadPreset() ? "preset loaded" : "load failed";
+        }
+    }
+    SetDebugMessage(initMessage);
+
+    // Apply loaded normalizedValues to all parameters
+    for (int panel = 0; panel < panelModesCount; panel++) {
+        const PanelKnobBinding& binding = displayPanels[panel].bindings;
+        ParamId params[4] = {binding.knob1, binding.knob2, binding.knob3, binding.knob4};
+        
+        for (int knob = 0; knob < 4; knob++) {
+            if (params[knob] != PARAM_NONE) {
+                SetParamValue(params[knob], knobValues[panel][knob]);
             }
         }
     }
@@ -2084,6 +2032,24 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                     return (probability == 0) ? "OFF" : std::to_string(probability) + "%";
                 }
             default: return "OFF";
+        }
+    }
+    else if (panelId == 'u') {
+        switch(paramIndex) {
+            case 0: // Multiplier for CC1-2
+            case 1: // Multiplier for CC3-4
+            case 2: // Multiplier for CC5-6
+            case 3: // Multiplier for CC7-8
+                {
+                    // Map normalized 0.0-1.0 to discrete multipliers: 1, 2, 4, 8
+                    uint8_t mult;
+                    if (normalizedValue < 0.25f) mult = 1;
+                    else if (normalizedValue < 0.5f) mult = 2;
+                    else if (normalizedValue < 0.75f) mult = 4;
+                    else mult = 8;
+                    return "x" + std::to_string(mult);
+                }
+            default: return "x1";
         }
     }
     
@@ -2878,6 +2844,11 @@ void InitTriggerSequence()
     sequencer.currentSequenceStep = 0;
     sequencer.lastSequenceStepTime = hw.seed.system.GetNow();
     sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));  // 16th note timing
+    
+    // Initialize subdivision timing (for CC multiplier feature)
+    sequencer.currentSubdivision = 0;
+    sequencer.lastSubdivisionTime = hw.seed.system.GetNow();
+    sequencer.subdivisionInterval = sequencer.sequenceStepInterval / 8;
 }
 
 
@@ -3005,6 +2976,56 @@ void ProcessCCSlots()
     // If no CCs were triggered and we have a high CC normalizedValue, force latch down
     if (triggeredSlots == 0 && lastCCValue > 0) {
         ResetCCState();
+    }
+}
+
+// Process CC slots with subdivision support for multipliers
+// subdivision should be 0-7 (one of 8 subdivisions of a sequencer step)
+void ProcessCCSlotsWithSubdivision(uint8_t subdivision)
+{
+    globalNoteCounter++; // Keep for display purposes
+    
+    int triggeredSlots = 0;
+    uint8_t triggeredValues[8];
+    
+    // Check each slot to see if it should trigger on this subdivision
+    // based on its multiplier
+    for (int i = 7; i >= 0; i--) {
+        uint8_t multiplier = ccSlotMultipliers[i];
+        
+        // Determine if this slot should trigger on this subdivision
+        // multiplier 1: subdivision 0 only (subdivision % 8 == 0)
+        // multiplier 2: subdivisions 0, 4 (subdivision % 4 == 0)
+        // multiplier 4: subdivisions 0, 2, 4, 6 (subdivision % 2 == 0)
+        // multiplier 8: all subdivisions 0-7 (always trigger)
+        bool shouldTrigger = false;
+        if (multiplier == 1) {
+            shouldTrigger = (subdivision == 0); // Only trigger once at start of step
+        } else {
+            // Formula: (subdivision % (8 / multiplier)) == 0
+            // This gives evenly spaced triggers based on multiplier
+            uint8_t divisor = 8 / multiplier;
+            shouldTrigger = (subdivision % divisor) == 0;
+        }
+        
+        // If this slot should trigger on this subdivision, evaluate its probability
+        if (shouldTrigger && ShouldFireWithProbability(ccSlotProbabilities[i])) {
+            triggeredValues[triggeredSlots] = ccSlotValues[i];
+            triggeredSlots++;
+        }
+    }
+    
+    // Queue all triggered CCs
+    for (int i = 0; i < triggeredSlots; i++) {
+        AddCCToQueue(triggeredValues[i], false);
+    }
+    
+    // If no CCs were triggered and we have a high CC normalizedValue, force latch down
+    if (triggeredSlots == 0 && lastCCValue > 0) {
+        // Only reset at the end of a complete step (subdivision 7)
+        if (subdivision == 7) {
+            ResetCCState();
+        }
     }
 }
 
@@ -3278,7 +3299,11 @@ public:
         SendMidiMesssage(event.note, 15, "NOTE_ON");
         
         // Process CC slots based on subdivision logic
-        ProcessCCSlots();
+        if (sequencer.sequencerMode) {
+            // ProcessCCSlotsWithSubdivision(sequencer.currentSubdivision);
+        } else {
+            ProcessCCSlots();
+        }
         
         noteCount++;
         
@@ -3364,11 +3389,33 @@ public:
             return;
         }
         
-        // Check if it's time to advance to the next sequence step
+        // Check if it's time for the next subdivision
         uint32_t currentTime = hw.seed.system.GetNow();
-        if ((currentTime - sequencer.lastSequenceStepTime) >= sequencer.sequenceStepInterval) {
-            AdvanceSequenceStep();
-            sequencer.lastSequenceStepTime = currentTime;
+        
+        // Check subdivision timing (every 1/8 of a sequencer step)
+        if ((currentTime - sequencer.lastSubdivisionTime) >= sequencer.subdivisionInterval) {
+            // Only process CC slots if current step should trigger a note
+            bool currentStepTriggers = sequencer.triggerSequence[sequencer.currentSequenceStep];
+            
+            if (currentStepTriggers) {
+                // Process CC slots for this subdivision
+                ProcessCCSlotsWithSubdivision(sequencer.currentSubdivision);
+            }
+            
+            sequencer.lastSubdivisionTime = currentTime;
+            
+            // Advance to next subdivision
+            sequencer.currentSubdivision++;
+            
+            // When we've completed all 8 subdivisions, advance to next sequence step
+            if (sequencer.currentSubdivision >= 8) {
+                sequencer.currentSubdivision = 0;
+                AdvanceSequenceStep();  // Only triggers note if step has trigger
+                sequencer.lastSequenceStepTime = currentTime;
+                
+                // Start fresh at subdivision 0 for the new step
+                sequencer.lastSubdivisionTime = currentTime;  // Reset subdivision timer
+            }
         }
     }
     
@@ -3387,8 +3434,8 @@ private:
             
             ProcessHandlerChainNoteOn(event);
             
-            // Process CC slots based on subdivision logic
-            // ProcessCCSlots();
+            // Note: CC processing happens via subdivision loop, not here
+            // This ensures proper timing aligned with subdivisions
             
             // Advance to next note in sequencer array
             sequencer.sequencerNoteIndex = (sequencer.sequencerNoteIndex + 1) % sequencer.sequencerNotes.size();
