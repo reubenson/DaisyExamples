@@ -1070,8 +1070,16 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             
         case PARAM_SEQ_BPM:
             {
-                appState.seqBpm = normalizedValue;
+                // Calculate BPM from normalized value
                 int32_t newBpm = CLOCK_BPM_MIN + static_cast<int32_t>(normalizedValue * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
+                
+                // Quantize to nearest multiple of 5
+                newBpm = ((newBpm + 2) / 5) * 5;
+                newBpm = std::max(CLOCK_BPM_MIN, std::min(CLOCK_BPM_MAX, newBpm));
+                
+                // Update normalized value to match quantized BPM so display reflects actual value
+                appState.seqBpm = static_cast<float>(newBpm - CLOCK_BPM_MIN) / (CLOCK_BPM_MAX - CLOCK_BPM_MIN);
+                
                 if (newBpm != sequencer.clockBpm) {
                     sequencer.clockBpm = newBpm;
                     sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
@@ -2020,9 +2028,11 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                 return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
             case 3: // BPM
                 {
-                    // Map 0-1 to CLOCK_BPM_MIN-CLOCK_BPM_MAX
-                    int bpm = CLOCK_BPM_MIN + static_cast<int>(normalizedValue * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
-                    return std::to_string(bpm);
+                    // Map 0-1 to CLOCK_BPM_MIN-CLOCK_BPM_MAX and quantize to multiple of 5
+                    int32_t bpm = CLOCK_BPM_MIN + static_cast<int32_t>(normalizedValue * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
+                    bpm = ((bpm + 2) / 5) * 5;  // Round to nearest multiple of 5
+                    bpm = std::max(CLOCK_BPM_MIN, std::min(CLOCK_BPM_MAX, bpm));
+                    return std::to_string(static_cast<int>(bpm));
                 }
             default: return "0";
         }
