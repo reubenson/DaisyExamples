@@ -94,6 +94,7 @@ Fm2 voiceFm2Osc[4];                        // FM2 oscillators for all 4 voices
 FormantOscillator voiceFormantOsc[4];             // Formant oscillators for all 4 voices
 HarmonicOscillator<> voiceHarmonicOsc[4];    // Harmonic oscillators for all 4 voices (default 16 harmonics)
 
+size_t blocksize = 8;
 int panelMode;
 float voicesMinLevel = 0.0f;
 float cvOut1;
@@ -380,8 +381,8 @@ enum ParamId {
 // All normalizedValues stored in normalized 0.0-1.0 range
 struct UserState {
     // ADSR parameters (stored directly in milliseconds)
-    float adsrAttackMs;        // Attack time in milliseconds (0.1ms - 5000ms)
-    float adsrDecayReleaseMs;   // Decay/Release time in milliseconds (0.1ms - 3000ms)
+    float adsrAttackMs;        // Attack time in milliseconds (0.1ms - 1500ms)
+    float adsrDecayReleaseMs;   // Decay/Release time in milliseconds (0.1ms - 1500ms)
     float adsrSustain;          // Sustain level 0.0-1.0
     float adsrMin;              // Minimum envelope level 0.0-1.0
     
@@ -812,8 +813,8 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             {
                 // Convert normalized normalizedValue (0.0-1.0) to milliseconds
                 // Use exponential mapping for better control over short times
-                float attackMs = (normalizedValue * normalizedValue) * 5000.0f;
-                appState.adsrAttackMs = std::max(0.1f, std::min(5000.0f, attackMs));
+                float attackMs = (normalizedValue * normalizedValue) * 1500.0f;
+                appState.adsrAttackMs = std::max(0.1f, std::min(1500.0f, attackMs));
                 
                 // Apply to all envelopes (convert ms to seconds)
                 for (int i = 0; i < 4; i++) {
@@ -827,8 +828,8 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             {
                 // Convert normalized normalizedValue (0.0-1.0) to milliseconds
                 // Use exponential mapping for better control over short times
-                float decayMs = (normalizedValue * normalizedValue) * 3000.0f;
-                appState.adsrDecayReleaseMs = std::max(0.1f, std::min(3000.0f, decayMs));
+                float decayMs = (normalizedValue * normalizedValue) * 1500.0f;
+                appState.adsrDecayReleaseMs = std::max(0.1f, std::min(1500.0f, decayMs));
                 
                 // Apply to all envelopes (convert ms to seconds)
                 for (int i = 0; i < 4; i++) {
@@ -1547,7 +1548,7 @@ void InitEnvelopes(float samplerate)
     for(int i = 0; i < 4; i++)
     {
         // Initialize envelope objects
-        envelopes[i].env.Init(samplerate);
+        envelopes[i].env.Init(samplerate, blocksize);
         
         // Initialize gate state to false (no notes playing initially)
         envelopes[i].gate = false;
@@ -1650,7 +1651,6 @@ void HandleMidiMessage(MidiEvent m)
 int main(void)
 {
     float samplerate;
-    size_t blocksize = 8;
     hw.Init();
     
     samplerate = hw.AudioSampleRate();
@@ -1884,15 +1884,9 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
     if (panelId == 'e') {
         switch(paramIndex) {
             case 0: // Attack time - convert normalized value to milliseconds
-                {
-                    float attackMs = 0.1f + (normalizedValue) * 4999.9f;
-                    return std::to_string(static_cast<int>(attackMs)) + "ms";
-                }
+                return std::to_string(static_cast<int>(appState.adsrAttackMs)) + "ms";
             case 1: // Decay/Release time - convert normalized value to milliseconds
-                {
-                    float decayMs = 0.1f + (normalizedValue) * 4999.9f;
-                    return std::to_string(static_cast<int>(decayMs)) + "ms";
-                }
+                return std::to_string(static_cast<int>(appState.adsrDecayReleaseMs)) + "ms";
             case 2: // Sustain level
                 return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
             case 3: // Minimum level
