@@ -55,6 +55,49 @@ public:
         waveform_param_ = param;
     }
     
+    void SetPhase(float phase) {
+        phase_ = phase;
+        // Keep phase in 0-1 range
+        if (phase_ >= 1.0f) phase_ -= 1.0f;
+        if (phase_ < 0.0f) phase_ += 1.0f;
+    }
+    
+    float GetPhase() const {
+        return phase_;
+    }
+    
+    // Generate output at a specific phase without advancing internal phase
+    float ProcessAtPhase(float phase) const {
+        // Normalize phase to 0-1 range
+        while (phase >= 1.0f) phase -= 1.0f;
+        while (phase < 0.0f) phase += 1.0f;
+        
+        float output = 0.0f;
+        
+        // Generate base waveforms
+        float sine = sinf(phase * 2.0f * M_PI);
+        float triangle = 2.0f * (phase < 0.5f ? 2.0f * phase : 2.0f * (1.0f - phase)) - 1.0f;
+        float square = phase < 0.5f ? 1.0f : -1.0f;
+        float saw = 2.0f * phase - 1.0f;
+        
+        // Interpolate between waveforms
+        if (waveform_param_ <= 0.33f) {
+            // Interpolate between sine and triangle
+            float t = waveform_param_ / 0.33f;
+            output = sine * (1.0f - t) + triangle * t;
+        } else if (waveform_param_ <= 0.66f) {
+            // Interpolate between triangle and square
+            float t = (waveform_param_ - 0.33f) / 0.33f;
+            output = triangle * (1.0f - t) + square * t;
+        } else {
+            // Interpolate between square and saw
+            float t = (waveform_param_ - 0.66f) / 0.34f;
+            output = square * (1.0f - t) + saw * t;
+        }
+        
+        return output * amp_;
+    }
+    
     float Process() {
         float output = 0.0f;
         
@@ -93,6 +136,7 @@ InterpolatedOscillator voiceInterpOsc[4];  // Oscillators for all 4 voices
 Fm2 voiceFm2Osc[4];                        // FM2 oscillators for all 4 voices
 FormantOscillator voiceFormantOsc[4];             // Formant oscillators for all 4 voices
 HarmonicOscillator<> voiceHarmonicOsc[4];    // Harmonic oscillators for all 4 voices (default 16 harmonics)
+InterpolatedOscillator panLfo;              // LFO for panning CV output
 
 size_t blocksize = 8;
 int panelMode;
@@ -333,6 +377,7 @@ enum ParamId {
     // MIXER Panel
     PARAM_PAN_FREQ,
     PARAM_PAN_AMP,
+    PARAM_PAN_WAVEFORM,
     PARAM_VOLUME,
     
     // OSC Panel
@@ -389,6 +434,7 @@ struct UserState {
     // MIXER parameters
     float panFreq;              // 0.0-1.0 maps to 0-10Hz
     float panAmp;               // 0.0-1.0 amplitude (0=centered, 1=full pan)
+    float panWaveform;          // 0.0-1.0 waveform for pan LFO (same as oscWaveform: sine->tri->square->saw)
     float volume;               // 0.0-1.0 master volume
     
     // OSC parameters
@@ -438,6 +484,7 @@ struct UserState {
         adsrMin(0.0f),
         panFreq(0.02f),         // Default 0.2Hz
         panAmp(1.0f),           // Default full amplitude
+        panWaveform(0.0f),      // Default sine wave for pan LFO
         volume(0.8f),           // Default 80% volume
         oscWaveform(0.0f),      // Default sine wave
         oscMode(0.0f),          // Default Interpolated oscillator
@@ -515,10 +562,10 @@ panelStruct displayPanels[9] = {
         id: 'm',
         input1Name: "Freq",
         input2Name: "Amp",
-        input3Name: "",
+        input3Name: "Wave",
         input4Name: "Vol",
         normalizedValues: {0.0f, 0.0f, 0.0f, 0.8f},
-        bindings: {PARAM_PAN_FREQ, PARAM_PAN_AMP, PARAM_NONE, PARAM_VOLUME}
+        bindings: {PARAM_PAN_FREQ, PARAM_PAN_AMP, PARAM_PAN_WAVEFORM, PARAM_VOLUME}
     },
     {
         name: "OSC",
@@ -762,6 +809,7 @@ float GetParamValue(ParamId paramId)
         // MIXER Panel
         case PARAM_PAN_FREQ:            return appState.panFreq;
         case PARAM_PAN_AMP:             return appState.panAmp;
+        case PARAM_PAN_WAVEFORM:        return appState.panWaveform;
         case PARAM_VOLUME:              return appState.volume;
         
         // OSC Panel
@@ -862,11 +910,17 @@ void SetParamValue(ParamId paramId, float normalizedValue)
         case PARAM_PAN_FREQ:
             appState.panFreq = normalizedValue;
             panFreq = normalizedValue * 10.0f;  // Map to 0-10Hz
+            panLfo.SetFreq(panFreq);
             break;
             
         case PARAM_PAN_AMP:
             appState.panAmp = normalizedValue;
             panAmp = normalizedValue;
+            break;
+            
+        case PARAM_PAN_WAVEFORM:
+            appState.panWaveform = normalizedValue;
+            panLfo.SetWaveformParam(normalizedValue);
             break;
             
         case PARAM_VOLUME:
@@ -1276,7 +1330,7 @@ void PanEqualPowerStereo(float pan, float normalizedValue, float* left, float* r
 }
 
 void ApplyPanning(float* data) {
-    float L1, R1, L2, R2, L3, R3, L4, R4;
+    float L1, R1, R2, L2, L3, R3, L4, R4;
     
     // Update pan phase manually to maintain control
     panPhase += 2.0f * M_PI * panFreq / hw.AudioSampleRate();
@@ -1284,18 +1338,21 @@ void ApplyPanning(float* data) {
         panPhase -= 2.0f * M_PI;
     }
     
-    // Calculate pan positions for each voice with fixed phase offsets
+    // Convert pan phase from 0-2π to 0-1 range for LFO
+    float lfoPhase = panPhase / (2.0f * M_PI);
+    
+    // Get LFO outputs for each voice with fixed phase offsets
     // Voices are evenly distributed: 0°, 90°, 180°, 270°
     // This ensures voices 0 and 2 are opposite (hard left/right at some point in LFO cycle)
     // and voices 1 and 3 are also opposite
     // Scale by panAmp: 0 = all centered, 1 = full panning effect
-    float pan0 = sinf(panPhase) * panAmp;                      // Voice 0: 0° (base phase)
-    float pan1 = sinf(panPhase + M_PI * 0.5f) * panAmp;       // Voice 1: +90° = cos(phase)
-    float pan2 = sinf(panPhase + M_PI) * panAmp;              // Voice 2: +180° = -sin(phase)
-    float pan3 = sinf(panPhase + M_PI * 1.5f) * panAmp;       // Voice 3: +270° = -cos(phase)
+    float pan0 = panLfo.ProcessAtPhase(lfoPhase) * panAmp;       // Voice 0: 0° (base phase)
+    float pan1 = panLfo.ProcessAtPhase(lfoPhase + 0.25f) * panAmp;  // Voice 1: +90°
+    float pan2 = panLfo.ProcessAtPhase(lfoPhase + 0.5f) * panAmp;   // Voice 2: +180°
+    float pan3 = panLfo.ProcessAtPhase(lfoPhase + 0.75f) * panAmp;  // Voice 3: +270°
     
-    // Store base output for CV output
-    panOutput = pan0;
+    // Store LFO output for CV output (before amplitude scaling)
+    panOutput = panLfo.ProcessAtPhase(lfoPhase);
     
     PanEqualPowerStereo(pan0, data[0], &L1, &R1);
     PanEqualPowerStereo(pan1, data[1], &L2, &R2);
@@ -1928,6 +1985,11 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                 return std::to_string(static_cast<int>(normalizedValue * 10)) + "Hz";
             case 1: // Amplitude
                 return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
+            case 2: // Waveform
+                if (normalizedValue < 0.25f) return "Sine";
+                else if (normalizedValue < 0.5f) return "Tri";
+                else if (normalizedValue < 0.75f) return "Sqr";
+                else return "Saw";
             case 3: // Volume
                 return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
             default: return "0%";
@@ -2594,6 +2656,12 @@ void InitPan(float samplerate)
     panPhase = 0.0f;
     panFreq = 0.2f;  // Default panning frequency (0-10Hz range via knob control)
     panAmp = 1.0f;   // Default full amplitude (0-1 range via knob control)
+    
+    // Initialize pan LFO oscillator
+    panLfo.Init(samplerate);
+    panLfo.SetFreq(panFreq);
+    panLfo.SetAmp(1.0f);
+    panLfo.SetWaveformParam(0.0f);  // Default sine wave
     
     // Keep old pan oscillator initialization for potential future use
     pan.Init(samplerate);
