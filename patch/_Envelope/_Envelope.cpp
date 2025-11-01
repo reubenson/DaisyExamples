@@ -396,7 +396,7 @@ struct UserState {
     float oscMode;              // 0.0-1.0 oscillator mode (0=Interpolated, 1=FM2, 2=Formant, 3=Harmonic)
     float fm2Ratio;             // 0.0-1.0 maps to 0.125-8.0
     float fm2Index;             // 0.0-1.0 maps to 0.0-1.0
-    float formantFreq;          // 0.0-1.0 maps to 10-1000 Hz
+    float formantFreq;          // 0.0-1.0 maps to 0.5-2.0 ratio of carrier frequency
     float formantPhaseShift;   // 0.0-1.0 maps to 0.0-1.0
     float harmonicIdx;          // 0.0-1.0 maps to 1-16 as integers
     float harmonicDecay;        // 0.0-1.0 maps to 0-10 decay rate
@@ -443,7 +443,7 @@ struct UserState {
         oscMode(0.0f),          // Default Interpolated oscillator
         fm2Ratio(0.26f),        // Default 1.0 ratio (0.26 normalizes to 1.0)
         fm2Index(0.5f),         // Default 0.5 index
-        formantFreq(0.5f),      // Default 500 Hz
+        formantFreq(0.33f),      // Default 1.0x ratio (0.33 normalizes to ~1.0, which is 100%)
         formantPhaseShift(0.5f), // Default 0.5 phase shift
         harmonicIdx(0.0f),      // Default harmonic index 1 (0.0 normalizes to 1)
         harmonicDecay(0.3f),    // Default decay rate
@@ -476,6 +476,9 @@ UserState appState;
 float GetParamValue(ParamId paramId);
 void SetParamValue(ParamId paramId, float normalizedValue);
 float GetKnobValue(int panelIndex, int knobIndex);  // Helper to get knob normalizedValue from UserState
+
+// Utility functions
+float MidiNoteToFrequency(int8_t note, int8_t channel);
 
 // Panel knob binding structure
 struct PanelKnobBinding {
@@ -911,11 +914,18 @@ void SetParamValue(ParamId paramId, float normalizedValue)
         case PARAM_OSC_FORMANT_FREQ:
             {
                 appState.formantFreq = normalizedValue;
-                // Map 0.0-1.0 to 10-1000 Hz (logarithmic scale)
-                float freq = 10.0f * powf(100.0f, normalizedValue);
-                freq = std::max(10.0f, std::min(1000.0f, freq));
+                // Update formant frequencies for all voices based on their carrier frequencies
+                // Map 0.0-1.0 to 0.5-2.0 ratio
+                float ratio = 0.5f + normalizedValue * 1.5f;
+                ratio = std::max(0.5f, std::min(2.0f, ratio));
+                
                 for (int i = 0; i < 4; i++) {
-                    voiceFormantOsc[i].SetFormantFreq(freq);
+                    // Get current carrier frequency and apply ratio
+                    float carrierFreq = MidiNoteToFrequency(voices[i].note, 1);
+                    if (carrierFreq > 0) {
+                        float formantFreq = carrierFreq * ratio;
+                        voiceFormantOsc[i].SetFormantFreq(formantFreq);
+                    }
                 }
             }
             break;
@@ -1370,6 +1380,13 @@ void SetOscillatorFrequency(int voiceIndex, float freq) {
     voiceFm2Osc[voiceIndex].SetFrequency(freq);
     voiceFormantOsc[voiceIndex].SetCarrierFreq(freq);
     voiceHarmonicOsc[voiceIndex].SetFreq(freq);
+    
+    // Update formant frequency as ratio of carrier frequency
+    // Map 0.0-1.0 to 0.5-2.0 ratio
+    float ratio = 0.5f + appState.formantFreq * 1.5f;
+    ratio = std::max(0.5f, std::min(2.0f, ratio));
+    float formantFreq = freq * ratio;
+    voiceFormantOsc[voiceIndex].SetFormantFreq(formantFreq);
 }
 
 // Apply VCA to inputs based on envelope normalizedValues
@@ -1761,7 +1778,10 @@ int main(void)
     for (int i = 0; i < 4; i++) {
         voiceFormantOsc[i].Init(samplerate);
         voiceFormantOsc[i].SetCarrierFreq(440.0f);
-        voiceFormantOsc[i].SetFormantFreq(2000.0f);
+        // Formant frequency will be set correctly when SetParamValue is called
+        // Default ratio is 1.0x (0.33 normalized), so formant = 440 * 1.0 = 440
+        float defaultRatio = 0.5f + appState.formantFreq * 1.5f;
+        voiceFormantOsc[i].SetFormantFreq(440.0f * defaultRatio);
         voiceFormantOsc[i].SetPhaseShift(0.5f);
     }
     
@@ -1923,11 +1943,12 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                                 ratio = std::max(0.125f, std::min(8.0f, ratio));
                                 return std::to_string(static_cast<int>(ratio * 100.0f)) + "%";
                             }
-                        case 2: // Formant - frequency
+                        case 2: // Formant - ratio
                             {
-                                float freq = 10.0f * powf(100.0f, normalizedValue);
-                                freq = std::max(10.0f, std::min(1000.0f, freq));
-                                return std::to_string(static_cast<int>(freq)) + "Hz";
+                                float ratio = 0.5f + normalizedValue * 1.5f;
+                                ratio = std::max(0.5f, std::min(2.0f, ratio));
+                                // Display as percentage (e.g., "150%" for 1.5x)
+                                return std::to_string(static_cast<int>(ratio * 100.0f)) + "%";
                             }
                         case 3: // Harmonic - idx
                             {
