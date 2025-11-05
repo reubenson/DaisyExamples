@@ -1471,12 +1471,9 @@ void ApplyVCAs(float* data) {
         }
     }
 
-    int16_t outputMaxEnvelope = envMax * 4095;
     int16_t vactrolOffset = 300; // this is to bias the Intellijel vactrol
-    // int16_t output = std::min(outputMaxEnvelope + vactrolOffset, static_cast<int16_t>(4095));
-    hw.seed.dac.WriteValue(DacHandle::Channel::TWO, outputMaxEnvelope + vactrolOffset);
-    // cvOut1 = IncrementTowards(cvOut1 + vactrolOffset, envMax);
-    // hw.seed.dac.WriteValue(DacHandle::Channel::TWO, cvOut1 * 4095);
+    int16_t outputMaxEnvelope = vactrolOffset + envMax * (4095 - vactrolOffset);
+    hw.seed.dac.WriteValue(DacHandle::Channel::TWO, outputMaxEnvelope);
 }
 
 // due to hardware quirks, this only works with patch cables inserted into the unused inputs
