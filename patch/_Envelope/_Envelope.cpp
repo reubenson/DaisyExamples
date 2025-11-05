@@ -26,6 +26,14 @@ Oscillator      pan, lfo1, lfo2, lfo3;
 SdmmcHandler    sdcard;
 Compressor      compressor;
 
+// Delay lines for stereo delay effect
+// Maximum delay: 600ms at 48kHz = 28800 samples, use 30000 for safety margin
+static constexpr size_t MAX_DELAY_SAMPLES = 30000;
+DelayLine<float, MAX_DELAY_SAMPLES> delayL;
+DelayLine<float, MAX_DELAY_SAMPLES> delayR;
+float delaySampleRate = 48000.0f;
+float currentDelayTimeSamples = 0.0f;  // Cached delay time in samples
+
 // Custom oscillator class for waveform interpolation
 class InterpolatedOscillator {
 private:
@@ -419,6 +427,12 @@ enum ParamId {
     PARAM_COMP_ATTACK,
     PARAM_COMP_RELEASE,
     
+    // DELAY Panel
+    PARAM_DELAY_MODE,
+    PARAM_DELAY_TIME,
+    PARAM_DELAY_FEEDBACK,
+    PARAM_DELAY_WETDRY,
+    
     PARAM_NONE  // Used for unbound knobs
 };
 
@@ -476,6 +490,12 @@ struct UserState {
     float compAttack;          // 0.0-1.0 maps to 0.001-10.0 seconds
     float compRelease;         // 0.0-1.0 maps to 0.001-10.0 seconds
     
+    // DELAY parameters
+    float delayMode;           // 0.0-1.0 (short=0.0-0.5, long=0.5-1.0)
+    float delayTime;           // 0.0-1.0 normalized delay time
+    float delayFeedback;       // 0.0-1.0 feedback amount
+    float delayWetDry;         // 0.0-1.0 wet/dry mix
+    
     // Constructor with default normalizedValues
     UserState() :
         adsrAttackMs(0.1f),         // 0.1ms attack
@@ -512,12 +532,50 @@ struct UserState {
         compRatio(0.25f),        // Default 4:1 ratio (0.25 = (4-1)/(40-1) ≈ 0.077)
         compThreshold(0.6f),    // Default -12 dB (0.6 in normalized range)
         compAttack(0.01f),      // Default 0.001s attack
-        compRelease(0.05f)      // Default 0.1s release
+        compRelease(0.05f),      // Default 0.1s release
+        delayMode(0.0f),        // Default short mode
+        delayTime(0.5f),        // Default 50% delay time
+        delayFeedback(0.3f),    // Default 30% feedback
+        delayWetDry(0.3f)       // Default 30% wet mix
     {}
 };
 
 // Global state instance
 UserState appState;
+
+// Function to update delay time calculation (called when parameters change)
+void UpdateDelayTime() {
+    float mode = appState.delayMode;
+    float time = appState.delayTime;
+    float delayTimeSamples;
+    
+    if (mode < 0.5f) {
+        // Short mode: 0.05ms to 50ms linear
+        float delayMs = 0.05f + (time * 49.95f);  // 0.05ms to 50ms
+        delayTimeSamples = (delayMs / 1000.0f) * delaySampleRate;
+    } else {
+        // Long mode: BPM-synced (1/4, 1/3, 1/2, 1, 2, 3, 4 beats)
+        static const float beatMultipliers[7] = {0.25f, 0.333333f, 0.5f, 1.0f, 2.0f, 3.0f, 4.0f};
+        
+        // Map delayTime (0.0-1.0) to beat multiplier using nearest neighbor
+        int index = static_cast<int>(time * 6.99f);  // 0-6 for 7 values
+        index = std::max(0, std::min(6, index));
+        float beatMultiplier = beatMultipliers[index];
+        
+        // Calculate delay time in seconds based on BPM
+        float beatDuration = 60.0f / static_cast<float>(sequencer.clockBpm);  // seconds per beat
+        float delayTimeSeconds = beatMultiplier * beatDuration;
+        delayTimeSamples = delayTimeSeconds * delaySampleRate;
+    }
+    
+    // Clamp delay time to valid range
+    float maxDelay = static_cast<float>(MAX_DELAY_SAMPLES - 1);
+    currentDelayTimeSamples = std::max(1.0f, std::min(delayTimeSamples, maxDelay));
+    
+    // Set delay times
+    delayL.SetDelay(currentDelayTimeSamples);
+    delayR.SetDelay(currentDelayTimeSamples);
+}
 
 // State accessor functions
 float GetParamValue(ParamId paramId);
@@ -537,16 +595,20 @@ struct PanelKnobBinding {
 
 struct panelStruct
 {
-    std::string         name;
+    const char*         name;
     char                id;
-    std::string         input1Name;
-    std::string         input2Name;
-    std::string         input3Name;
-    std::string         input4Name;
+    const char*         input1Name;
+    const char*         input2Name;
+    const char*         input3Name;
+    const char*         input4Name;
     float               normalizedValues[4];      // Legacy - will be removed in cleanup
     PanelKnobBinding    bindings;       // New binding system
 };
-panelStruct displayPanels[9] = {
+
+// Maximum number of panels - increase this if adding more panels
+constexpr int MAX_PANELS = 16;
+
+panelStruct displayPanels[] = {
     { 
         name: "ADSR",
         id: 'e',
@@ -628,6 +690,16 @@ panelStruct displayPanels[9] = {
         bindings: {PARAM_COMP_RATIO, PARAM_COMP_THRESHOLD, PARAM_COMP_ATTACK, PARAM_COMP_RELEASE}
     },
     {
+        name: "DELAY",
+        id: 'd',
+        input1Name: "Mode",
+        input2Name: "Time",
+        input3Name: "Feed",
+        input4Name: "Mix",
+        normalizedValues: {0.0f, 0.5f, 0.3f, 0.3f},
+        bindings: {PARAM_DELAY_MODE, PARAM_DELAY_TIME, PARAM_DELAY_FEEDBACK, PARAM_DELAY_WETDRY}
+    },
+    {
         name: "PRESET",
         id: 'p',
         input1Name: "",
@@ -638,7 +710,11 @@ panelStruct displayPanels[9] = {
         bindings: {PARAM_NONE, PARAM_NONE, PARAM_NONE, PARAM_NONE}
     }
 };
-int panelModesCount = sizeof(displayPanels) / sizeof(displayPanels[0]);
+
+// Calculate panel count dynamically from array size
+constexpr int panelModesCount = sizeof(displayPanels) / sizeof(displayPanels[0]);
+static_assert(panelModesCount <= MAX_PANELS, "Too many panels! Increase MAX_PANELS");
+
 panelStruct currentPanel;
 int noteCount = 0;
 
@@ -647,7 +723,8 @@ float smoothedKnobState[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 bool knobCaughtUp[4] = {false, false, false, false};  // Track if knob has caught up to stored knob normalizedValue
 
 // Global knob normalizedValues storage - stores all knob positions for all panels (0.0-1.0 normalized)
-float knobValues[9][4] = {
+// Size matches MAX_PANELS to support dynamic panel addition
+float knobValues[MAX_PANELS][4] = {
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 0: ADSR
     {0.0f, 0.0f, 0.0f, 0.8f},  // Panel 1: MIXER
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 2: OSC
@@ -656,7 +733,9 @@ float knobValues[9][4] = {
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 5: SAMPLER
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 6: MULT 
     {0.25f, 0.6f, 0.01f, 0.05f}, // Panel 7: COMP
-    {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 8: PRESET
+    {0.0f, 0.5f, 0.3f, 0.3f},  // Panel 8: DELAY
+    {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 9: PRESET
+    // Remaining panels initialized to {0.0f, 0.0f, 0.0f, 0.0f} by default
 };
 const float KNOB_CATCHUP_THRESHOLD = 0.05f;  // How close knob must be to catch up (5%)
 
@@ -695,6 +774,8 @@ void      ProcessControls();
 void      ApplyVCAs();
 void      ApplyPanning(float* data);
 void      ApplyCompression(float* data);
+void      ApplyDelay(float* data);
+void      UpdateDelayTime();
 void      UpdateOled();
 // void      plucksApply();
 void      InitPan(float samplerate);
@@ -850,6 +931,12 @@ float GetParamValue(ParamId paramId)
         case PARAM_COMP_THRESHOLD:     return appState.compThreshold;
         case PARAM_COMP_ATTACK:        return appState.compAttack;
         case PARAM_COMP_RELEASE:       return appState.compRelease;
+        
+        // DELAY Panel
+        case PARAM_DELAY_MODE:         return appState.delayMode;
+        case PARAM_DELAY_TIME:         return appState.delayTime;
+        case PARAM_DELAY_FEEDBACK:     return appState.delayFeedback;
+        case PARAM_DELAY_WETDRY:       return appState.delayWetDry;
         
         case PARAM_NONE:
         default:                        return 0.0f;
@@ -1139,6 +1226,8 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                     sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
                     sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));
                     sequencer.subdivisionInterval = sequencer.sequenceStepInterval / 8;
+                    // Update delay time if in BPM-sync mode
+                    UpdateDelayTime();
                 }
             }
             break;
@@ -1274,6 +1363,27 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             }
             break;
         
+        // DELAY Panel
+        case PARAM_DELAY_MODE:
+            appState.delayMode = normalizedValue;
+            UpdateDelayTime();  // Recalculate delay time when mode changes
+            break;
+            
+        case PARAM_DELAY_TIME:
+            appState.delayTime = normalizedValue;
+            UpdateDelayTime();  // Recalculate delay time when time changes
+            break;
+            
+        case PARAM_DELAY_FEEDBACK:
+            appState.delayFeedback = normalizedValue;
+            // Feedback is read in ApplyDelay() - no action needed here
+            break;
+            
+        case PARAM_DELAY_WETDRY:
+            appState.delayWetDry = normalizedValue;
+            // Wet/dry mix is read in ApplyDelay() - no action needed here
+            break;
+        
         case PARAM_NONE:
         default:
             break;
@@ -1283,7 +1393,7 @@ void SetParamValue(ParamId paramId, float normalizedValue)
 // Helper to get knob normalizedValue from UserState via panel bindings
 float GetKnobValue(int panelIndex, int knobIndex)
 {
-    if (panelIndex < 0 || panelIndex >= 8 || knobIndex < 0 || knobIndex >= 4) {
+    if (panelIndex < 0 || panelIndex >= panelModesCount || knobIndex < 0 || knobIndex >= 4) {
         return 0.0f;
     }
     
@@ -1372,6 +1482,33 @@ void ApplyCompression(float* data) {
     data[1] = compressor.Process(data[1]);
     data[2] = compressor.Process(data[2]);
     data[3] = compressor.Process(data[3]);
+}
+
+void ApplyDelay(float* data) {
+    // Read delay parameters from UserState (delay time is cached, no need to recalculate)
+    float feedback = appState.delayFeedback;
+    float wetDry = appState.delayWetDry;
+    
+    // Process left channel
+    float leftIn = data[0];
+    float leftDelayed = delayL.Read();
+    float leftFeedback = leftIn + (leftDelayed * feedback);
+    delayL.Write(leftFeedback);
+    
+    // Process right channel
+    float rightIn = data[1];
+    float rightDelayed = delayR.Read();
+    float rightFeedback = rightIn + (rightDelayed * feedback);
+    delayR.Write(rightFeedback);
+    
+    // Mix wet/dry
+    float dryL = leftIn;
+    float wetL = leftDelayed;
+    data[0] = (dryL * (1.0f - wetDry)) + (wetL * wetDry);
+    
+    float dryR = rightIn;
+    float wetR = rightDelayed;
+    data[1] = (dryR * (1.0f - wetDry)) + (wetR * wetDry);
 }
 
 float IncrementTowards(float normalizedValue, float target)
@@ -1584,6 +1721,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
         // Panel 3 - Panning and mixing
         ApplyPanning(results);
+
+        // Panel 4 - Delay effect
+        ApplyDelay(results);
 
         // plucksApply(results);
 
@@ -1849,6 +1989,14 @@ int main(void)
     compressor.SetAttack(0.003f);        // Default 3ms attack
     compressor.SetRelease(0.1f);         // Default 100ms release
     compressor.AutoMakeup(true);         // Enable auto makeup gain
+    
+    // Initialize delay lines
+    delaySampleRate = samplerate;
+    delayL.Init();
+    delayR.Init();
+    delayL.Reset();
+    delayR.Reset();
+    UpdateDelayTime();  // Initialize delay time calculation
     
     // Initialize interpolated oscillators for all 4 voices
     for (int i = 0; i < 4; i++) {
@@ -2166,6 +2314,49 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
             default: return "x1";
         }
     }
+    else if (panelId == 'd') {
+        switch(paramIndex) {
+            case 0: // Mode
+                return normalizedValue < 0.5f ? "SHORT" : "LONG";
+            case 1: // Time
+                {
+                    // Check if we're in short or long mode
+                    float mode = GetParamValue(PARAM_DELAY_MODE);
+                    if (mode < 0.5f) {
+                        // Short mode: show milliseconds (0.05ms to 50ms)
+                        float delayMs = 0.05f + (normalizedValue * 49.95f);
+                        // Format with 2 decimal places for small values
+                        if (delayMs < 1.0f) {
+                            int msInt = static_cast<int>(delayMs * 100);  // Convert to 0.xx format
+                            if (msInt < 10) {
+                                return "0.0" + std::to_string(msInt) + "ms";
+                            } else {
+                                return "0." + std::to_string(msInt) + "ms";
+                            }
+                        } else {
+                            return std::to_string(static_cast<int>(delayMs)) + "ms";
+                        }
+                    } else {
+                        // Long mode: show beat fraction
+                        float beatMultipliers[7] = {0.25f, 0.333333f, 0.5f, 1.0f, 2.0f, 3.0f, 4.0f};
+                        int index = static_cast<int>(normalizedValue * 6.99f);
+                        index = std::max(0, std::min(6, index));
+                        float beatMult = beatMultipliers[index];
+                        
+                        // Format as fraction or whole number
+                        if (index == 0) return "1/4";
+                        if (index == 1) return "1/3";
+                        if (index == 2) return "1/2";
+                        return std::to_string(static_cast<int>(beatMult));
+                    }
+                }
+            case 2: // Feedback
+                return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
+            case 3: // Wet/Dry
+                return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
+            default: return "0%";
+        }
+    }
     
     // Default fallback
     return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
@@ -2230,10 +2421,13 @@ void UpdateOled()
     
     // Display panel name vertically (one character per row)
     int startY = 0;
-    for (size_t i = 0; i < currentPanel.name.length() && i < 7; i++) {
-        char charStr[2] = {currentPanel.name[i], '\0'};
-        hw.display.SetCursor(2, startY + i * 9);  // 9 pixels between rows for font_s
-        hw.display.WriteString(charStr, font_s, true);
+    const char* panelName = currentPanel.name;
+    if (panelName) {
+        for (size_t i = 0; panelName[i] != '\0' && i < 7; i++) {
+            char charStr[2] = {panelName[i], '\0'};
+            hw.display.SetCursor(2, startY + i * 9);  // 9 pixels between rows for font_s
+            hw.display.WriteString(charStr, font_s, true);
+        }
     }
     
     // Define layout parameters
@@ -2259,12 +2453,12 @@ void UpdateOled()
         WriteFixedString(hw, knobPositions[0], labelY, 5, font_s, label1.c_str());
         WriteFixedString(hw, knobPositions[1], labelY, 5, font_s, label2.c_str());
         WriteFixedString(hw, knobPositions[2], labelY, 5, font_s, label3.c_str());
-        WriteFixedString(hw, knobPositions[3], labelY, 5, font_s, currentPanel.input4Name.c_str());
+        WriteFixedString(hw, knobPositions[3], labelY, 5, font_s, currentPanel.input4Name);
     } else {
-        WriteFixedString(hw, knobPositions[0], labelY, 5, font_s, currentPanel.input1Name.c_str());
-        WriteFixedString(hw, knobPositions[1], labelY, 5, font_s, currentPanel.input2Name.c_str());
-        WriteFixedString(hw, knobPositions[2], labelY, 5, font_s, currentPanel.input3Name.c_str());
-        WriteFixedString(hw, knobPositions[3], labelY, 5, font_s, currentPanel.input4Name.c_str());
+        WriteFixedString(hw, knobPositions[0], labelY, 5, font_s, currentPanel.input1Name);
+        WriteFixedString(hw, knobPositions[1], labelY, 5, font_s, currentPanel.input2Name);
+        WriteFixedString(hw, knobPositions[2], labelY, 5, font_s, currentPanel.input3Name);
+        WriteFixedString(hw, knobPositions[3], labelY, 5, font_s, currentPanel.input4Name);
     }
     
     // Draw horizontal meters below labels
