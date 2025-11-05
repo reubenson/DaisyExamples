@@ -1691,6 +1691,22 @@ void SendPitchBend(uint8_t channel, int16_t bendValue)
     currentPitchBendValues[channel] = bendValue;
 }
 
+void SendChannelPressure(uint8_t channel, uint8_t pressure)
+{
+    // Send MIDI Channel Pressure (Aftertouch) message
+    // Format: 0xD0 + channel, pressure
+    uint8_t bytes[2] = {static_cast<uint8_t>(0xD0 + channel), pressure};
+    hw.midi.SendMessage(bytes, 2);
+}
+
+void SendPolyphonicKeyPressure(uint8_t channel, uint8_t note, uint8_t pressure)
+{
+    // Send MIDI Polyphonic Key Pressure (Aftertouch) message
+    // Format: 0xA0 + channel, note, pressure
+    uint8_t bytes[3] = {static_cast<uint8_t>(0xA0 + channel), note, pressure};
+    hw.midi.SendMessage(bytes, 3);
+}
+
 int8_t getCurrentHighestNote() {
     int8_t highestNote = voices[0].note;
     for (int i = 1; i < 4; i++)
@@ -1724,6 +1740,20 @@ void HandleMidiMessage(MidiEvent m)
         {
             NoteOffEvent event = m.AsNoteOff();
             ProcessHandlerChainNoteOff(event);
+            break;
+        }
+        case ChannelPressure:
+        {
+            // Forward channel pressure (aftertouch) to channel 15
+            ChannelPressureEvent event = m.AsChannelPressure();
+            SendChannelPressure(15, event.pressure);
+            break;
+        }
+        case PolyphonicKeyPressure:
+        {
+            // Forward polyphonic key pressure (aftertouch) to channel 15
+            PolyphonicKeyPressureEvent event = m.AsPolyphonicKeyPressure();
+            SendPolyphonicKeyPressure(15, event.note, event.pressure);
             break;
         }
         default: break;
