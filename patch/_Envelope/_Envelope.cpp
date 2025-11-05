@@ -34,6 +34,10 @@ DelayLine<float, MAX_DELAY_SAMPLES> delayR;
 float delaySampleRate = 48000.0f;
 float currentDelayTimeSamples = 0.0f;  // Cached delay time in samples
 
+// Resampling delay read positions (offset from write pointer in samples, can be fractional)
+float delayReadPosL = 0.0f;  // Current read position offset for left channel
+float delayReadPosR = 0.0f;  // Current read position offset for right channel
+
 // Custom oscillator class for waveform interpolation
 class InterpolatedOscillator {
 private:
@@ -572,9 +576,11 @@ void UpdateDelayTime() {
     float maxDelay = static_cast<float>(MAX_DELAY_SAMPLES - 1);
     currentDelayTimeSamples = std::max(1.0f, std::min(delayTimeSamples, maxDelay));
     
-    // Set delay times
-    delayL.SetDelay(currentDelayTimeSamples);
-    delayR.SetDelay(currentDelayTimeSamples);
+    // For resampling delay, we don't set delay directly on the delay lines
+    // Instead, we initialize read positions to the target delay time
+    // The read positions will be updated smoothly in ApplyDelay()
+    delayReadPosL = currentDelayTimeSamples;
+    delayReadPosR = currentDelayTimeSamples;
 }
 
 // State accessor functions
@@ -1485,19 +1491,34 @@ void ApplyCompression(float* data) {
 }
 
 void ApplyDelay(float* data) {
-    // Read delay parameters from UserState (delay time is cached, no need to recalculate)
+    // Read delay parameters from UserState
     float feedback = appState.delayFeedback;
     float wetDry = appState.delayWetDry;
     
+    // Smoothly move read positions toward target delay time
+    // This allows smooth modulation without clicks/pops
+    float targetDelay = currentDelayTimeSamples;
+    float smoothingFactor = 0.01f;  // Smoothing rate (smaller = smoother but slower)
+    
+    delayReadPosL += (targetDelay - delayReadPosL) * smoothingFactor;
+    delayReadPosR += (targetDelay - delayReadPosR) * smoothingFactor;
+    
+    // Clamp read positions to valid range
+    float maxDelay = static_cast<float>(MAX_DELAY_SAMPLES - 1);
+    delayReadPosL = std::max(1.0f, std::min(delayReadPosL, maxDelay));
+    delayReadPosR = std::max(1.0f, std::min(delayReadPosR, maxDelay));
+    
+    // Read from delay lines using fractional positions (Hermite interpolation for better quality)
+    float leftDelayed = delayL.ReadHermite(delayReadPosL);
+    float rightDelayed = delayR.ReadHermite(delayReadPosR);
+    
     // Process left channel
     float leftIn = data[0];
-    float leftDelayed = delayL.Read();
     float leftFeedback = leftIn + (leftDelayed * feedback);
     delayL.Write(leftFeedback);
     
     // Process right channel
     float rightIn = data[1];
-    float rightDelayed = delayR.Read();
     float rightFeedback = rightIn + (rightDelayed * feedback);
     delayR.Write(rightFeedback);
     
@@ -1996,7 +2017,7 @@ int main(void)
     delayR.Init();
     delayL.Reset();
     delayR.Reset();
-    UpdateDelayTime();  // Initialize delay time calculation
+    UpdateDelayTime();  // Initialize delay time calculation (also sets read positions)
     
     // Initialize interpolated oscillators for all 4 voices
     for (int i = 0; i < 4; i++) {
