@@ -153,9 +153,8 @@ InterpolatedOscillator panLfo;              // LFO for panning CV output
 size_t blocksize = 8;
 int panelMode;
 float voicesMinLevel = 0.0f;
-float cvOut1;
-float cvOut2;
-float panOutput;
+
+// float panOutput;
 float panPhase = 0.0f;  // Manual phase tracking for quadrature panning
 float panFreq = 0.2f;   // Pan LFO frequency (0-10Hz range)
 float panAmp = 1.0f;    // Pan amplitude (0 = centered, 1 = full panning)
@@ -166,7 +165,6 @@ int8_t lastLowestNote = 0;
 int8_t currentNote = 0;
 int8_t lastCurrentNote = 0;
 int8_t nextVoiceIndex = 0;  // Round-robin voice allocator (0-3)
-uint32_t voiceAllocationCounter = 0;  // Counter to track voice allocation order
 
 bool shiftRegisterMode = false;
 
@@ -267,7 +265,7 @@ struct CCQueueItem {
     bool isReset; // true if this is a reset to lowest normalizedValue
 };
 
-const size_t CC_QUEUE_SIZE = 16; // Reduced from 16 to save memory
+const size_t CC_QUEUE_SIZE = 8; // Reduced to save memory (was 16)
 CCQueueItem ccQueue[CC_QUEUE_SIZE];
 size_t ccQueueHead = 0;
 size_t ccQueueTail = 0;
@@ -301,6 +299,16 @@ void      InitTriggerSequence();
 void      GenerateEuclideanRhythm(int numTriggers, int numSteps, bool* pattern);
 void      BuildPattern(int level, std::vector<bool>& result, const std::vector<int>& count, const std::vector<int>& remainder);
 
+// Sequencer order modes
+enum SequencerOrderMode {
+    SEQ_ORDER_ASC = 0,    // Ascending
+    SEQ_ORDER_DESC = 1,   // Descending
+    SEQ_ORDER_UPD = 2,    // Up-down
+    SEQ_ORDER_FWD = 3,    // Forward (original order)
+    SEQ_ORDER_RND = 4,    // Random
+    SEQ_ORDER_BRN = 5     // Brownian
+};
+
 // Sequencer parameters and state
 struct SequencerParams {
     // Hardware parameter objects
@@ -311,10 +319,16 @@ struct SequencerParams {
     
     // Sequencer mode and state
     bool sequencerMode = false;
-    bool sequencerNotesAscending = true;
+    SequencerOrderMode sequencerOrderMode = SEQ_ORDER_ASC;
     uint8_t sequencerNoteIndex = 0;
     float sequencerNoteLengthPercent = 0.5f;  // Note length as percentage of step (10%-90%)
     bool sequencerUsingInitialCapture = false;
+    
+    // State for up-down mode
+    bool sequencerUpDownDirection = true;  // true = ascending, false = descending
+    
+    // State for brownian mode
+    uint8_t sequencerLastNote = 0;
     
     // Sequencer note management
     std::vector<uint8_t> sequencerNotes;  // Array of held notes for sequencer
@@ -349,7 +363,9 @@ struct SequencerParams {
         // noteParam.Init(hw.controls[1], 36.0f, 84.0f, Parameter::LINEAR);
         sequencerNotes.clear();
         sequencerNoteIndex = 0;
-        sequencerNotesAscending = true;
+        sequencerOrderMode = SEQ_ORDER_ASC;
+        sequencerUpDownDirection = true;
+        sequencerLastNote = 0;
         sequencerNoteLengthPercent = 0.5f;
         clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
         lastClockTime = hw.seed.system.GetNow();
@@ -616,7 +632,7 @@ constexpr int MAX_PANELS = 16;
 
 panelStruct displayPanels[] = {
     { 
-        name: "ADSR",
+        name: "ENV",
         id: 'e',
         input1Name: "A", 
         input2Name: "D/R", 
@@ -626,7 +642,7 @@ panelStruct displayPanels[] = {
         bindings: {PARAM_ADSR_ATTACK, PARAM_ADSR_DECAY_RELEASE, PARAM_ADSR_SUSTAIN, PARAM_ADSR_MIN}
     },
     {
-        name: "MIXER",
+        name: "MIX",
         id: 'm',
         input1Name: "Freq",
         input2Name: "Amp",
@@ -638,7 +654,7 @@ panelStruct displayPanels[] = {
     {
         name: "OSC",
         id: 'o',
-        input1Name: "Waveform",
+        input1Name: "Wav",
         input2Name: "",
         input3Name: "",
         input4Name: "Mode",
@@ -650,53 +666,53 @@ panelStruct displayPanels[] = {
         id: 't',
         input1Name: "T",
         input2Name: "",
-        input3Name: "MIDI",
+        input3Name: "",
         input4Name: "",
         normalizedValues: {0.0f, 0.0f, 1.0f, 1.0f},
         bindings: {PARAM_TUNING_INDEX, PARAM_NONE, PARAM_TUNING_MIDI_ENABLE, PARAM_NONE}
     },
     {
-        name: "SEQUENCER",
+        name: "SEQ",
         id: 's',
-        input1Name: "Density",
-        input2Name: "Order",
-        input3Name: "Length",
+        input1Name: "Num",
+        input2Name: "Ord",
+        input3Name: "Len",
         input4Name: "BPM",
         normalizedValues: {0.0f, 0.0f, 0.5f, 0.0f},
         bindings: {PARAM_SEQ_DENSITY, PARAM_SEQ_ORDER, PARAM_SEQ_LENGTH, PARAM_SEQ_BPM}
     },
     {
-        name: "SAMPLER",
+        name: "SAMPL",
         id: 'c',
-        input1Name: "CC1-2",
-        input2Name: "CC3-4",
-        input3Name: "CC5-6",
-        input4Name: "CC7-8",
+        input1Name: "C12",
+        input2Name: "C34",
+        input3Name: "C56",
+        input4Name: "C78",
         normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
         bindings: {PARAM_CC_PROB_0_1, PARAM_CC_PROB_2_3, PARAM_CC_PROB_4_5, PARAM_CC_PROB_6_7}
     },
     {
-        name: "MULT",
+        name: "MLT",
         id: 'u',
-        input1Name: "M1-2",
-        input2Name: "M3-4",
-        input3Name: "M5-6",
-        input4Name: "M7-8",
+        input1Name: "M12",
+        input2Name: "M34",
+        input3Name: "M56",
+        input4Name: "M78",
         normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
         bindings: {PARAM_CC_MULT_0_1, PARAM_CC_MULT_2_3, PARAM_CC_MULT_4_5, PARAM_CC_MULT_6_7}
     },
     {
-        name: "COMP",
+        name: "CMM",
         id: 'x',
-        input1Name: "Ratio",
-        input2Name: "Thresh",
+        input1Name: "Rt",
+        input2Name: "Th",
         input3Name: "Atk",
         input4Name: "Rel",
         normalizedValues: {0.25f, 0.6f, 0.01f, 0.05f},
         bindings: {PARAM_COMP_RATIO, PARAM_COMP_THRESHOLD, PARAM_COMP_ATTACK, PARAM_COMP_RELEASE}
     },
     {
-        name: "DELAY",
+        name: "DLY",
         id: 'd',
         input1Name: "Mode",
         input2Name: "Time",
@@ -706,7 +722,7 @@ panelStruct displayPanels[] = {
         bindings: {PARAM_DELAY_MODE, PARAM_DELAY_TIME, PARAM_DELAY_FEEDBACK, PARAM_DELAY_WETDRY}
     },
     {
-        name: "PRESET",
+        name: "SAVE",
         id: 'p',
         input1Name: "",
         input2Name: "",
@@ -729,8 +745,8 @@ float smoothedKnobState[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 bool knobCaughtUp[4] = {false, false, false, false};  // Track if knob has caught up to stored knob normalizedValue
 
 // Global knob normalizedValues storage - stores all knob positions for all panels (0.0-1.0 normalized)
-// Size matches MAX_PANELS to support dynamic panel addition
-float knobValues[MAX_PANELS][4] = {
+// Size matches actual panel count to save memory
+float knobValues[10][4] = {  // panelModesCount = 10
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 0: ADSR
     {0.0f, 0.0f, 0.0f, 0.8f},  // Panel 1: MIXER
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 2: OSC
@@ -749,7 +765,7 @@ struct voiceStruct
 {
     int8_t note;
     int8_t velocity;
-    uint32_t allocationOrder;  // Track when this voice was last allocated (for voice stealing)
+    // Removed allocationOrder - not used (voice stealing uses round-robin)
     // float freq;
     // float amp;
     // float decay;
@@ -1202,10 +1218,28 @@ void SetParamValue(ParamId paramId, float normalizedValue)
         case PARAM_SEQ_ORDER:
             {
                 appState.seqOrder = normalizedValue;
-                bool newAscending = normalizedValue < 0.5f;
-                if (newAscending != sequencer.sequencerNotesAscending) {
-                    sequencer.sequencerNotesAscending = newAscending;
+                // Map normalized value (0.0-1.0) to 6 modes
+                SequencerOrderMode newMode;
+                if (normalizedValue < 0.1667f) {
+                    newMode = SEQ_ORDER_ASC;
+                } else if (normalizedValue < 0.3333f) {
+                    newMode = SEQ_ORDER_DESC;
+                } else if (normalizedValue < 0.5f) {
+                    newMode = SEQ_ORDER_UPD;
+                } else if (normalizedValue < 0.6667f) {
+                    newMode = SEQ_ORDER_FWD;
+                } else if (normalizedValue < 0.8333f) {
+                    newMode = SEQ_ORDER_RND;
+                } else {
+                    newMode = SEQ_ORDER_BRN;
+                }
+                
+                if (newMode != sequencer.sequencerOrderMode) {
+                    sequencer.sequencerOrderMode = newMode;
                     SortSequencerNotes();
+                    // Reset index when mode changes
+                    sequencer.sequencerNoteIndex = 0;
+                    sequencer.sequencerUpDownDirection = true;
                 }
             }
             break;
@@ -1468,7 +1502,7 @@ void ApplyPanning(float* data) {
     float pan3 = panLfo.ProcessAtPhase(lfoPhase + 0.75f) * panAmp;  // Voice 3: +270°
     
     // Store LFO output for CV output (before amplitude scaling)
-    panOutput = panLfo.ProcessAtPhase(lfoPhase);
+    float panOutput = panLfo.ProcessAtPhase(lfoPhase);
     
     PanEqualPowerStereo(pan0, data[0], &L1, &R1);
     PanEqualPowerStereo(pan1, data[1], &L2, &R2);
@@ -1989,7 +2023,6 @@ int main(void)
     {
         voices[i].note = 60;
         voices[i].velocity = 0;
-        voices[i].allocationOrder = 0;
 
         // pluck init
         // plucks[i].decay = 1.0;
@@ -2281,7 +2314,22 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
             case 0: // Density
                 return std::to_string(static_cast<int>(normalizedValue * 16)) + "/16";
             case 1: // Order
-                return normalizedValue < 0.5f ? "ASC" : "DESC";
+                {
+                    // Map normalized value (0.0-1.0) to 6 modes
+                    if (normalizedValue < 0.1667f) {
+                        return "ASC";
+                    } else if (normalizedValue < 0.3333f) {
+                        return "DESC";
+                    } else if (normalizedValue < 0.5f) {
+                        return "UPD";
+                    } else if (normalizedValue < 0.6667f) {
+                        return "FWD";
+                    } else if (normalizedValue < 0.8333f) {
+                        return "RND";
+                    } else {
+                        return "BRN";
+                    }
+                }
             case 2: // Length
                 return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
             case 3: // BPM
@@ -2583,8 +2631,18 @@ void UpdateOled()
         
         // Show sequencer-specific information
         if (sequencer.sequencerMode) {
-            // Show note ordering direction
-            WriteFixedString(hw, knobPositions[3], 32, 4, font_s, sequencer.sequencerNotesAscending ? "ASC" : "DESC");
+            // Show note ordering mode
+            const char* modeStr;
+            switch (sequencer.sequencerOrderMode) {
+                case SEQ_ORDER_ASC: modeStr = "ASC"; break;
+                case SEQ_ORDER_DESC: modeStr = "DESC"; break;
+                case SEQ_ORDER_UPD: modeStr = "UPD"; break;
+                case SEQ_ORDER_FWD: modeStr = "FWD"; break;
+                case SEQ_ORDER_RND: modeStr = "RND"; break;
+                case SEQ_ORDER_BRN: modeStr = "BRN"; break;
+                default: modeStr = "ASC"; break;
+            }
+            WriteFixedString(hw, knobPositions[3], 32, 4, font_s, modeStr);
             
             // Show number of held notes
             WriteFixedStringF(hw, knobPositions[0], 40, 4, font_s, "N:%d", static_cast<int>(sequencer.sequencerNotes.size()));
@@ -3060,8 +3118,11 @@ void AddNoteToSequencer(uint8_t note)
     // Add note to array
     sequencer.sequencerNotes.push_back(note);
     
-    // Sort notes based on current ordering preference
-    SortSequencerNotes();
+    // For FWD mode, don't sort - preserve order as notes are added
+    // For other modes, sort based on current ordering preference
+    if (sequencer.sequencerOrderMode != SEQ_ORDER_FWD) {
+        SortSequencerNotes();
+    }
     
     // Reset sequencer note index when new notes are added
     sequencer.sequencerNoteIndex = 0;
@@ -3089,6 +3150,11 @@ void RemoveNoteFromSequencer(uint8_t note)
         }
     }
     
+    // For brownian mode, reset last note if it was the one removed
+    if (sequencer.sequencerOrderMode == SEQ_ORDER_BRN && sequencer.sequencerLastNote == note) {
+        sequencer.sequencerLastNote = 0;  // Reset to trigger random selection next time
+    }
+    
     // Adjust sequencer note index if needed
     if (!sequencer.sequencerNotes.empty() && sequencer.sequencerNoteIndex >= sequencer.sequencerNotes.size()) {
         sequencer.sequencerNoteIndex = 0;
@@ -3097,17 +3163,43 @@ void RemoveNoteFromSequencer(uint8_t note)
 
 void SortSequencerNotes()
 {
-    if (sequencer.sequencerNotesAscending) {
-        std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end());
-    } else {
-        std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end(), std::greater<uint8_t>());
+    // For FWD mode, don't sort - preserve order as notes were added
+    if (sequencer.sequencerOrderMode == SEQ_ORDER_FWD) {
+        return;
     }
+    
+    // For other modes, sort based on mode
+    switch (sequencer.sequencerOrderMode) {
+        case SEQ_ORDER_ASC:
+            std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end());
+            break;
+        case SEQ_ORDER_DESC:
+            std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end(), std::greater<uint8_t>());
+            break;
+        case SEQ_ORDER_UPD:
+            // For up-down, start with ascending order
+            std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end());
+            sequencer.sequencerUpDownDirection = true;
+            break;
+        case SEQ_ORDER_RND:
+        case SEQ_ORDER_BRN:
+            // For random and brownian, we don't need sorted order
+            // But we can keep them sorted for easier brownian distance calculation
+            std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end());
+            break;
+        default:
+            break;
+    }
+    
+    sequencer.sequencerNoteIndex = 0;
 }
 
 void ClearSequencerNotes()
 {
     sequencer.sequencerNotes.clear();
     sequencer.sequencerNoteIndex = 0;
+    sequencer.sequencerUpDownDirection = true;
+    sequencer.sequencerLastNote = 0;
     sequencer.sequencerUsingInitialCapture = false;  // Reset flag when clearing notes
 }
 
@@ -3577,7 +3669,6 @@ public:
         envelopes[voiceIndex].gate = true;
         voices[voiceIndex].note = event.note;
         voices[voiceIndex].velocity = event.velocity;
-        voices[voiceIndex].allocationOrder = voiceAllocationCounter++;
         
         // Set velocity-scaled sustain level before retriggering
         float sustainKnobValue = hw.controls[2].Process(); // Read sustain knob directly
@@ -3605,7 +3696,6 @@ public:
                 // Clear voice data when note is released
                 voices[i].note = 0;
                 voices[i].velocity = 0;
-                voices[i].allocationOrder = 0;
             }
         }
         
@@ -3758,8 +3848,89 @@ private:
     void AdvanceSequenceStep() {
         // Check if current step should trigger
         if (sequencer.triggerSequence[sequencer.currentSequenceStep]) {
-            // Sequencer mode: trigger next note from sequencer notes array
-            uint8_t noteToTrigger = sequencer.sequencerNotes[sequencer.sequencerNoteIndex];
+            uint8_t noteToTrigger;
+            
+            // Select note based on sequencer order mode
+            switch (sequencer.sequencerOrderMode) {
+                case SEQ_ORDER_ASC:
+                case SEQ_ORDER_DESC:
+                    // Linear progression through sorted array
+                    noteToTrigger = sequencer.sequencerNotes[sequencer.sequencerNoteIndex];
+                    sequencer.sequencerNoteIndex = (sequencer.sequencerNoteIndex + 1) % sequencer.sequencerNotes.size();
+                    break;
+                    
+                case SEQ_ORDER_FWD:
+                    // Use sequencerNotes directly - in FWD mode it's not sorted, so it preserves original order
+                    noteToTrigger = sequencer.sequencerNotes[sequencer.sequencerNoteIndex];
+                    sequencer.sequencerNoteIndex = (sequencer.sequencerNoteIndex + 1) % sequencer.sequencerNotes.size();
+                    break;
+                    
+                case SEQ_ORDER_UPD:
+                    // Up-down: go up then down, reversing at ends
+                    noteToTrigger = sequencer.sequencerNotes[sequencer.sequencerNoteIndex];
+                    if (sequencer.sequencerUpDownDirection) {
+                        // Going up
+                        if (sequencer.sequencerNoteIndex >= sequencer.sequencerNotes.size() - 1) {
+                            // Reached end, reverse direction
+                            sequencer.sequencerUpDownDirection = false;
+                            if (sequencer.sequencerNotes.size() > 1) {
+                                sequencer.sequencerNoteIndex--;
+                            }
+                        } else {
+                            sequencer.sequencerNoteIndex++;
+                        }
+                    } else {
+                        // Going down
+                        if (sequencer.sequencerNoteIndex == 0) {
+                            // Reached start, reverse direction
+                            sequencer.sequencerUpDownDirection = true;
+                            if (sequencer.sequencerNotes.size() > 1) {
+                                sequencer.sequencerNoteIndex++;
+                            }
+                        } else {
+                            sequencer.sequencerNoteIndex--;
+                        }
+                    }
+                    break;
+                    
+                case SEQ_ORDER_RND:
+                    // Random selection
+                    sequencer.sequencerNoteIndex = rand() % sequencer.sequencerNotes.size();
+                    noteToTrigger = sequencer.sequencerNotes[sequencer.sequencerNoteIndex];
+                    break;
+                    
+                case SEQ_ORDER_BRN:
+                    // Brownian: random distance from last note
+                    if (sequencer.sequencerLastNote == 0 || sequencer.sequencerNotes.size() == 1) {
+                        // First note or only one note - pick randomly
+                        sequencer.sequencerNoteIndex = rand() % sequencer.sequencerNotes.size();
+                        noteToTrigger = sequencer.sequencerNotes[sequencer.sequencerNoteIndex];
+                    } else {
+                        // Find current note index in sorted array
+                        size_t currentIdx = 0;
+                        for (size_t i = 0; i < sequencer.sequencerNotes.size(); i++) {
+                            if (sequencer.sequencerNotes[i] == sequencer.sequencerLastNote) {
+                                currentIdx = i;
+                                break;
+                            }
+                        }
+                        
+                        // Random step: -2 to +2 (brownian motion)
+                        int step = (rand() % 5) - 2; // -2, -1, 0, 1, 2
+                        int newIdx = static_cast<int>(currentIdx) + step;
+                        
+                        // Clamp to valid range
+                        if (newIdx < 0) newIdx = 0;
+                        if (newIdx >= static_cast<int>(sequencer.sequencerNotes.size())) {
+                            newIdx = static_cast<int>(sequencer.sequencerNotes.size()) - 1;
+                        }
+                        
+                        sequencer.sequencerNoteIndex = static_cast<size_t>(newIdx);
+                        noteToTrigger = sequencer.sequencerNotes[sequencer.sequencerNoteIndex];
+                    }
+                    sequencer.sequencerLastNote = noteToTrigger;
+                    break;
+            }
             
             // Create note event and send through handler chain
             NoteOnEvent event;
@@ -3771,9 +3942,6 @@ private:
             
             // Note: CC processing happens via subdivision loop, not here
             // This ensures proper timing aligned with subdivisions
-            
-            // Advance to next note in sequencer array
-            sequencer.sequencerNoteIndex = (sequencer.sequencerNoteIndex + 1) % sequencer.sequencerNotes.size();
             
             // Schedule note-off based on note length percentage (only when not using shift register)
             if (!shiftRegisterMode) {
@@ -3810,50 +3978,51 @@ void ProcessSequencerMidiSource() {
 
 // Common preset storage constants
 static const int PRESET_SECTOR = 2000;
-static const int PRESET_BUFFER_LENGTH = 128;
+static const int PRESET_BUFFER_LENGTH = 64;  // MAX_PANELS * 4 = 16 * 4
 static const int PRESET_TIMEOUT_MS = 5000;
 static const int PRESET_MAX_RETRIES = 3;
 
+// Shared preset buffer (saves stack space by reusing between Save/Load)
+static uint32_t presetBuffer[PRESET_BUFFER_LENGTH];
+
 bool SavePreset() {
-    uint32_t buffer[PRESET_BUFFER_LENGTH];
-    memset(buffer, 0, sizeof(buffer));
+    memset(presetBuffer, 0, sizeof(presetBuffer));
     
-    // Store all 32 knob normalizedValues (8 panels × 4 knobs)
+    // Store all knob normalizedValues (panelModesCount panels × 4 knobs)
     int idx = 0;
     for (int panel = 0; panel < panelModesCount; panel++) {
         for (int knob = 0; knob < 4; knob++) {
             int intValue = (int)(knobValues[panel][knob] * 100);
-            buffer[idx++] = (uint32_t)intValue;
+            presetBuffer[idx++] = (uint32_t)intValue;
         }
     }
     
     // Retry on write failure (retry count = 1)
     uint8_t result;
     for (int retry = 0; retry < 2; retry++) { // 2 attempts = 1 retry
-        result = BSP_SD_WriteBlocks(buffer, PRESET_SECTOR, 1, 2000); // 2 second timeout
+        result = BSP_SD_WriteBlocks(presetBuffer, PRESET_SECTOR, 1, 2000); // 2 second timeout
         if (result == MSD_OK) {
             SetDebugMessage("saved");
             return true;
         }
     }
     
-    SetDebugMessageF("save fail: %d", result);
+    // SetDebugMessageF("save fail: %d", result);
     return false;
 }
 
 bool LoadPreset() {
-    uint32_t buffer[PRESET_BUFFER_LENGTH];
-    uint8_t result = BSP_SD_ReadBlocks(buffer, PRESET_SECTOR, 1, PRESET_TIMEOUT_MS);
+    uint8_t result = BSP_SD_ReadBlocks(presetBuffer, PRESET_SECTOR, 1, PRESET_TIMEOUT_MS);
     if (result != MSD_OK) {
-        SetDebugMessageF("load fail: %d", result);
+        // SetDebugMessageF("load fail: %d", result);
         return false;
     }
     
-    // Load all knob normalizedValues (8 panels × 4 knobs)
+    // Load all knob normalizedValues (panelModesCount panels × 4 knobs)
     int idx = 0;
     for (int panel = 0; panel < panelModesCount; panel++) {
         for (int knob = 0; knob < 4; knob++) {
-            int intValue = (int)buffer[idx++];
+            int intValue = (int)presetBuffer[idx++];
             knobValues[panel][knob] = intValue / 100.0f;
         }
     }
