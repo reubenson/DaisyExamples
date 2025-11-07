@@ -3,13 +3,13 @@
 #include <stdint.h>
 
 // Maximum number of degrees in a Scala tuning
-#define MAX_SCALA_DEGREES 128
+#define MAX_SCALA_DEGREES 12
 
 // Structure to hold a Scala tuning
 struct ScalaTuning {
     const char* name;                    // Human-readable name
     uint8_t degreeCount;                 // Number of degrees in the scale
-    float degrees[MAX_SCALA_DEGREES];     // Cents values for each degree
+    float degrees[12];                   // Cents values for each degree (12-tone scales)
 };
 
 // Embedded tuning presets - common just intonation scales
