@@ -41,6 +41,77 @@ float delayReadPosR = 0.0f;  // Current read position offset for right channel
 // One-pole filter state for pluck-like damping (filter in feedback path)
 float delayFilterState = 0.0f;
 
+// ============================================================================
+// Parameter Configuration - Compile-Time Constants (Zero RAM Usage)
+// ============================================================================
+
+namespace ParamConfig {
+    // Delay parameters
+    static constexpr float DELAY_SHORT_MIN_MS = 0.05f;
+    static constexpr float DELAY_SHORT_MAX_MS = 25.0f;
+    static constexpr float DELAY_SHORT_RANGE_MS = DELAY_SHORT_MAX_MS - DELAY_SHORT_MIN_MS;
+    
+    static constexpr float BEAT_MULTIPLIERS[7] = {0.25f, 0.333333f, 0.5f, 1.0f, 2.0f, 3.0f, 4.0f};
+    static constexpr int NUM_BEAT_MULTIPLIERS = 7;
+    
+    // ADSR parameters
+    static constexpr float ADSR_MIN_MS = 0.1f;
+    static constexpr float ADSR_MAX_MS = 1500.0f;
+    
+    // Pan parameters
+    static constexpr float PAN_FREQ_MAX_HZ = 10.0f;
+    
+    // Compressor parameters
+    static constexpr float COMP_RATIO_MIN = 1.0f;
+    static constexpr float COMP_RATIO_MAX = 40.0f;
+    static constexpr float COMP_THRESHOLD_MIN_DB = -80.0f;
+    static constexpr float COMP_THRESHOLD_MAX_DB = 0.0f;
+    static constexpr float COMP_TIME_MIN_S = 0.001f;
+    static constexpr float COMP_TIME_MAX_S = 10.0f;
+    
+    // Sequencer parameters
+    static constexpr int SEQ_DENSITY_MAX = 16;
+    static constexpr int SEQ_ORDER_MODES = 6;
+}
+
+// ============================================================================
+// Parameter Transformation Helpers - Inline (Zero Function Call Overhead)
+// ============================================================================
+
+// Linear mapping: normalized (0-1) -> value (min-max)
+inline constexpr float LinearMap(float normalized, float min, float max) {
+    return min + (normalized * (max - min));
+}
+
+// Exponential mapping: normalized (0-1) -> value (min-max) with exponential curve
+inline constexpr float ExpMap(float normalized, float min, float max) {
+    return min + ((normalized * normalized) * (max - min));
+}
+
+// Logarithmic mapping: normalized (0-1) -> value (min-max) with log curve
+inline float LogMap(float normalized, float min, float max) {
+    return min * powf(max / min, normalized);
+}
+
+// Percentage formatter (0-100%)
+inline std::string FormatPercent(float normalized) {
+    return std::to_string(static_cast<int>(normalized * 100)) + "%";
+}
+
+// Milliseconds formatter
+inline std::string FormatMs(float ms) {
+    if (ms < 1.0f) {
+        int msInt = static_cast<int>(ms * 100);
+        if (msInt < 10) {
+            return "0.0" + std::to_string(msInt) + "ms";
+        } else {
+            return "0." + std::to_string(msInt) + "ms";
+        }
+    } else {
+        return std::to_string(static_cast<int>(ms)) + "ms";
+    }
+}
+
 // Custom oscillator class for waveform interpolation
 class InterpolatedOscillator {
 private:
@@ -393,6 +464,20 @@ struct SequencerParams {
 
 SequencerParams sequencer;
 
+// Delay time helper (centralized) - implemented after sequencer declaration
+inline float DelayTimeToMs(float normalizedTime, bool isShortMode) {
+    if (isShortMode) {
+        return LinearMap(normalizedTime, ParamConfig::DELAY_SHORT_MIN_MS, ParamConfig::DELAY_SHORT_MAX_MS);
+    } else {
+        // Long mode - BPM synced
+        int index = static_cast<int>(normalizedTime * (ParamConfig::NUM_BEAT_MULTIPLIERS - 0.01f));
+        index = std::max(0, std::min(ParamConfig::NUM_BEAT_MULTIPLIERS - 1, index));
+        float beatMultiplier = ParamConfig::BEAT_MULTIPLIERS[index];
+        float beatDuration = 60.0f / static_cast<float>(sequencer.clockBpm);
+        return beatMultiplier * beatDuration * 1000.0f;  // Convert to ms
+    }
+}
+
 // ============================================================================
 // State Management System - Centralized State Storage
 // ============================================================================
@@ -570,26 +655,10 @@ UserState appState;
 void UpdateDelayTime() {
     float mode = appState.delayMode;
     float time = appState.delayTime;
-    float delayTimeSamples;
     
-    if (mode < 0.5f) {
-        // Short mode: 0.25ms to 25ms linear
-        float delayMs = 0.25f + (time * 24.75f);  // 0.25ms to 25ms
-        delayTimeSamples = (delayMs / 1000.0f) * delaySampleRate;
-    } else {
-        // Long mode: BPM-synced (1/4, 1/3, 1/2, 1, 2, 3, 4 beats)
-        static const float beatMultipliers[7] = {0.25f, 0.333333f, 0.5f, 1.0f, 2.0f, 3.0f, 4.0f};
-        
-        // Map delayTime (0.0-1.0) to beat multiplier using nearest neighbor
-        int index = static_cast<int>(time * 6.99f);  // 0-6 for 7 values
-        index = std::max(0, std::min(6, index));
-        float beatMultiplier = beatMultipliers[index];
-        
-        // Calculate delay time in seconds based on BPM
-        float beatDuration = 60.0f / static_cast<float>(sequencer.clockBpm);  // seconds per beat
-        float delayTimeSeconds = beatMultiplier * beatDuration;
-        delayTimeSamples = delayTimeSeconds * delaySampleRate;
-    }
+    // Use centralized helper function
+    float delayMs = DelayTimeToMs(time, mode < 0.5f);
+    float delayTimeSamples = (delayMs / 1000.0f) * delaySampleRate;
     
     // Clamp delay time to valid range
     float maxDelay = static_cast<float>(MAX_DELAY_SAMPLES - 1);
@@ -976,8 +1045,8 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             {
                 // Convert normalized normalizedValue (0.0-1.0) to milliseconds
                 // Use exponential mapping for better control over short times
-                float attackMs = (normalizedValue * normalizedValue) * 1500.0f;
-                appState.adsrAttackMs = std::max(0.1f, std::min(1500.0f, attackMs));
+                float attackMs = ExpMap(normalizedValue, ParamConfig::ADSR_MIN_MS, ParamConfig::ADSR_MAX_MS);
+                appState.adsrAttackMs = std::max(ParamConfig::ADSR_MIN_MS, std::min(ParamConfig::ADSR_MAX_MS, attackMs));
                 
                 // Apply to all envelopes (convert ms to seconds)
                 for (int i = 0; i < 4; i++) {
@@ -991,8 +1060,8 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             {
                 // Convert normalized normalizedValue (0.0-1.0) to milliseconds
                 // Use exponential mapping for better control over short times
-                float decayMs = (normalizedValue * normalizedValue) * 1500.0f;
-                appState.adsrDecayReleaseMs = std::max(0.1f, std::min(1500.0f, decayMs));
+                float decayMs = ExpMap(normalizedValue, ParamConfig::ADSR_MIN_MS, ParamConfig::ADSR_MAX_MS);
+                appState.adsrDecayReleaseMs = std::max(ParamConfig::ADSR_MIN_MS, std::min(ParamConfig::ADSR_MAX_MS, decayMs));
                 
                 // Apply to all envelopes (convert ms to seconds)
                 for (int i = 0; i < 4; i++) {
@@ -1021,7 +1090,7 @@ void SetParamValue(ParamId paramId, float normalizedValue)
         // MIXER Panel
         case PARAM_PAN_FREQ:
             appState.panFreq = normalizedValue;
-            panFreq = normalizedValue * 10.0f;  // Map to 0-10Hz
+            panFreq = LinearMap(normalizedValue, 0.0f, ParamConfig::PAN_FREQ_MAX_HZ);
             panLfo.SetFreq(panFreq);
             break;
             
@@ -2214,29 +2283,29 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
     if (panelId == 'e') {
         switch(paramIndex) {
             case 0: // Attack time - convert normalized value to milliseconds
-                return std::to_string(static_cast<int>(appState.adsrAttackMs)) + "ms";
+                return FormatMs(appState.adsrAttackMs);
             case 1: // Decay/Release time - convert normalized value to milliseconds
-                return std::to_string(static_cast<int>(appState.adsrDecayReleaseMs)) + "ms";
+                return FormatMs(appState.adsrDecayReleaseMs);
             case 2: // Sustain level
-                return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
+                return FormatPercent(normalizedValue);
             case 3: // Minimum level
-                return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
+                return FormatPercent(normalizedValue);
             default: return "0%";
         }
     }
     else if (panelId == 'm') {
         switch(paramIndex) {
             case 0: // Frequency
-                return std::to_string(static_cast<int>(normalizedValue * 10)) + "Hz";
+                return std::to_string(static_cast<int>(LinearMap(normalizedValue, 0.0f, ParamConfig::PAN_FREQ_MAX_HZ))) + "Hz";
             case 1: // Amplitude
-                return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
+                return FormatPercent(normalizedValue);
             case 2: // Waveform
                 if (normalizedValue < 0.25f) return "Sine";
                 else if (normalizedValue < 0.5f) return "Tri";
                 else if (normalizedValue < 0.75f) return "Sqr";
                 else return "Saw";
             case 3: // Volume
-                return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
+                return FormatPercent(normalizedValue);
             default: return "0%";
         }
     }
@@ -2328,7 +2397,7 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
     else if (panelId == 's') {
         switch(paramIndex) {
             case 0: // Density
-                return std::to_string(static_cast<int>(normalizedValue * 16)) + "/16";
+                return std::to_string(static_cast<int>(normalizedValue * ParamConfig::SEQ_DENSITY_MAX)) + "/" + std::to_string(ParamConfig::SEQ_DENSITY_MAX);
             case 1: // Order
                 {
                     // Map normalized value (0.0-1.0) to 6 modes
@@ -2347,7 +2416,7 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                     }
                 }
             case 2: // Length
-                return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
+                return FormatPercent(normalizedValue);
             case 3: // BPM
                 {
                     // Map 0-1 to CLOCK_BPM_MIN-CLOCK_BPM_MAX and quantize to multiple of 5
@@ -2407,26 +2476,17 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                 {
                     // Check if we're in short or long mode
                     float mode = GetParamValue(PARAM_DELAY_MODE);
-                    if (mode < 0.5f) {
-                        // Short mode: show milliseconds (0.25ms to 25ms)
-                        float delayMs = 0.25f + (normalizedValue * 24.75f);
-                        // Format with 2 decimal places for small values
-                        if (delayMs < 1.0f) {
-                            int msInt = static_cast<int>(delayMs * 100);  // Convert to 0.xx format
-                            if (msInt < 10) {
-                                return "0.0" + std::to_string(msInt) + "ms";
-                            } else {
-                                return "0." + std::to_string(msInt) + "ms";
-                            }
-                        } else {
-                            return std::to_string(static_cast<int>(delayMs)) + "ms";
-                        }
+                    bool isShortMode = mode < 0.5f;
+                    
+                    if (isShortMode) {
+                        // Short mode: use centralized helper
+                        float delayMs = DelayTimeToMs(normalizedValue, true);
+                        return FormatMs(delayMs);
                     } else {
                         // Long mode: show beat fraction
-                        float beatMultipliers[7] = {0.25f, 0.333333f, 0.5f, 1.0f, 2.0f, 3.0f, 4.0f};
-                        int index = static_cast<int>(normalizedValue * 6.99f);
-                        index = std::max(0, std::min(6, index));
-                        float beatMult = beatMultipliers[index];
+                        int index = static_cast<int>(normalizedValue * (ParamConfig::NUM_BEAT_MULTIPLIERS - 0.01f));
+                        index = std::max(0, std::min(ParamConfig::NUM_BEAT_MULTIPLIERS - 1, index));
+                        float beatMult = ParamConfig::BEAT_MULTIPLIERS[index];
                         
                         // Format as fraction or whole number
                         if (index == 0) return "1/4";
@@ -2436,9 +2496,9 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                     }
                 }
             case 2: // Damp
-                return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
+                return FormatPercent(normalizedValue);
             case 3: // Wet/Dry
-                return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
+                return FormatPercent(normalizedValue);
             default: return "0%";
         }
     }
