@@ -38,6 +38,9 @@ float currentDelayTimeSamples = 0.0f;  // Cached delay time in samples
 float delayReadPosL = 0.0f;  // Current read position offset for left channel
 float delayReadPosR = 0.0f;  // Current read position offset for right channel
 
+// One-pole filter state for pluck-like damping (filter in feedback path)
+float delayFilterState = 0.0f;
+
 // Custom oscillator class for waveform interpolation
 class InterpolatedOscillator {
 private:
@@ -450,7 +453,7 @@ enum ParamId {
     // DELAY Panel
     PARAM_DELAY_MODE,
     PARAM_DELAY_TIME,
-    PARAM_DELAY_FEEDBACK,
+    PARAM_DELAY_DAMP,
     PARAM_DELAY_WETDRY,
     
     PARAM_NONE  // Used for unbound knobs
@@ -513,7 +516,7 @@ struct UserState {
     // DELAY parameters
     float delayMode;           // 0.0-1.0 (short=0.0-0.5, long=0.5-1.0)
     float delayTime;           // 0.0-1.0 normalized delay time
-    float delayFeedback;       // 0.0-1.0 feedback amount
+    float delayDamp;           // 0.0-1.0 damping coefficient (pluck-like filter)
     float delayWetDry;         // 0.0-1.0 wet/dry mix
     
     // Constructor with default normalizedValues
@@ -555,7 +558,7 @@ struct UserState {
         compRelease(0.05f),      // Default 0.1s release
         delayMode(0.0f),        // Default short mode
         delayTime(0.5f),        // Default 50% delay time
-        delayFeedback(0.3f),    // Default 30% feedback
+        delayDamp(0.3f),        // Default 30% damping (pluck-like filter)
         delayWetDry(0.3f)       // Default 30% wet mix
     {}
 };
@@ -570,8 +573,8 @@ void UpdateDelayTime() {
     float delayTimeSamples;
     
     if (mode < 0.5f) {
-        // Short mode: 0.05ms to 50ms linear
-        float delayMs = 0.05f + (time * 49.95f);  // 0.05ms to 50ms
+        // Short mode: 0.25ms to 25ms linear
+        float delayMs = 0.25f + (time * 24.75f);  // 0.25ms to 25ms
         delayTimeSamples = (delayMs / 1000.0f) * delaySampleRate;
     } else {
         // Long mode: BPM-synced (1/4, 1/3, 1/2, 1, 2, 3, 4 beats)
@@ -716,10 +719,10 @@ panelStruct displayPanels[] = {
         id: 'd',
         input1Name: "Mode",
         input2Name: "Time",
-        input3Name: "Feed",
+        input3Name: "Damp",
         input4Name: "Mix",
         normalizedValues: {0.0f, 0.5f, 0.3f, 0.3f},
-        bindings: {PARAM_DELAY_MODE, PARAM_DELAY_TIME, PARAM_DELAY_FEEDBACK, PARAM_DELAY_WETDRY}
+        bindings: {PARAM_DELAY_MODE, PARAM_DELAY_TIME, PARAM_DELAY_DAMP, PARAM_DELAY_WETDRY}
     },
     {
         name: "SAVE",
@@ -755,7 +758,7 @@ float knobValues[10][4] = {  // panelModesCount = 10
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 5: SAMPLER
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 6: MULT 
     {0.25f, 0.6f, 0.01f, 0.05f}, // Panel 7: COMP
-    {0.0f, 0.5f, 0.3f, 0.3f},  // Panel 8: DELAY
+    {0.0f, 0.5f, 0.3f, 0.3f},  // Panel 8: DELAY (Mode, Time, Damp, Mix)
     {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 9: PRESET
     // Remaining panels initialized to {0.0f, 0.0f, 0.0f, 0.0f} by default
 };
@@ -957,7 +960,7 @@ float GetParamValue(ParamId paramId)
         // DELAY Panel
         case PARAM_DELAY_MODE:         return appState.delayMode;
         case PARAM_DELAY_TIME:         return appState.delayTime;
-        case PARAM_DELAY_FEEDBACK:     return appState.delayFeedback;
+        case PARAM_DELAY_DAMP:         return appState.delayDamp;
         case PARAM_DELAY_WETDRY:       return appState.delayWetDry;
         
         case PARAM_NONE:
@@ -1414,9 +1417,9 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             UpdateDelayTime();  // Recalculate delay time when time changes
             break;
             
-        case PARAM_DELAY_FEEDBACK:
-            appState.delayFeedback = normalizedValue;
-            // Feedback is read in ApplyDelay() - no action needed here
+        case PARAM_DELAY_DAMP:
+            appState.delayDamp = normalizedValue;
+            // Damping is read in ApplyDelay() - no action needed here
             break;
             
         case PARAM_DELAY_WETDRY:
@@ -1526,8 +1529,13 @@ void ApplyCompression(float* data) {
 
 void ApplyDelay(float* data) {
     // Read delay parameters from UserState
-    float feedback = appState.delayFeedback;
+    float dampCoeff = appState.delayDamp;  // Damping coefficient (0.0-1.0)
     float wetDry = appState.delayWetDry;
+    
+    // Use damping coefficient to derive feedback amount
+    // Higher damping = lower feedback (more pluck-like decay)
+    // Map 0.0-1.0 damping to 0.3-0.95 feedback range
+    float feedback = 1.f - (dampCoeff * 0.65f);
     
     // Smoothly move read positions toward target delay time
     // This allows smooth modulation without clicks/pops
@@ -1545,6 +1553,13 @@ void ApplyDelay(float* data) {
     // Read from delay lines using fractional positions (Hermite interpolation for better quality)
     float leftDelayed = delayL.ReadHermite(delayReadPosL);
     float rightDelayed = delayR.ReadHermite(delayReadPosR);
+    
+    // Apply one-pole lowpass filter in feedback path (pluck-like damping)
+    // This creates the natural decay characteristic similar to pluck algorithm
+    // Filter coefficient: higher dampCoeff = more filtering = faster decay
+    float filterCoeff = dampCoeff * 0.9f;  // Scale to 0.0-0.9 for stable filtering
+    leftDelayed = delayFilterState = leftDelayed * (1.0f - filterCoeff) + delayFilterState * filterCoeff;
+    rightDelayed = delayFilterState = rightDelayed * (1.0f - filterCoeff) + delayFilterState * filterCoeff;
     
     // Process left channel
     float leftIn = data[0];
@@ -2050,6 +2065,7 @@ int main(void)
     delayR.Init();
     delayL.Reset();
     delayR.Reset();
+    delayFilterState = 0.0f;  // Initialize filter state for pluck-like damping
     UpdateDelayTime();  // Initialize delay time calculation (also sets read positions)
     
     // Initialize interpolated oscillators for all 4 voices
@@ -2392,8 +2408,8 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                     // Check if we're in short or long mode
                     float mode = GetParamValue(PARAM_DELAY_MODE);
                     if (mode < 0.5f) {
-                        // Short mode: show milliseconds (0.05ms to 50ms)
-                        float delayMs = 0.05f + (normalizedValue * 49.95f);
+                        // Short mode: show milliseconds (0.25ms to 25ms)
+                        float delayMs = 0.25f + (normalizedValue * 24.75f);
                         // Format with 2 decimal places for small values
                         if (delayMs < 1.0f) {
                             int msInt = static_cast<int>(delayMs * 100);  // Convert to 0.xx format
@@ -2419,7 +2435,7 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                         return std::to_string(static_cast<int>(beatMult));
                     }
                 }
-            case 2: // Feedback
+            case 2: // Damp
                 return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
             case 3: // Wet/Dry
                 return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
