@@ -11,6 +11,7 @@
 #include "tuning/TuningCalculator.h"
 #include "ScreenUtils.h"
 #include "util/bsp_sd_diskio.h"
+#include "Microsound.h"
 
 // Font aliases
 #define font_s Font_6x8    // 6x8 pixels - small, good for labels and compact info
@@ -25,6 +26,8 @@ Fm2             osc1, osc2;
 Oscillator      pan, lfo1, lfo2, lfo3;
 SdmmcHandler    sdcard;
 Compressor      compressor;
+microsound::PulsarSynth pulsarSynth;
+int8_t microsoundNote = 60;  // Current MIDI note for microsound
 
 // Delay lines for stereo delay effect
 // Maximum delay: 600ms at 48kHz = 28800 samples, use 30000 for safety margin
@@ -34,12 +37,19 @@ DelayLine<float, MAX_DELAY_SAMPLES> delayR;
 float delaySampleRate = 48000.0f;
 float currentDelayTimeSamples = 0.0f;  // Cached delay time in samples
 
+// Microsound ring buffer - separate from delay for stability
+// 500ms buffer at 48kHz = 24000 samples (enough for 50-200ms grain reads)
+static constexpr size_t MICROSOUND_BUFFER_SIZE = 24000;
+DelayLine<float, MICROSOUND_BUFFER_SIZE> microsoundBufferL;
+DelayLine<float, MICROSOUND_BUFFER_SIZE> microsoundBufferR;
+
 // Resampling delay read positions (offset from write pointer in samples, can be fractional)
 float delayReadPosL = 0.0f;  // Current read position offset for left channel
 float delayReadPosR = 0.0f;  // Current read position offset for right channel
 
-// One-pole filter state for pluck-like damping (filter in feedback path)
-float delayFilterState = 0.0f;
+// One-pole filter states for pluck-like damping (separate for stereo)
+float delayFilterStateL = 0.0f;
+float delayFilterStateR = 0.0f;
 
 // ============================================================================
 // Parameter Configuration - Compile-Time Constants (Zero RAM Usage)
@@ -541,6 +551,12 @@ enum ParamId {
     PARAM_DELAY_DAMP,
     PARAM_DELAY_WETDRY,
     
+    // MICROSOUND Panel
+    PARAM_MICRO_PULSARET_LENGTH,
+    PARAM_MICRO_PULSE_WIDTH,
+    PARAM_MICRO_MODULATION,
+    PARAM_MICRO_WETDRY,
+    
     PARAM_NONE  // Used for unbound knobs
 };
 
@@ -604,6 +620,12 @@ struct UserState {
     float delayDamp;           // 0.0-1.0 damping coefficient (pluck-like filter)
     float delayWetDry;         // 0.0-1.0 wet/dry mix
     
+    // MICROSOUND parameters
+    float microPulsaretLength;  // 0.0-1.0 maps to 1-100ms
+    float microPulseWidth;      // 0.0-1.0 duty cycle
+    float microModulation;      // 0.0-1.0 texture parameter
+    float microWetDry;          // 0.0-1.0 wet/dry mix
+    
     // Constructor with default normalizedValues
     UserState() :
         adsrAttackMs(0.1f),         // 0.1ms attack
@@ -644,7 +666,11 @@ struct UserState {
         delayMode(0.0f),        // Default short mode
         delayTime(0.5f),        // Default 50% delay time
         delayDamp(0.3f),        // Default 30% damping (pluck-like filter)
-        delayWetDry(0.3f)       // Default 30% wet mix
+        delayWetDry(0.3f),      // Default 30% wet mix
+        microPulsaretLength(0.2f),  // Default 20ms (0.2 maps to ~20ms in 1-100ms range)
+        microPulseWidth(0.5f),      // Default 50% duty cycle
+        microModulation(0.0f),      // Default no modulation
+        microWetDry(0.0f)           // Default 0% wet (fully dry - no microsound)
     {}
 };
 
@@ -802,6 +828,17 @@ panelStruct displayPanels[] = {
         input4Name: "",
         normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
         bindings: {PARAM_NONE, PARAM_NONE, PARAM_NONE, PARAM_NONE}
+    },
+    {
+        name: "MICRO",
+        id: 'g',
+        input1Name: "PLen",
+        input2Name: "PWid",
+        input3Name: "Mod",
+        input4Name: "Mix",
+        normalizedValues: {0.2f, 0.5f, 0.0f, 0.0f},
+        bindings: {PARAM_MICRO_PULSARET_LENGTH, PARAM_MICRO_PULSE_WIDTH, 
+                   PARAM_MICRO_MODULATION, PARAM_MICRO_WETDRY}
     }
 };
 
@@ -818,7 +855,7 @@ bool knobCaughtUp[4] = {false, false, false, false};  // Track if knob has caugh
 
 // Global knob normalizedValues storage - stores all knob positions for all panels (0.0-1.0 normalized)
 // Size matches actual panel count to save memory
-float knobValues[10][4] = {  // panelModesCount = 10
+float knobValues[11][4] = {  // panelModesCount = 11
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 0: ADSR
     {0.0f, 0.0f, 0.0f, 0.8f},  // Panel 1: MIXER
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 2: OSC
@@ -828,8 +865,8 @@ float knobValues[10][4] = {  // panelModesCount = 10
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 6: MULT 
     {0.25f, 0.6f, 0.01f, 0.05f}, // Panel 7: COMP
     {0.0f, 0.5f, 0.3f, 0.3f},  // Panel 8: DELAY (Mode, Time, Damp, Mix)
-    {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 9: PRESET
-    // Remaining panels initialized to {0.0f, 0.0f, 0.0f, 0.0f} by default
+    {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 9: PRESET
+    {0.2f, 0.5f, 0.0f, 0.0f}   // Panel 10: MICRO (PLen, PWid, Mod, Mix)
 };
 const float KNOB_CATCHUP_THRESHOLD = 0.05f;  // How close knob must be to catch up (5%)
 
@@ -868,6 +905,7 @@ void      ProcessControls();
 void      ApplyVCAs();
 void      ApplyPanning(float* data);
 void      ApplyCompression(float* data);
+void      ApplyMicrosound(float* data);
 void      ApplyDelay(float* data);
 void      UpdateDelayTime();
 void      UpdateOled();
@@ -1031,6 +1069,12 @@ float GetParamValue(ParamId paramId)
         case PARAM_DELAY_TIME:         return appState.delayTime;
         case PARAM_DELAY_DAMP:         return appState.delayDamp;
         case PARAM_DELAY_WETDRY:       return appState.delayWetDry;
+        
+        // MICROSOUND Panel
+        case PARAM_MICRO_PULSARET_LENGTH: return appState.microPulsaretLength;
+        case PARAM_MICRO_PULSE_WIDTH:     return appState.microPulseWidth;
+        case PARAM_MICRO_MODULATION:      return appState.microModulation;
+        case PARAM_MICRO_WETDRY:          return appState.microWetDry;
         
         case PARAM_NONE:
         default:                        return 0.0f;
@@ -1496,6 +1540,28 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             // Wet/dry mix is read in ApplyDelay() - no action needed here
             break;
         
+        // MICROSOUND Panel
+        case PARAM_MICRO_PULSARET_LENGTH:
+            appState.microPulsaretLength = normalizedValue;
+            // Map to 5-50ms range (longer minimum reduces noise)
+            pulsarSynth.SetPulsaretLength(5.0f + normalizedValue * 45.0f);
+            break;
+            
+        case PARAM_MICRO_PULSE_WIDTH:
+            appState.microPulseWidth = normalizedValue;
+            pulsarSynth.SetPulseWidth(normalizedValue);
+            break;
+            
+        case PARAM_MICRO_MODULATION:
+            appState.microModulation = normalizedValue;
+            pulsarSynth.SetModulation(normalizedValue);
+            break;
+            
+        case PARAM_MICRO_WETDRY:
+            appState.microWetDry = normalizedValue;
+            // Wet/dry mixing now happens in ApplyMicrosound, not in PulsarSynth
+            break;
+        
         case PARAM_NONE:
         default:
             break;
@@ -1596,6 +1662,75 @@ void ApplyCompression(float* data) {
     data[3] = compressor.Process(data[3]);
 }
 
+void ApplyMicrosound(float* data) {
+    // Static filter states for smoothing and lowpass
+    static float prevMicroL = 0.0f;
+    static float prevMicroR = 0.0f;
+    static float lpfStateL = 0.0f;
+    static float lpfStateR = 0.0f;
+    
+    // Get wet/dry parameter
+    float wetDry = appState.microWetDry;
+    
+    // Skip ALL processing if wet/dry is 0 (fully dry)
+    // This ensures no interference with the normal signal path
+    if (wetDry <= 0.0f) {
+        prevMicroL = 0.0f;
+        prevMicroR = 0.0f;
+        lpfStateL = 0.0f;
+        lpfStateR = 0.0f;
+        return;  // Pass through unchanged
+    }
+    
+    // Write current audio to microsound buffer (only when active)
+    microsoundBufferL.Write(data[0]);
+    microsoundBufferR.Write(data[1]);
+    
+    // Update microsound frequency to track voice 0's current note
+    if (voices[0].note > 0) {
+        float microsoundFreq = MidiNoteToFrequency(voices[0].note, 1);
+        pulsarSynth.SetFrequency(microsoundFreq);
+        microsoundNote = voices[0].note;
+    }
+    
+    float microL = 0.0f;
+    float microR = 0.0f;
+    
+    // Process microsound by reading from dedicated microsound buffers
+    pulsarSynth.Process(microsoundBufferL, microsoundBufferR, microL, microR);
+    
+    // Check for invalid values
+    if (!std::isfinite(microL)) microL = 0.0f;
+    if (!std::isfinite(microR)) microR = 0.0f;
+    
+    // Apply simple one-pole lowpass filter to reduce high-frequency noise
+    // Cutoff ~5kHz at 48kHz sample rate
+    float lpfCoeff = 0.6f;  // Higher = more filtering
+    lpfStateL = microL * (1.0f - lpfCoeff) + lpfStateL * lpfCoeff;
+    lpfStateR = microR * (1.0f - lpfCoeff) + lpfStateR * lpfCoeff;
+    microL = lpfStateL;
+    microR = lpfStateR;
+    
+    // Apply moderate gain (1.0x - same as input), then clip
+    microL *= 1.0f;
+    microR *= 1.0f;
+    microL = std::max(-1.0f, std::min(microL, 1.0f));
+    microR = std::max(-1.0f, std::min(microR, 1.0f));
+    
+    // Apply gentle smoothing for envelope continuity
+    float alpha = 0.3f;
+    microL = prevMicroL * (1.0f - alpha) + microL * alpha;
+    microR = prevMicroR * (1.0f - alpha) + microR * alpha;
+    prevMicroL = microL;
+    prevMicroR = microR;
+    
+    // Apply wet/dry mixing
+    float dryL = data[0];
+    float dryR = data[1];
+    data[0] = dryL * (1.0f - wetDry) + microL * wetDry;
+    data[1] = dryR * (1.0f - wetDry) + microR * wetDry;
+}
+
 void ApplyDelay(float* data) {
     // Read delay parameters from UserState
     float dampCoeff = appState.delayDamp;  // Damping coefficient (0.0-1.0)
@@ -1603,13 +1738,11 @@ void ApplyDelay(float* data) {
     
     // Use damping coefficient to derive feedback amount
     // Higher damping = lower feedback (more pluck-like decay)
-    // Map 0.0-1.0 damping to 0.3-0.95 feedback range
-    float feedback = 1.f - (dampCoeff * 0.65f);
+    float feedback = 1.0f - (dampCoeff * 0.65f);
     
     // Smoothly move read positions toward target delay time
-    // This allows smooth modulation without clicks/pops
     float targetDelay = currentDelayTimeSamples;
-    float smoothingFactor = 0.01f;  // Smoothing rate (smaller = smoother but slower)
+    float smoothingFactor = 0.01f;
     
     delayReadPosL += (targetDelay - delayReadPosL) * smoothingFactor;
     delayReadPosR += (targetDelay - delayReadPosR) * smoothingFactor;
@@ -1619,35 +1752,39 @@ void ApplyDelay(float* data) {
     delayReadPosL = std::max(1.0f, std::min(delayReadPosL, maxDelay));
     delayReadPosR = std::max(1.0f, std::min(delayReadPosR, maxDelay));
     
-    // Read from delay lines using fractional positions (Hermite interpolation for better quality)
+    // Read from delay lines using fractional positions
     float leftDelayed = delayL.ReadHermite(delayReadPosL);
     float rightDelayed = delayR.ReadHermite(delayReadPosR);
     
+    // Safety check for invalid values
+    if (!std::isfinite(leftDelayed)) leftDelayed = 0.0f;
+    if (!std::isfinite(rightDelayed)) rightDelayed = 0.0f;
+    
     // Apply one-pole lowpass filter in feedback path (pluck-like damping)
-    // This creates the natural decay characteristic similar to pluck algorithm
-    // Filter coefficient: higher dampCoeff = more filtering = faster decay
-    float filterCoeff = dampCoeff * 0.9f;  // Scale to 0.0-0.9 for stable filtering
-    leftDelayed = delayFilterState = leftDelayed * (1.0f - filterCoeff) + delayFilterState * filterCoeff;
-    rightDelayed = delayFilterState = rightDelayed * (1.0f - filterCoeff) + delayFilterState * filterCoeff;
+    // IMPORTANT: Use separate filter states for left and right channels
+    float filterCoeff = dampCoeff * 0.9f;
+    float filteredL = leftDelayed * (1.0f - filterCoeff) + delayFilterStateL * filterCoeff;
+    float filteredR = rightDelayed * (1.0f - filterCoeff) + delayFilterStateR * filterCoeff;
+    delayFilterStateL = filteredL;  // Update left filter state
+    delayFilterStateR = filteredR;  // Update right filter state
     
     // Process left channel
     float leftIn = data[0];
-    float leftFeedback = leftIn + (leftDelayed * feedback);
+    float leftFeedback = leftIn + (filteredL * feedback);
     delayL.Write(leftFeedback);
     
     // Process right channel
     float rightIn = data[1];
-    float rightFeedback = rightIn + (rightDelayed * feedback);
+    float rightFeedback = rightIn + (filteredR * feedback);
     delayR.Write(rightFeedback);
     
     // Mix wet/dry
-    float dryL = leftIn;
-    float wetL = leftDelayed;
-    data[0] = (dryL * (1.0f - wetDry)) + (wetL * wetDry);
+    data[0] = (leftIn * (1.0f - wetDry)) + (filteredL * wetDry);
+    data[1] = (rightIn * (1.0f - wetDry)) + (filteredR * wetDry);
     
-    float dryR = rightIn;
-    float wetR = rightDelayed;
-    data[1] = (dryR * (1.0f - wetDry)) + (wetR * wetDry);
+    // Final safety check
+    if (!std::isfinite(data[0])) data[0] = 0.0f;
+    if (!std::isfinite(data[1])) data[1] = 0.0f;
 }
 
 float IncrementTowards(float normalizedValue, float target)
@@ -1861,7 +1998,10 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         // Panel 3 - Panning and mixing
         ApplyPanning(results);
 
-        // Panel 4 - Delay effect
+        // Panel 4 - Microsound (reads from separate microsound buffer, mixes into results)
+        ApplyMicrosound(results);
+
+        // Panel 5 - Delay effect (independent from microsound)
         ApplyDelay(results);
 
         // plucksApply(results);
@@ -2134,8 +2274,36 @@ int main(void)
     delayR.Init();
     delayL.Reset();
     delayR.Reset();
-    delayFilterState = 0.0f;  // Initialize filter state for pluck-like damping
+    
+    // Clear delay buffers by writing zeros
+    for (size_t i = 0; i < MAX_DELAY_SAMPLES; i++) {
+        delayL.Write(0.0f);
+        delayR.Write(0.0f);
+    }
+    
+    delayFilterStateL = 0.0f;  // Initialize filter states for pluck-like damping
+    delayFilterStateR = 0.0f;
     UpdateDelayTime();  // Initialize delay time calculation (also sets read positions)
+    
+    // Initialize microsound buffers (separate from delay for stability)
+    microsoundBufferL.Init();
+    microsoundBufferR.Init();
+    microsoundBufferL.Reset();
+    microsoundBufferR.Reset();
+    
+    // Clear microsound buffers by writing zeros
+    for (size_t i = 0; i < MICROSOUND_BUFFER_SIZE; i++) {
+        microsoundBufferL.Write(0.0f);
+        microsoundBufferR.Write(0.0f);
+    }
+    
+    // Initialize microsound
+    pulsarSynth.Init(samplerate);
+    pulsarSynth.SetFrequency(MidiNoteToFrequency(60, 1));  // Default middle C
+    pulsarSynth.SetPulsaretLength(10.0f);  // Default 10ms (mid-range)
+    pulsarSynth.SetPulseWidth(0.7f);       // Default 70% (audible but not overwhelming)
+    pulsarSynth.SetModulation(0.0f);       // Default no modulation
+    pulsarSynth.SetWetDry(0.0f);           // Default 0% wet (fully dry)
     
     // Initialize interpolated oscillators for all 4 voices
     for (int i = 0; i < 4; i++) {
