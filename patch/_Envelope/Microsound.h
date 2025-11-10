@@ -59,22 +59,18 @@ public:
             }
             
             // Set buffer read position based on a fixed delay time
-            // Read from ~100ms back with minimal variation
+            // Modulation provides direct control over read position
             float sample_rate = sample_rate_;
-            float base_delay_ms = 100.0f;  // Base delay of 100ms
+            float base_delay_ms = 35.0f;  // Base delay of 35ms (when Mod = 0) - ultra-low latency
             
-            // Modulation adds subtle position variation (±20ms)
-            float mod_delay_ms = 20.0f * modulation_;
+            // Modulation controls position: 0 = 35ms back, 1.0 = 60ms back
+            float mod_delay_ms = 25.0f * modulation_;
+            float delay_time_ms = base_delay_ms + mod_delay_ms;
             
-            // Small pseudo-random variation for texture
-            float phase_hash = sinf(fundamental_phase_ * 12.9898f) * 43758.5453f;
-            phase_hash = phase_hash - floorf(phase_hash);  // Get fractional part (0-1)
-            
-            float delay_time_ms = base_delay_ms + mod_delay_ms * (phase_hash * 2.0f - 1.0f);
             buffer_read_pos_ = (delay_time_ms / 1000.0f) * sample_rate;
             
-            // Clamp to safe range (80-120ms)
-            buffer_read_pos_ = std::max(sample_rate * 0.08f, std::min(buffer_read_pos_, sample_rate * 0.12f));
+            // Clamp to safe range (35-60ms) - 5ms buffer over max grain size (30ms)
+            buffer_read_pos_ = std::max(sample_rate * 0.035f, std::min(buffer_read_pos_, sample_rate * 0.06f));
         }
         
         // Process active pulsaret
@@ -88,9 +84,8 @@ public:
             window *= pw_scale;
             
             // Read from delay lines
-            // Playback speed is affected by modulation for pitch variation
-            // Subtle pitch shifting: 0.8x to 1.2x speed
-            float playback_speed = 0.8f + modulation_ * 0.4f;
+            // Fixed playback speed (1.0x) for faithful reproduction without pitch shifting
+            float playback_speed = 1.0f;
             float read_offset = pulsaret_phase_ * pulsaret_samples_ * playback_speed;
             float read_pos = buffer_read_pos_ + read_offset;
             
@@ -104,9 +99,9 @@ public:
             // Final safety clamp
             read_pos = std::max(1.0f, std::min(read_pos, static_cast<float>(max_size - 1)));
             
-            // Read samples with interpolation using DelayLine's Read method
-            float grain_L = delayL.Read(read_pos);
-            float grain_R = delayR.Read(read_pos);
+            // Read samples with Hermite interpolation for higher quality
+            float grain_L = delayL.ReadHermite(read_pos);
+            float grain_R = delayR.ReadHermite(read_pos);
             
             // Apply window to output (wet/dry mixing happens in ApplyMicrosound)
             outL = grain_L * window;

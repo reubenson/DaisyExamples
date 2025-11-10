@@ -1543,8 +1543,8 @@ void SetParamValue(ParamId paramId, float normalizedValue)
         // MICROSOUND Panel
         case PARAM_MICRO_PULSARET_LENGTH:
             appState.microPulsaretLength = normalizedValue;
-            // Map to 5-50ms range (longer minimum reduces noise)
-            pulsarSynth.SetPulsaretLength(5.0f + normalizedValue * 45.0f);
+            // Map to 2-30ms range for tight, responsive grains
+            pulsarSynth.SetPulsaretLength(2.0f + normalizedValue * 28.0f);
             break;
             
         case PARAM_MICRO_PULSE_WIDTH:
@@ -1663,22 +1663,12 @@ void ApplyCompression(float* data) {
 }
 
 void ApplyMicrosound(float* data) {
-    // Static filter states for smoothing and lowpass
-    static float prevMicroL = 0.0f;
-    static float prevMicroR = 0.0f;
-    static float lpfStateL = 0.0f;
-    static float lpfStateR = 0.0f;
-    
     // Get wet/dry parameter
     float wetDry = appState.microWetDry;
     
     // Skip ALL processing if wet/dry is 0 (fully dry)
     // This ensures no interference with the normal signal path
     if (wetDry <= 0.0f) {
-        prevMicroL = 0.0f;
-        prevMicroR = 0.0f;
-        lpfStateL = 0.0f;
-        lpfStateR = 0.0f;
         return;  // Pass through unchanged
     }
     
@@ -1686,11 +1676,12 @@ void ApplyMicrosound(float* data) {
     microsoundBufferL.Write(data[0]);
     microsoundBufferR.Write(data[1]);
     
-    // Update microsound frequency to track voice 0's current note
-    if (voices[0].note > 0) {
-        float microsoundFreq = MidiNoteToFrequency(voices[0].note, 1);
+    // Update microsound frequency to track the most recently played note
+    // Uses currentNote which is updated by the Intellijel handler
+    if (currentNote > 0) {
+        float microsoundFreq = MidiNoteToFrequency(currentNote, 1);
         pulsarSynth.SetFrequency(microsoundFreq);
-        microsoundNote = voices[0].note;
+        microsoundNote = currentNote;
     }
     
     float microL = 0.0f;
@@ -1703,26 +1694,11 @@ void ApplyMicrosound(float* data) {
     if (!std::isfinite(microL)) microL = 0.0f;
     if (!std::isfinite(microR)) microR = 0.0f;
     
-    // Apply simple one-pole lowpass filter to reduce high-frequency noise
-    // Cutoff ~5kHz at 48kHz sample rate
-    float lpfCoeff = 0.6f;  // Higher = more filtering
-    lpfStateL = microL * (1.0f - lpfCoeff) + lpfStateL * lpfCoeff;
-    lpfStateR = microR * (1.0f - lpfCoeff) + lpfStateR * lpfCoeff;
-    microL = lpfStateL;
-    microR = lpfStateR;
-    
     // Apply moderate gain (1.0x - same as input), then clip
     microL *= 1.0f;
     microR *= 1.0f;
     microL = std::max(-1.0f, std::min(microL, 1.0f));
     microR = std::max(-1.0f, std::min(microR, 1.0f));
-    
-    // Apply gentle smoothing for envelope continuity
-    float alpha = 0.3f;
-    microL = prevMicroL * (1.0f - alpha) + microL * alpha;
-    microR = prevMicroR * (1.0f - alpha) + microR * alpha;
-    prevMicroL = microL;
-    prevMicroR = microR;
     
     // Apply wet/dry mixing
     float dryL = data[0];

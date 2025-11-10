@@ -29,11 +29,11 @@ void PulsarSynth::SetFrequency(float freq) {
 }
 
 void PulsarSynth::SetPulsaretLength(float length_ms) {
-    // Clamp to 5-50ms range (longer minimum reduces noise)
-    pulsaret_length_ms_ = std::max(5.0f, std::min(length_ms, 50.0f));
+    // Clamp to 2-30ms range for tight, responsive grains
+    pulsaret_length_ms_ = std::max(2.0f, std::min(length_ms, 30.0f));
     pulsaret_samples_ = (pulsaret_length_ms_ / 1000.0f) * sample_rate_;
     // Ensure minimum safe value to prevent division by zero
-    pulsaret_samples_ = std::max(pulsaret_samples_, 240.0f);  // ~5ms at 48kHz
+    pulsaret_samples_ = std::max(pulsaret_samples_, 96.0f);  // ~2ms at 48kHz
 }
 
 void PulsarSynth::SetPulseWidth(float width) {
