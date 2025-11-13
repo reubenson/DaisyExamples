@@ -890,6 +890,8 @@ struct envStruct
     float     envSig;
     bool      gate;
     bool      trig;
+    bool      noteGate;
+    bool      latchActive;
 };
 
 // from PluckEcho example
@@ -947,6 +949,13 @@ bool      knobChanged = false;
 uint32_t  lastSaveTime = 0;
 const uint32_t SAVE_DEBOUNCE_MS = 2000; // Save 2 seconds after last knob change
 bool      sdCardInitialized = false;
+
+constexpr float ADSR_SUSTAIN_FULL_LEVEL_ZONE_START   = 0.75f;
+constexpr float ADSR_SUSTAIN_LATCH_ENABLE_THRESHOLD  = 0.90f;
+
+bool  adsrLatchEnabled            = false;
+bool  adsrSustainFullLevelLocked  = true;
+float currentSustainLevel         = 1.0f;
 
 void DisplayMessage(const char* str)
 {
@@ -1081,6 +1090,25 @@ float GetParamValue(ParamId paramId)
     }
 }
 
+static inline float ComputeSustainLevelFromNormalized(float normalizedValue)
+{
+    if(normalizedValue < ADSR_SUSTAIN_FULL_LEVEL_ZONE_START)
+    {
+        return 0.01f * powf(100.0f, normalizedValue);
+    }
+    return 1.0f;
+}
+
+static inline bool ShouldEnableLatch(float normalizedValue)
+{
+    return normalizedValue >= ADSR_SUSTAIN_LATCH_ENABLE_THRESHOLD;
+}
+
+static inline bool IsFullLevelZone(float normalizedValue)
+{
+    return normalizedValue >= ADSR_SUSTAIN_FULL_LEVEL_ZONE_START;
+}
+
 void SetParamValue(ParamId paramId, float normalizedValue)
 {
     switch(paramId) {
@@ -1117,12 +1145,27 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             break;
             
         case PARAM_ADSR_SUSTAIN:
-            // Clamp to 0.0-1.0 range
-            appState.adsrSustain = std::max(0.0f, std::min(1.0f, normalizedValue));
-            // Apply to all envelopes
-            for (int i = 0; i < 4; i++) {
-                float sustainLevel = 0.01f * powf(100.0f, normalizedValue);
-                envelopes[i].env.SetSustainLevel(sustainLevel);
+            {
+                float clampedValue = std::max(0.0f, std::min(1.0f, normalizedValue));
+                appState.adsrSustain = clampedValue;
+
+                adsrLatchEnabled           = ShouldEnableLatch(clampedValue);
+                adsrSustainFullLevelLocked = IsFullLevelZone(clampedValue);
+                currentSustainLevel        = ComputeSustainLevelFromNormalized(clampedValue);
+
+                // Apply to all envelopes and update latch state
+                for (int i = 0; i < 4; i++) {
+                    envelopes[i].env.SetSustainLevel(currentSustainLevel);
+
+                    if (adsrLatchEnabled && envelopes[i].noteGate) {
+                        envelopes[i].latchActive = true;
+                    } else if (!adsrLatchEnabled && envelopes[i].latchActive) {
+                        envelopes[i].latchActive = false;
+                        if (envelopes[i].noteGate) {
+                            envelopes[i].gate = true;
+                        }
+                    }
+                }
             }
             break;
             
@@ -1922,6 +1965,36 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // Process envelopes at audio rate for consistent timing
     for(int j = 0; j < 4; j++)
     {
+        if(envelopes[j].latchActive)
+        {
+            if(!adsrLatchEnabled || !envelopes[j].noteGate)
+            {
+                envelopes[j].latchActive = false;
+                if(!envelopes[j].noteGate)
+                {
+                    envelopes[j].gate = false;
+                }
+            }
+            else
+            {
+                uint8_t segment = envelopes[j].env.GetCurrentSegment();
+                if(envelopes[j].gate)
+                {
+                    if(segment == ADSR_SEG_DECAY)
+                    {
+                        envelopes[j].gate = false;
+                    }
+                }
+                else
+                {
+                    if(segment == ADSR_SEG_IDLE)
+                    {
+                        envelopes[j].gate = true;
+                    }
+                }
+            }
+        }
+
         envelopes[j].envSig = envelopes[j].env.Process(envelopes[j].gate);
     }
 
@@ -1991,7 +2064,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         
         // Output voices 0 and 2 to audio outputs 3 and 4 when their gates are open
         // Use cached oscillator outputs (before VCA/compression/panning processing)
-        if (envelopes[0].gate) {
+        if (envelopes[0].noteGate) {
             if (useInternalOscillators[0]) {
                 out[2][i] = oscOutputs[0];
             } else {
@@ -2002,7 +2075,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             out[2][i] = 0.0f;
         }
         
-        if (envelopes[2].gate) {
+        if (envelopes[2].noteGate) {
             if (useInternalOscillators[2]) {
                 out[3][i] = oscOutputs[2];
             } else {
@@ -2019,6 +2092,10 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
 void InitEnvelopes(float samplerate)
 {
+    adsrLatchEnabled           = ShouldEnableLatch(appState.adsrSustain);
+    adsrSustainFullLevelLocked = IsFullLevelZone(appState.adsrSustain);
+    currentSustainLevel        = ComputeSustainLevelFromNormalized(appState.adsrSustain);
+
     for(int i = 0; i < 4; i++)
     {
         // Initialize envelope objects
@@ -2026,6 +2103,10 @@ void InitEnvelopes(float samplerate)
         
         // Initialize gate state to false (no notes playing initially)
         envelopes[i].gate = false;
+        envelopes[i].noteGate = false;
+        envelopes[i].latchActive = false;
+        envelopes[i].trig = false;
+        envelopes[i].env.SetSustainLevel(currentSustainLevel);
     }
 }
 
@@ -2401,6 +2482,8 @@ int main(void)
                 
                 // Turn off the envelope gate
                 envelopes[sequencer.sequencerVoiceToTurnOff].gate = false;
+                envelopes[sequencer.sequencerVoiceToTurnOff].noteGate = false;
+                envelopes[sequencer.sequencerVoiceToTurnOff].latchActive = false;
                 
                 // Clear voice data
                 voices[sequencer.sequencerVoiceToTurnOff].note = 0;
@@ -3270,23 +3353,33 @@ static void ApplyShiftRegisterState()
             
             if(state.needs_retrigger)
             {
-                // Set velocity-scaled sustain level before retriggering
-                float sustainKnobValue = hw.controls[2].Process(); // Read sustain knob directly
-                float baseSustainLevel = 0.01f * powf(100.0f, sustainKnobValue);
-                float velocityFactor = state.velocity / 127.0f;
-                float velocityScaledSustain = baseSustainLevel * velocityFactor;
-                envelopes[i].env.SetSustainLevel(velocityScaledSustain);
+                // Set sustain level before retriggering
+                float sustainLevel = currentSustainLevel;
+                if(adsrSustainFullLevelLocked)
+                {
+                    sustainLevel = 1.0f;
+                }
+                else
+                {
+                    float velocityFactor = state.velocity / 127.0f;
+                    sustainLevel *= velocityFactor;
+                }
+                envelopes[i].env.SetSustainLevel(sustainLevel);
                 
                 envelopes[i].env.Retrigger(true);
             }
             // Use gate_on state from the library (tracks note-on/off)
-            envelopes[i].gate  = state.gate_on;
+            envelopes[i].noteGate   = state.gate_on;
+            envelopes[i].latchActive = adsrLatchEnabled && state.gate_on;
+            envelopes[i].gate  = state.gate_on || envelopes[i].latchActive;
             voices[i].note     = static_cast<int8_t>(state.note);
             voices[i].velocity = static_cast<int8_t>(state.velocity);
         }
         else
         {
-            envelopes[i].gate  = false;
+            envelopes[i].gate      = false;
+            envelopes[i].noteGate  = false;
+            envelopes[i].latchActive = false;
             voices[i].note     = 0;
             voices[i].velocity = 0;
         }
@@ -3430,7 +3523,7 @@ void CaptureCurrentlyHeldNotes()
     
     // Capture all currently held notes from the voices array
     for (int i = 0; i < 4; i++) {
-        if (envelopes[i].gate && voices[i].note > 0) {
+        if (envelopes[i].noteGate && voices[i].note > 0) {
             // Add note to sequencer if it's currently held
             AddNoteToSequencer(static_cast<uint8_t>(voices[i].note));
         }
@@ -3454,7 +3547,7 @@ void ApplyTuningToSequencerNotes()
     
     // Update pitch bend for all currently active voices that are playing sequencer notes
     for (int i = 0; i < 4; i++) {
-        if (envelopes[i].gate && voices[i].note > 0) {
+        if (envelopes[i].noteGate && voices[i].note > 0) {
             // Check if this voice is playing a note from the sequencer
             bool isSequencerNote = false;
             for (size_t j = 0; j < sequencer.sequencerNotes.size(); j++) {
@@ -3832,13 +3925,13 @@ public:
         int8_t voiceIndex = -1;
         
         // Step 1: Try the next voice in round-robin sequence if it's free
-        if (!envelopes[nextVoiceIndex].gate) {
+        if (!envelopes[nextVoiceIndex].noteGate) {
             voiceIndex = nextVoiceIndex;
         } else {
             // Step 2: If next voice is busy, search for any free voice
             bool foundFree = false;
             for (int i = 0; i < 4; i++) {
-                if (!envelopes[i].gate) {
+                if (!envelopes[i].noteGate) {
                     voiceIndex = i;
                     foundFree = true;
                     break;
@@ -3886,16 +3979,24 @@ public:
         }
         
         // Update voice state
+        envelopes[voiceIndex].noteGate = true;
+        envelopes[voiceIndex].latchActive = adsrLatchEnabled;
         envelopes[voiceIndex].gate = true;
         voices[voiceIndex].note = event.note;
         voices[voiceIndex].velocity = event.velocity;
         
         // Set velocity-scaled sustain level before retriggering
-        float sustainKnobValue = hw.controls[2].Process(); // Read sustain knob directly
-        float baseSustainLevel = 0.01f * powf(100.0f, sustainKnobValue);
-        float velocityFactor = event.velocity / 127.0f;
-        float velocityScaledSustain = baseSustainLevel * velocityFactor;
-        envelopes[voiceIndex].env.SetSustainLevel(velocityScaledSustain);
+        float sustainLevel = currentSustainLevel;
+        if(adsrSustainFullLevelLocked)
+        {
+            sustainLevel = 1.0f;
+        }
+        else
+        {
+            float velocityFactor = event.velocity / 127.0f;
+            sustainLevel *= velocityFactor;
+        }
+        envelopes[voiceIndex].env.SetSustainLevel(sustainLevel);
         
         envelopes[voiceIndex].env.Retrigger(true);
         
@@ -3912,6 +4013,8 @@ public:
                 hw.midi.SendMessage(bytes, 3);
                 
                 envelopes[i].gate = false;
+                envelopes[i].noteGate = false;
+                envelopes[i].latchActive = false;
                 
                 // Clear voice data when note is released
                 voices[i].note = 0;
