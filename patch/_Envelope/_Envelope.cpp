@@ -1268,11 +1268,9 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             
         case PARAM_OSC_FM2_INDEX:
             {
+                // FM index is now controlled by envelope amplitude per voice
+                // This parameter is kept for UI display purposes but doesn't control the index
                 appState.fm2Index = normalizedValue;
-                float index = normalizedValue; // 0.0-1.0
-                for (int i = 0; i < 4; i++) {
-                    voiceFm2Osc[i].SetIndex(index);
-                }
             }
             break;
             
@@ -2017,6 +2015,14 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         envelopes[j].envSig = envelopes[j].env.Process(envelopes[j].gate);
     }
 
+    // Update FM index for each voice based on envelope amplitude
+    // Scale envelope amplitude by the index parameter value
+    for (int j = 0; j < 4; j++) {
+        // Multiply envelope amplitude (0.0-1.0) by index parameter to get final FM index
+        float index = envelopes[j].envSig * appState.fm2Index;
+        voiceFm2Osc[j].SetIndex(index);
+    }
+
     // float trig, nn, decay;       // Pluck Vars
     // float sig, delsig;           // Mono Audio Vars
     // synth.SetDecay(1.0);
@@ -2049,10 +2055,15 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             results[j] = in[j][i];
         }
 
-        // Use internal oscillators for each voice if enabled
+        // Always compute oscillator outputs for all voices
+        for (int ch = 0; ch < 4; ch++) {
+            oscOutputs[ch] = ProcessOscillator(ch);
+        }
+        
+        // For voices 0 and 2: only mix into stereo output if useInternalOscillators is enabled
+        // For voices 1 and 3: always mix into stereo output if useInternalOscillators is enabled
         for (int ch = 0; ch < 4; ch++) {
             if (useInternalOscillators[ch]) {
-                oscOutputs[ch] = ProcessOscillator(ch);
                 results[ch] = oscOutputs[ch];
             }
         }
@@ -2083,29 +2094,21 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         out[0][i] = processedLeft;
         out[1][i] = processedRight;
         
-        // Output voices 0 and 2 to audio outputs 3 and 4 when their gates are open
-        // Use cached oscillator outputs (before VCA/compression/panning processing)
+        // Output voices 0 and 2 to audio outputs 2 and 3 with envelope amplitude scaling (VCA)
+        // Always use internal oscillators for these outputs
+        float output2 = 0.0f;
         if (envelopes[0].noteGate) {
-            if (useInternalOscillators[0]) {
-                out[2][i] = oscOutputs[0];
-            } else {
-                // Output raw input signal
-                out[2][i] = in[0][i];
-            }
-        } else {
-            out[2][i] = 0.0f;
+            output2 = oscOutputs[0];
         }
+        // Scale by envelope amplitude (VCA behavior)
+        out[2][i] = output2 * envelopes[0].envSig;
         
+        float output3 = 0.0f;
         if (envelopes[2].noteGate) {
-            if (useInternalOscillators[2]) {
-                out[3][i] = oscOutputs[2];
-            } else {
-                // Output raw input signal
-                out[3][i] = in[2][i];
-            }
-        } else {
-            out[3][i] = 0.0f;
+            output3 = oscOutputs[2];
         }
+        // Scale by envelope amplitude (VCA behavior)
+        out[3][i] = output3 * envelopes[2].envSig;
     }
 
     // Note: Display updates moved to main loop to prevent audio dropouts
@@ -3406,11 +3409,9 @@ static void ApplyShiftRegisterState()
         const auto& state = voice_states[i];
         if(state.active)
         {
-            // Update internal oscillator frequencies BEFORE setting gate to avoid clicks
-            if (useInternalOscillators[i]) {
-                float freq = MidiNoteToFrequency(static_cast<int8_t>(state.note), 1);  // Use 1 to avoid voice 0 special case
-                SetOscillatorFrequency(i, freq);
-            }
+            // Always update oscillator frequencies for all voices
+            float freq = MidiNoteToFrequency(static_cast<int8_t>(state.note), 1);  // Use 1 to avoid voice 0 special case
+            SetOscillatorFrequency(i, freq);
             
             // Send pitch bend for shift register mode if tuning is enabled
             if (sendPitchBendMidi && state.gate_on) {
@@ -3659,11 +3660,9 @@ void ApplyTuningToSequencerNotes()
                 SendPitchBend(static_cast<uint8_t>(i), pitchBendValue);
             }
             
-            // Update internal oscillator frequency if enabled
-            if (useInternalOscillators[i]) {
-                float freq = MidiNoteToFrequency(voices[i].note, 1);  // Use 1 to avoid voice 0 special case
-                SetOscillatorFrequency(i, freq);
-            }
+            // Always update oscillator frequencies for all voices
+            float freq = MidiNoteToFrequency(voices[i].note, 1);  // Use 1 to avoid voice 0 special case
+            SetOscillatorFrequency(i, freq);
         }
     }
 }
@@ -4066,11 +4065,9 @@ public:
         uint8_t bytes[3] = {static_cast<uint8_t>(0x90 + voiceIndex), event.note, event.velocity};
         hw.midi.SendMessage(bytes, 3);
         
-        // Update internal oscillator frequencies BEFORE setting gate to avoid clicks
-        if (useInternalOscillators[voiceIndex]) {
-            float freq = MidiNoteToFrequency(event.note, 1);  // Use 1 to avoid voice 0 special case
-            SetOscillatorFrequency(voiceIndex, freq);
-        }
+        // Always update oscillator frequencies for all voices
+        float freq = MidiNoteToFrequency(event.note, 1);  // Use 1 to avoid voice 0 special case
+        SetOscillatorFrequency(voiceIndex, freq);
         
         // Update voice state
         envelopes[voiceIndex].noteGate = true;
