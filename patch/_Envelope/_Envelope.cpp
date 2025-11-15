@@ -306,6 +306,7 @@ template<typename NextHandler> class NormalVoiceHandler;
 void ProcessHandlerChainNoteOn(NoteOnEvent& event);
 void ProcessHandlerChainNoteOff(NoteOffEvent& event);
 void ProcessSequencerMidiSource();
+void AdvanceSequencerStep(); // Advance sequencer step (used by self-trigger mode)
 void ResetCCState(); // Reset CC state to clean state
 
 // Display update timing
@@ -403,10 +404,12 @@ struct SequencerParams {
     
     // Sequencer mode and state
     bool sequencerMode = false;
+    bool selfTriggerMode = false;  // Alternate sequencer mode: self-trigger based on envelope duration
     SequencerOrderMode sequencerOrderMode = SEQ_ORDER_ASC;
     uint8_t sequencerNoteIndex = 0;
     float sequencerNoteLengthPercent = 0.5f;  // Note length as percentage of step (10%-90%)
     bool sequencerUsingInitialCapture = false;
+    uint32_t envelopeDurationMs = 0;  // Calculated from attack+decay for self-trigger mode
     
     // State for up-down mode
     bool sequencerUpDownDirection = true;  // true = ascending, false = descending
@@ -1109,6 +1112,33 @@ static inline bool IsFullLevelZone(float normalizedValue)
     return normalizedValue >= ADSR_SUSTAIN_FULL_LEVEL_ZONE_START;
 }
 
+// Update sequencer timing based on envelope duration for self-trigger mode
+static void UpdateSequencerEnvelopeTiming()
+{
+    if (sequencer.selfTriggerMode && sequencer.sequencerMode) {
+        // Calculate envelope duration from attack + decay
+        sequencer.envelopeDurationMs = static_cast<uint32_t>(appState.adsrAttackMs + appState.adsrDecayReleaseMs);
+        
+        // Clamp to reasonable range (minimum 10ms, maximum 10 seconds)
+        const uint32_t minDuration = 10;
+        const uint32_t maxDuration = 10000;
+        sequencer.envelopeDurationMs = std::max(minDuration, std::min(maxDuration, sequencer.envelopeDurationMs));
+        
+        // Calculate BPM from envelope duration: BPM = 60000 / duration_ms
+        // Clamp to reasonable BPM range (20-300 BPM)
+        uint32_t calculatedBpm = 60000 / sequencer.envelopeDurationMs;
+        const uint32_t minBpm = 20;
+        const uint32_t maxBpm = 300;
+        calculatedBpm = std::max(minBpm, std::min(maxBpm, calculatedBpm));
+        
+        // Update sequencer timing based on calculated BPM
+        sequencer.clockBpm = static_cast<int32_t>(calculatedBpm);
+        sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
+        sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));
+        sequencer.subdivisionInterval = sequencer.sequenceStepInterval / 8;
+    }
+}
+
 void SetParamValue(ParamId paramId, float normalizedValue)
 {
     switch(paramId) {
@@ -1125,6 +1155,9 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                     float attackTime = appState.adsrAttackMs / 1000.0f; // Convert ms to seconds
                     envelopes[i].env.SetTime(ADSR_SEG_ATTACK, attackTime);
                 }
+                
+                // Update sequencer timing if in self-trigger mode
+                UpdateSequencerEnvelopeTiming();
             }
             break;
             
@@ -1141,6 +1174,9 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                     envelopes[i].env.SetTime(ADSR_SEG_DECAY, decayTime);
                     envelopes[i].env.SetTime(ADSR_SEG_RELEASE, decayTime);
                 }
+                
+                // Update sequencer timing if in self-trigger mode
+                UpdateSequencerEnvelopeTiming();
             }
             break;
             
@@ -1149,13 +1185,27 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                 float clampedValue = std::max(0.0f, std::min(1.0f, normalizedValue));
                 appState.adsrSustain = clampedValue;
 
-                adsrLatchEnabled           = ShouldEnableLatch(clampedValue);
+                adsrLatchEnabled = ShouldEnableLatch(clampedValue);
                 adsrSustainFullLevelLocked = IsFullLevelZone(clampedValue);
-                currentSustainLevel        = ComputeSustainLevelFromNormalized(clampedValue);
+                currentSustainLevel = ComputeSustainLevelFromNormalized(clampedValue);
 
                 // Apply to all envelopes and update latch state
                 for (int i = 0; i < 4; i++) {
-                    envelopes[i].env.SetSustainLevel(currentSustainLevel);
+                    // In self-trigger mode, sustain is already set to 0 when note is triggered
+                    // For non-sequencer notes, apply normal sustain
+                    bool isSequencerNote = false;
+                    if (sequencer.selfTriggerMode && sequencer.sequencerMode) {
+                        for (size_t k = 0; k < sequencer.sequencerNotes.size(); k++) {
+                            if (sequencer.sequencerNotes[k] == voices[i].note) {
+                                isSequencerNote = true;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (!isSequencerNote) {
+                        envelopes[i].env.SetSustainLevel(currentSustainLevel);
+                    }
 
                     if (adsrLatchEnabled && envelopes[i].noteGate) {
                         envelopes[i].latchActive = true;
@@ -1405,7 +1455,18 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             
         case PARAM_SEQ_LENGTH:
             appState.seqLength = normalizedValue;
-            sequencer.sequencerNoteLengthPercent = 0.1f + normalizedValue * 0.8f;  // Map to 0.1-0.9
+            if (normalizedValue < 0.5f) {
+                // 0-50%: Map to note length percentage (0.1-0.9 range)
+                sequencer.sequencerNoteLengthPercent = 0.1f + (normalizedValue * 2.0f) * 0.8f;  // Map 0-0.5 to 0.1-0.9
+                sequencer.selfTriggerMode = false;
+            } else {
+                // 50-100%: Enable self-trigger mode
+                sequencer.selfTriggerMode = true;
+                // Note length is not used in self-trigger mode, but keep it at a reasonable default
+                sequencer.sequencerNoteLengthPercent = 0.5f;
+                // Update timing based on current envelope settings
+                UpdateSequencerEnvelopeTiming();
+            }
             break;
             
         case PARAM_SEQ_BPM:
@@ -1939,7 +2000,7 @@ void HandleSignalDetection(AudioHandle::InputBuffer in, size_t size) {
                 static_cast<int>(std::sqrt(signalDetectionAccum[1] / avgSamples) * 1000),
                 static_cast<int>(std::sqrt(signalDetectionAccum[2] / avgSamples) * 1000),
                 static_cast<int>(std::sqrt(signalDetectionAccum[3] / avgSamples) * 1000));
-            SetDebugMessage(debugMsg);
+            // SetDebugMessage(debugMsg);
             
             for (int ch = 0; ch < 4; ch++) {
                 // Calculate RMS: sqrt of average of squared values
@@ -1967,6 +2028,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     {
         if(envelopes[j].latchActive)
         {
+            // Check if we should disable latch (note released or mode changed)
             if(!adsrLatchEnabled || !envelopes[j].noteGate)
             {
                 envelopes[j].latchActive = false;
@@ -1989,6 +2051,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
                 {
                     if(segment == ADSR_SEG_IDLE)
                     {
+                        // Self-loop mode: retrigger self
                         envelopes[j].gate = true;
                     }
                 }
@@ -2249,15 +2312,15 @@ int main(void)
     sd_cfg.Defaults();
     SdmmcHandler::Result sd_result = sdcard.Init(sd_cfg);
     
-    const char* initMessage = "init failed";
+    // const char* initMessage = "init failed";
     if (sd_result == SdmmcHandler::Result::OK) {
         uint8_t bsp_result = BSP_SD_Init();
         if (bsp_result == MSD_OK) {
             sdCardInitialized = true;
-            initMessage = LoadPreset() ? "preset loaded" : "load failed";
+            // initMessage = LoadPreset() ? "preset loaded" : "load failed";
         }
     }
-    SetDebugMessage(initMessage);
+    // SetDebugMessage(initMessage);
 
     // Apply loaded normalizedValues to all parameters
     for (int panel = 0; panel < panelModesCount; panel++) {
@@ -3079,7 +3142,7 @@ void ProcessEncoder()
                 if (sdCardInitialized) {
                     SavePreset();
                 } else {
-                    SetDebugMessage("SD not init");
+                    // SetDebugMessage("SD not init");
                 }
                 UpdateOled();
             } else {
@@ -3089,11 +3152,67 @@ void ProcessEncoder()
                 if (sequencer.sequencerMode) {
                     // When enabling sequencer mode, capture currently held notes
                     CaptureCurrentlyHeldNotes();
-                    } else {
-                        // Clear sequencer notes when disabling sequencer mode to prevent artifacts
-                        ClearSequencerNotes();
-                        ResetCCState(); // Reset CC state when disabling sequencer
+                    
+                    // Reset sequencer step when enabling sequencer mode
+                    sequencer.currentSequenceStep = 0;
+                    
+                    // In self-trigger mode, mark existing voices as sequencer-controlled and set sustain to 0
+                    if (sequencer.selfTriggerMode && !sequencer.sequencerNotes.empty()) {
+                        // Mark all currently playing voices that match sequencer notes as sequencer-controlled
+                        for (int i = 0; i < 4; i++) {
+                            if (envelopes[i].noteGate && voices[i].note > 0) {
+                                // Check if this note is in the sequencer
+                                bool isSequencerNote = false;
+                                for (size_t j = 0; j < sequencer.sequencerNotes.size(); j++) {
+                                    if (sequencer.sequencerNotes[j] == static_cast<uint8_t>(voices[i].note)) {
+                                        isSequencerNote = true;
+                                        break;
+                                    }
+                                }
+                                
+                                if (isSequencerNote) {
+                                    // Set sustain to 0 for sequencer notes in self-trigger mode
+                                    envelopes[i].env.SetSustainLevel(0.0f);
+                                }
+                            }
+                        }
+                        
+                        // If no voices are currently playing sequencer notes, trigger the first note
+                        bool hasActiveSequencerVoice = false;
+                        for (int i = 0; i < 4; i++) {
+                            if (envelopes[i].noteGate) {
+                                // Check if this voice is playing a sequencer note
+                                for (size_t k = 0; k < sequencer.sequencerNotes.size(); k++) {
+                                    if (sequencer.sequencerNotes[k] == voices[i].note) {
+                                        hasActiveSequencerVoice = true;
+                                        break;
+                                    }
+                                }
+                                if (hasActiveSequencerVoice) break;
+                            }
+                        }
+                        
+                        if (!hasActiveSequencerVoice) {
+                            // Find a free voice to trigger the first note
+                            for (int i = 0; i < 4; i++) {
+                                if (!envelopes[i].noteGate) {
+                                    NoteOnEvent event;
+                                    event.note = sequencer.sequencerNotes[0];
+                                    event.velocity = 127;
+                                    event.channel = i;
+                                    ProcessHandlerChainNoteOn(event);
+                                    // Advance sequencer step when triggering first note
+                                    sequencer.currentSequenceStep = (sequencer.currentSequenceStep + 1) % TRIGGER_SEQUENCE_LENGTH;
+                                    break;
+                                }
+                            }
+                        }
                     }
+                } else {
+                    // Clear sequencer notes when disabling sequencer mode to prevent artifacts
+                    ClearSequencerNotes();
+                    ResetCCState(); // Reset CC state when disabling sequencer
+                }
                 
                 UpdateOled();
             }
@@ -3428,6 +3547,8 @@ void AddNoteToSequencer(uint8_t note)
         }
     }
     
+    bool wasEmpty = sequencer.sequencerNotes.empty();
+    
     // Add note to array
     sequencer.sequencerNotes.push_back(note);
     
@@ -3445,10 +3566,33 @@ void AddNoteToSequencer(uint8_t note)
     if (sequencer.sequencerUsingInitialCapture) {
         sequencer.sequencerUsingInitialCapture = false;
     }
+    
+    // In self-trigger mode, if this is the first note and sequencer is active, trigger it immediately
+    if (sequencer.selfTriggerMode && sequencer.sequencerMode && wasEmpty) {
+        // Find a free voice to trigger the first note
+        for (int i = 0; i < 4; i++) {
+            if (!envelopes[i].noteGate) {
+                NoteOnEvent event;
+                event.note = note;
+                event.velocity = 127;
+                event.channel = i;
+                ProcessHandlerChainNoteOn(event);
+                // Advance sequencer step when triggering first note
+                sequencer.currentSequenceStep = (sequencer.currentSequenceStep + 1) % TRIGGER_SEQUENCE_LENGTH;
+                break;
+            }
+        }
+    }
 }
 
 void RemoveNoteFromSequencer(uint8_t note)
 {
+    // In self-trigger mode, preserve all notes in the sequencer even after release
+    // This allows the sequencer to continue cycling through notes
+    if (sequencer.selfTriggerMode && sequencer.sequencerMode) {
+        return; // Don't remove notes in self-trigger mode
+    }
+    
     // If we're using initially captured notes, preserve all notes in the sequencer
     // This prevents losing notes when they're released at slightly different times
     if (sequencer.sequencerUsingInitialCapture) {
@@ -3987,15 +4131,47 @@ public:
         
         // Set velocity-scaled sustain level before retriggering
         float sustainLevel = currentSustainLevel;
-        if(adsrSustainFullLevelLocked)
-        {
-            sustainLevel = 1.0f;
+        
+        // In self-trigger mode, set sustain to 0 for sequencer notes (AD instead of ADSR)
+        if (sequencer.selfTriggerMode && sequencer.sequencerMode) {
+            // Check if this note is in the sequencer notes array
+            bool isSequencerNote = false;
+            for (size_t i = 0; i < sequencer.sequencerNotes.size(); i++) {
+                if (sequencer.sequencerNotes[i] == event.note) {
+                    isSequencerNote = true;
+                    break;
+                }
+            }
+            
+            if (isSequencerNote) {
+                sustainLevel = 0.0f;  // No sustain in self-trigger mode (AD envelope)
+                // Also set release time to 0 for true AD envelope (no release segment)
+                envelopes[voiceIndex].env.SetTime(ADSR_SEG_RELEASE, 0.0f);
+            } else {
+                // Normal sustain for non-sequencer notes
+                if(adsrSustainFullLevelLocked)
+                {
+                    sustainLevel = 1.0f;
+                }
+                else
+                {
+                    float velocityFactor = event.velocity / 127.0f;
+                    sustainLevel *= velocityFactor;
+                }
+            }
+        } else {
+            // Normal sustain calculation
+            if(adsrSustainFullLevelLocked)
+            {
+                sustainLevel = 1.0f;
+            }
+            else
+            {
+                float velocityFactor = event.velocity / 127.0f;
+                sustainLevel *= velocityFactor;
+            }
         }
-        else
-        {
-            float velocityFactor = event.velocity / 127.0f;
-            sustainLevel *= velocityFactor;
-        }
+        
         envelopes[voiceIndex].env.SetSustainLevel(sustainLevel);
         
         envelopes[voiceIndex].env.Retrigger(true);
@@ -4167,7 +4343,7 @@ public:
         }
     }
     
-private:
+    // Public method to advance sequencer step (used by self-trigger mode)
     void AdvanceSequenceStep() {
         // Check if current step should trigger
         if (sequencer.triggerSequence[sequencer.currentSequenceStep]) {
@@ -4299,6 +4475,11 @@ void ProcessSequencerMidiSource() {
     sequencerMidiSource.Process();
 }
 
+// Wrapper function to advance sequencer step (used by self-trigger mode)
+void AdvanceSequencerStep() {
+    sequencerMidiSource.AdvanceSequenceStep();
+}
+
 // Common preset storage constants
 static const int PRESET_SECTOR = 2000;
 static const int PRESET_BUFFER_LENGTH = 64;  // MAX_PANELS * 4 = 16 * 4
@@ -4325,7 +4506,7 @@ bool SavePreset() {
     for (int retry = 0; retry < 2; retry++) { // 2 attempts = 1 retry
         result = BSP_SD_WriteBlocks(presetBuffer, PRESET_SECTOR, 1, 2000); // 2 second timeout
         if (result == MSD_OK) {
-            SetDebugMessage("saved");
+            // SetDebugMessage("saved");
             return true;
         }
     }
@@ -4350,6 +4531,6 @@ bool LoadPreset() {
         }
     }
     
-    SetDebugMessage("loaded");
+    // SetDebugMessage("ld");
     return true;
 }
