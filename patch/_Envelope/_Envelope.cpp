@@ -253,14 +253,7 @@ int8_t nextVoiceIndex = 0;  // Round-robin voice allocator (0-3)
 bool shiftRegisterMode = false;
 
 // option to use internal oscillators for each voice
-bool useInternalOscillators[4] = {true, true, true, true};
-
-// Signal detection state
-bool signalDetectionEnabled = false;
-uint32_t signalDetectionSampleCount = 0;
-const uint32_t SIGNAL_DETECTION_SAMPLES = 4800;  // ~100ms at 48kHz
-float signalDetectionAccum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-float signalDetectionPeak[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+bool useInternalOscillators[4] = {false, true, false, true};
 
 // Tuning system variables
 uint8_t currentTuningIndex = 0;  // Current tuning preset index
@@ -1751,11 +1744,21 @@ void ApplyPanning(float* data) {
     PanEqualPowerStereo(pan2, data[2], &L3, &R3);
     PanEqualPowerStereo(pan3, data[3], &L4, &R4);
 
-    // Sum all voices and apply volume control from UserState
-    float mixVolume = appState.volume;
-    data[0] = (L1 + L2 + L3 + L4) * mixVolume;
-    data[1] = (R1 + R2 + R3 + R4) * mixVolume;
+    // Sum all voices (volume control moved to crossfader)
+    data[0] = L1 + L2 + L3 + L4;
+    data[1] = R1 + R2 + R3 + R4;
     hw.seed.dac.WriteValue(DacHandle::Channel::ONE, ((panOutput + 1.0f) / 2.0f) * 4095);
+}
+
+void ApplyCrossfader(float* processedLeft, float* processedRight, 
+                     float externalLeft, float externalRight) {
+    // Crossfader: volume parameter controls mix between processed output and external audio
+    // volume = 1.0: processed output at full, external audio at 0%
+    // volume = 0.5: processed output at 50%, external audio at 50%
+    // volume = 0.0: processed output at 0%, external audio at full
+    float volume = appState.volume;
+    *processedLeft = *processedLeft * volume + externalLeft * (1.0f - volume);
+    *processedRight = *processedRight * volume + externalRight * (1.0f - volume);
 }
 
 void ApplyCompression(float* data) {
@@ -1969,59 +1972,12 @@ void ApplyVCAs(float* data) {
     hw.seed.dac.WriteValue(DacHandle::Channel::TWO, outputMaxEnvelope);
 }
 
-// due to hardware quirks, this only works with patch cables inserted into the unused inputs
-// and is affected by whether the microcontroller is in plugged in
-void HandleSignalDetection(AudioHandle::InputBuffer in, size_t size) {
-    // Wait a bit for audio to stabilize before starting detection
-    static uint32_t callbackCount = 0;
-    if (!signalDetectionEnabled && callbackCount++ > 1000) {
-        signalDetectionEnabled = true;  // Start detection after ~50 callbacks (audio has stabilized)
-    }
-    
-    // Signal detection phase - accumulate RMS values during first 100ms
-    // Use RMS (root mean square) to better detect sinusoidal signals
-    if (signalDetectionEnabled && signalDetectionSampleCount < SIGNAL_DETECTION_SAMPLES) {
-        for (size_t i = 0; i < size && signalDetectionSampleCount < SIGNAL_DETECTION_SAMPLES; i++) {
-            for (int ch = 0; ch < 4; ch++) {
-                float sample = in[ch][i];
-                signalDetectionAccum[ch] += sample * sample;  // Accumulate squared values for RMS
-            }
-            signalDetectionSampleCount++;
-        }
-        
-        // After collecting enough samples, determine which inputs have signal
-        if (signalDetectionSampleCount >= SIGNAL_DETECTION_SAMPLES) {
-            const float signalThreshold = 0.30f;  // RMS threshold for signal detection
-            float avgSamples = static_cast<float>(SIGNAL_DETECTION_SAMPLES);
-
-            char debugMsg[100];
-            snprintf(debugMsg, 100, "RMS:%d/%d/%d/%d", 
-                static_cast<int>(std::sqrt(signalDetectionAccum[0] / avgSamples) * 1000),
-                static_cast<int>(std::sqrt(signalDetectionAccum[1] / avgSamples) * 1000),
-                static_cast<int>(std::sqrt(signalDetectionAccum[2] / avgSamples) * 1000),
-                static_cast<int>(std::sqrt(signalDetectionAccum[3] / avgSamples) * 1000));
-            // SetDebugMessage(debugMsg);
-            
-            for (int ch = 0; ch < 4; ch++) {
-                // Calculate RMS: sqrt of average of squared values
-                float rms = std::sqrt(signalDetectionAccum[ch] / avgSamples);
-                // If signal detected, disable internal oscillator for this voice
-                if (rms > signalThreshold) {
-                    useInternalOscillators[ch] = false;
-                }
-            }
-            signalDetectionEnabled = false;  // Done with detection
-        }
-    }
-}
 
 void AudioCallback(AudioHandle::InputBuffer  in,
                    AudioHandle::OutputBuffer out,
                    size_t                    size)
 {
     ProcessControls();
-    
-    HandleSignalDetection(in, size);
     
     // Process envelopes at audio rate for consistent timing
     for(int j = 0; j < 4; j++)
@@ -2116,14 +2072,16 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         // Panel 5 - Delay effect (independent from microsound)
         ApplyDelay(results);
 
-        // plucksApply(results);
-
-        // if (currentPanel.name == "Pluck") {
-        // out[0][i] = sig;
-        // out[1][i] = sig;
-        // }
-        out[0][i] = results[0];
-        out[1][i] = results[1];
+        // Crossfader: mix processed output with external audio from inputs 1 and 3
+        // Input 1 goes to left channel, input 3 goes to right channel
+        float processedLeft = results[0];
+        float processedRight = results[1];
+        float externalLeft = in[1][i];
+        float externalRight = in[3][i];
+        ApplyCrossfader(&processedLeft, &processedRight, externalLeft, externalRight);
+        
+        out[0][i] = processedLeft;
+        out[1][i] = processedRight;
         
         // Output voices 0 and 2 to audio outputs 3 and 4 when their gates are open
         // Use cached oscillator outputs (before VCA/compression/panning processing)
@@ -2471,14 +2429,6 @@ int main(void)
     SetParamValue(PARAM_OSC_HARMONIC_DECAY, 0.3f);  // Decay rate
     SetParamValue(PARAM_OSC_HARMONIC_SKEW, 0.0f);   // No skew (fundamental emphasis)
 
-    // Initialize signal detection - reset accumulators but don't enable yet
-    for (int i = 0; i < 4; i++) {
-        signalDetectionAccum[i] = 0.0f;
-        signalDetectionPeak[i] = 0.0f;
-    }
-    signalDetectionSampleCount = 0;
-    signalDetectionEnabled = false;  // Will be enabled after audio stabilizes
-    
     // Start the ADC and Audio Peripherals on the Hardware
     hw.StartAdc();
     hw.SetAudioBlockSize(blocksize);
