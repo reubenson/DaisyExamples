@@ -816,16 +816,6 @@ panelStruct displayPanels[] = {
         bindings: {PARAM_DELAY_MODE, PARAM_DELAY_TIME, PARAM_DELAY_DAMP, PARAM_DELAY_WETDRY}
     },
     {
-        name: "SAVE",
-        id: 'p',
-        input1Name: "",
-        input2Name: "",
-        input3Name: "",
-        input4Name: "",
-        normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
-        bindings: {PARAM_NONE, PARAM_NONE, PARAM_NONE, PARAM_NONE}
-    },
-    {
         name: "MICRO",
         id: 'g',
         input1Name: "PLen",
@@ -835,6 +825,16 @@ panelStruct displayPanels[] = {
         normalizedValues: {0.2f, 0.5f, 0.0f, 0.0f},
         bindings: {PARAM_MICRO_PULSARET_LENGTH, PARAM_MICRO_PULSE_WIDTH, 
                    PARAM_MICRO_MODULATION, PARAM_MICRO_WETDRY}
+    },
+    {
+        name: "SAVE",
+        id: 'p',
+        input1Name: "",
+        input2Name: "",
+        input3Name: "",
+        input4Name: "",
+        normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
+        bindings: {PARAM_NONE, PARAM_NONE, PARAM_NONE, PARAM_NONE}
     }
 };
 
@@ -861,8 +861,8 @@ float knobValues[11][4] = {  // panelModesCount = 11
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 6: MULT 
     {0.25f, 0.6f, 0.01f, 0.05f}, // Panel 7: COMP
     {0.0f, 0.5f, 0.3f, 0.3f},  // Panel 8: DELAY (Mode, Time, Damp, Mix)
-    {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 9: PRESET
-    {0.2f, 0.5f, 0.0f, 0.0f}   // Panel 10: MICRO (PLen, PWid, Mod, Mix)
+    {0.2f, 0.5f, 0.0f, 0.0f},  // Panel 9: MICRO (PLen, PWid, Mod, Mix)
+    {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 10: PRESET
 };
 const float KNOB_CATCHUP_THRESHOLD = 0.05f;  // How close knob must be to catch up (5%)
 
@@ -2273,15 +2273,17 @@ int main(void)
     sd_cfg.Defaults();
     SdmmcHandler::Result sd_result = sdcard.Init(sd_cfg);
     
-    // const char* initMessage = "init failed";
+    const char* initMessage = "init failed";
     if (sd_result == SdmmcHandler::Result::OK) {
         uint8_t bsp_result = BSP_SD_Init();
         if (bsp_result == MSD_OK) {
             sdCardInitialized = true;
-            // initMessage = LoadPreset() ? "preset loaded" : "load failed";
+            // Small delay to ensure card is ready
+            HAL_Delay(100);  // 100ms delay
+            initMessage = LoadPreset() ? "preset loaded" : "load failed";
         }
     }
-    // SetDebugMessage(initMessage);
+    SetDebugMessage(initMessage);
 
     // Apply loaded normalizedValues to all parameters
     for (int panel = 0; panel < panelModesCount; panel++) {
@@ -4453,7 +4455,7 @@ bool SavePreset() {
     for (int retry = 0; retry < 2; retry++) { // 2 attempts = 1 retry
         result = BSP_SD_WriteBlocks(presetBuffer, PRESET_SECTOR, 1, 2000); // 2 second timeout
         if (result == MSD_OK) {
-            // SetDebugMessage("saved");
+            SetDebugMessage("saved");
             return true;
         }
     }
@@ -4463,9 +4465,30 @@ bool SavePreset() {
 }
 
 bool LoadPreset() {
+    // Check card state before attempting to read
+    uint8_t cardState = BSP_SD_GetCardState();
+    if (cardState != MSD_OK) {
+        // SetDebugMessageF("card not ready: %d", cardState);
+        return false;
+    }
+    
     uint8_t result = BSP_SD_ReadBlocks(presetBuffer, PRESET_SECTOR, 1, PRESET_TIMEOUT_MS);
     if (result != MSD_OK) {
         // SetDebugMessageF("load fail: %d", result);
+        return false;
+    }
+    
+    // Optional: Check if preset appears to be valid (not all zeros)
+    // This helps detect if the sector was never written to
+    bool allZeros = true;
+    for (int i = 0; i < PRESET_BUFFER_LENGTH; i++) {
+        if (presetBuffer[i] != 0) {
+            allZeros = false;
+            break;
+        }
+    }
+    if (allZeros) {
+        // Preset sector is empty/uninitialized - treat as "no preset saved yet"
         return false;
     }
     
