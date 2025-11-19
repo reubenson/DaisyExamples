@@ -177,17 +177,29 @@ public:
         float saw = 2.0f * phase - 1.0f;
         
         // Interpolate between waveforms
-        if (waveform_param_ <= 0.33f) {
+        // Clamp waveform_param_ to valid range to prevent crashes
+        float wp = std::max(0.0f, std::min(1.0f, waveform_param_));
+
+        // wp = 0.0f;
+        
+        // Explicit handling for pure waveforms to avoid floating point issues
+        if (wp < 0.001f) {
+            // Pure sine (wp == 0.0 or very close)
+            output = sine;
+        } else if (wp <= 0.33f) {
             // Interpolate between sine and triangle
-            float t = waveform_param_ / 0.33f;
+            float t = wp / 0.33f;
             output = sine * (1.0f - t) + triangle * t;
-        } else if (waveform_param_ <= 0.66f) {
+        } else if (wp <= 0.66f) {
             // Interpolate between triangle and square
-            float t = (waveform_param_ - 0.33f) / 0.33f;
+            float t = (wp - 0.33f) / 0.33f;
             output = triangle * (1.0f - t) + square * t;
+        } else if (wp > 0.999f) {
+            // Pure sawtooth (wp == 1.0 or very close)
+            output = saw;
         } else {
             // Interpolate between square and saw
-            float t = (waveform_param_ - 0.66f) / 0.34f;
+            float t = (wp - 0.66f) / 0.34f;
             output = square * (1.0f - t) + saw * t;
         }
         
@@ -204,17 +216,27 @@ public:
         float saw = 2.0f * phase_ - 1.0f;
         
         // Interpolate between waveforms
-        if (waveform_param_ <= 0.33f) {
+        // Clamp waveform_param_ to valid range to prevent crashes
+        float wp = std::max(0.0f, std::min(1.0f, waveform_param_));
+        
+        // Explicit handling for pure waveforms to avoid floating point issues
+        if (wp < 0.001f) {
+            // Pure sine (wp == 0.0 or very close)
+            output = sine;
+        } else if (wp <= 0.33f) {
             // Interpolate between sine and triangle
-            float t = waveform_param_ / 0.33f;
+            float t = wp / 0.33f;
             output = sine * (1.0f - t) + triangle * t;
-        } else if (waveform_param_ <= 0.66f) {
+        } else if (wp <= 0.66f) {
             // Interpolate between triangle and square
-            float t = (waveform_param_ - 0.33f) / 0.33f;
+            float t = (wp - 0.33f) / 0.33f;
             output = triangle * (1.0f - t) + square * t;
+        } else if (wp > 0.999f) {
+            // Pure sawtooth (wp == 1.0 or very close)
+            output = saw;
         } else {
             // Interpolate between square and saw
-            float t = (waveform_param_ - 0.66f) / 0.34f;
+            float t = (wp - 0.66f) / 0.34f;
             output = square * (1.0f - t) + saw * t;
         }
         
@@ -233,6 +255,7 @@ Fm2 voiceFm2Osc[4];                        // FM2 oscillators for all 4 voices
 FormantOscillator voiceFormantOsc[4];             // Formant oscillators for all 4 voices
 HarmonicOscillator<> voiceHarmonicOsc[4];    // Harmonic oscillators for all 4 voices (default 16 harmonics)
 InterpolatedOscillator panLfo;              // LFO for panning CV output
+InterpolatedOscillator internalPhaseOsc[4]; // Internal oscillators for phase generation (voices 1 and 3 use these)
 
 size_t blocksize = 8;
 int panelMode;
@@ -254,6 +277,16 @@ bool shiftRegisterMode = false;
 
 // option to use internal oscillators for each voice
 bool useInternalOscillators[4] = {false, true, false, true};
+
+// Phase tracking for external audio inputs (voices 0 and 2) to handle discontinuities
+float externalPhaseTrack[2] = {0.0f, 0.0f};  // Tracked phase for voices 0 and 2
+float externalPhasePrev[2] = {0.0f, 0.0f};   // Previous mapped phase for discontinuity detection
+float externalPhaseSmooth[2] = {0.0f, 0.0f};  // Smoothed phase to reduce clicks
+
+// Peak amplitude tracking for input normalization (voices 0 and 2)
+// This ensures we always use the full 0-1 phase range regardless of input amplitude
+float inputPeakAmplitude[2] = {1.0f, 1.0f};  // Tracked peak amplitude for normalization
+float normalizedInputPrev[2] = {0.0f, 0.0f};  // Previous normalized input for smoothing
 
 // Tuning system variables
 uint8_t currentTuningIndex = 0;  // Current tuning preset index
@@ -623,50 +656,51 @@ struct UserState {
     float microWetDry;          // 0.0-1.0 wet/dry mix
     
     // Constructor with default normalizedValues
+    float initialValue = 0.0f;
     UserState() :
-        adsrAttackMs(0.1f),         // 0.1ms attack
-        adsrDecayReleaseMs(2500.0f), // 2.5s decay/release (2500ms)
-        adsrSustain(1.0f),           // Full sustain
-        adsrMin(0.0f),
-        panFreq(0.02f),         // Default 0.2Hz
-        panAmp(1.0f),           // Default full amplitude
-        panWaveform(0.0f),      // Default sine wave for pan LFO
-        volume(0.8f),           // Default 80% volume
-        oscWaveform(0.0f),      // Default sine wave
-        oscMode(0.0f),          // Default Interpolated oscillator
-        fm2Ratio(0.26f),        // Default 1.0 ratio (0.26 normalizes to 1.0)
-        fm2Index(0.5f),         // Default 0.5 index
-        formantFreq(0.33f),      // Default 1.0x ratio (0.33 normalizes to ~1.0, which is 100%)
-        formantPhaseShift(0.5f), // Default 0.5 phase shift
-        harmonicIdx(0.0f),      // Default harmonic index 1 (0.0 normalizes to 1)
-        harmonicDecay(0.3f),    // Default decay rate
-        harmonicSkew(0.0f),     // Default no skew (emphasize fundamental)
-        tuningIndex(0.0f),      // Default 12-TET
-        tuningMidiEnable(1.0f), // Default enabled
+        adsrAttackMs(initialValue),         // 0.1ms attack
+        adsrDecayReleaseMs(initialValue), // 2.5s decay/release (2500ms)
+        adsrSustain(initialValue),           // Full sustain
+        adsrMin(initialValue),
+        panFreq(initialValue),         // Default 0.2Hz
+        panAmp(initialValue),           // Default full amplitude
+        panWaveform(initialValue),      // Default sine wave for pan LFO
+        volume(initialValue),           // Default 80% volume
+        oscWaveform(initialValue),      // Default sine wave
+        oscMode(initialValue),          // Default Interpolated oscillator
+        fm2Ratio(initialValue),        // Default 1.0 ratio (0.26 normalizes to 1.0)
+        fm2Index(initialValue),         // Default 0.5 index
+        formantFreq(initialValue),      // Default 1.0x ratio (0.33 normalizes to ~1.0, which is 100%)
+        formantPhaseShift(initialValue), // Default 0.5 phase shift
+        harmonicIdx(initialValue),      // Default harmonic index 1 (0.0 normalizes to 1)
+        harmonicDecay(initialValue),    // Default decay rate
+        harmonicSkew(initialValue),     // Default no skew (emphasize fundamental)
+        tuningIndex(initialValue),      // Default 12-TET
+        tuningMidiEnable(initialValue), // Default enabled
         seqDensity(0.0f),
-        seqOrder(0.0f),         // Default ascending
-        seqLength(0.5f),        // Default 50% length
+        seqOrder(initialValue),         // Default ascending
+        seqLength(initialValue),        // Default 50% length
         seqBpm((CLOCK_BPM_DEFAULT - CLOCK_BPM_MIN) / static_cast<float>(CLOCK_BPM_MAX - CLOCK_BPM_MIN)),  // Default 120 BPM normalized
-        ccProb0_1(0.0f),
-        ccProb2_3(0.0f),
-        ccProb4_5(0.0f),
-        ccProb6_7(0.0f),
-        ccMult0_1(0.0f),        // Default multiplier 1 (0.0 maps to multiplier 1)
-        ccMult2_3(0.0f),
-        ccMult4_5(0.0f),
-        ccMult6_7(0.0f),
-        compRatio(0.25f),        // Default 4:1 ratio (0.25 = (4-1)/(40-1) ≈ 0.077)
-        compThreshold(0.6f),    // Default -12 dB (0.6 in normalized range)
-        compAttack(0.01f),      // Default 0.001s attack
-        compRelease(0.05f),      // Default 0.1s release
-        delayMode(0.0f),        // Default short mode
-        delayTime(0.5f),        // Default 50% delay time
-        delayDamp(0.3f),        // Default 30% damping (pluck-like filter)
-        delayWetDry(0.3f),      // Default 30% wet mix
-        microPulsaretLength(0.2f),  // Default 20ms (0.2 maps to ~20ms in 1-100ms range)
-        microPulseWidth(0.5f),      // Default 50% duty cycle
-        microModulation(0.0f),      // Default no modulation
-        microWetDry(0.0f)           // Default 0% wet (fully dry - no microsound)
+        ccProb0_1(initialValue),
+        ccProb2_3(initialValue),
+        ccProb4_5(initialValue),
+        ccProb6_7(initialValue),
+        ccMult0_1(initialValue),        // Default multiplier 1 (0.0 maps to multiplier 1)
+        ccMult2_3(initialValue),
+        ccMult4_5(initialValue),
+        ccMult6_7(initialValue),
+        compRatio(initialValue),        // Default 4:1 ratio (0.25 = (4-1)/(40-1) ≈ 0.077)
+        compThreshold(initialValue),    // Default -12 dB (0.6 in normalized range)
+        compAttack(initialValue),      // Default 0.001s attack
+        compRelease(initialValue),      // Default 0.1s release
+        delayMode(initialValue),        // Default short mode
+        delayTime(initialValue),        // Default 50% delay time
+        delayDamp(initialValue),        // Default 30% damping (pluck-like filter)
+        delayWetDry(initialValue),      // Default 30% wet mix
+        microPulsaretLength(initialValue),  // Default 20ms (0.2 maps to ~20ms in 1-100ms range)
+        microPulseWidth(initialValue),      // Default 50% duty cycle
+        microModulation(initialValue),      // Default no modulation
+        microWetDry(initialValue)           // Default 0% wet (fully dry - no microsound)
     {}
 };
 
@@ -852,15 +886,15 @@ bool knobCaughtUp[4] = {false, false, false, false};  // Track if knob has caugh
 // Global knob normalizedValues storage - stores all knob positions for all panels (0.0-1.0 normalized)
 // Size matches actual panel count to save memory
 float knobValues[11][4] = {  // panelModesCount = 11
-    {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 0: ADSR
-    {0.0f, 0.0f, 0.0f, 0.8f},  // Panel 1: MIXER
+    {0.0f, 0.5f, 0.7f, 0.0f},  // Panel 0: ADSR
+    {0.0f, 1.0f, 0.0f, 0.8f},  // Panel 1: MIXER
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 2: OSC
-    {0.0f, 0.0f, 1.0f, 1.0f},  // Panel 3: TUNING
+    {0.9f, 0.0f, 1.0f, 1.0f},  // Panel 3: TUNING
     {0.0f, 0.0f, 0.5f, 0.0f},  // Panel 4: SEQUENCER
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 5: SAMPLER
     {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 6: MULT 
     {0.25f, 0.6f, 0.01f, 0.05f}, // Panel 7: COMP
-    {0.0f, 0.5f, 0.3f, 0.3f},  // Panel 8: DELAY (Mode, Time, Damp, Mix)
+    {0.7f, 0.5f, 0.5f, 0.2f},  // Panel 8: DELAY (Mode, Time, Damp, Mix)
     {0.2f, 0.5f, 0.0f, 0.0f},  // Panel 9: MICRO (PLen, PWid, Mod, Mix)
     {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 10: PRESET
 };
@@ -1249,9 +1283,25 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             break;
             
         case PARAM_OSC_MODE:
-            appState.oscMode = normalizedValue;
-            // Store mode for audio callback to use
-            // No action needed here, the audio callback will check the mode
+            {
+                float oldMode = appState.oscMode;
+                appState.oscMode = normalizedValue;
+                
+                // Reset phase tracking when switching to/from Interpolated mode to prevent stale values
+                int newMode = static_cast<int>(normalizedValue * 3.99f);
+                int oldModeInt = static_cast<int>(oldMode * 3.99f);
+                
+                if ((newMode == 0 && oldModeInt != 0) || (newMode != 0 && oldModeInt == 0)) {
+                    // Switching to/from Interpolated mode - reset phase tracking
+                    for (int i = 0; i < 2; i++) {
+                        externalPhaseTrack[i] = 0.0f;
+                        externalPhasePrev[i] = 0.0f;
+                        externalPhaseSmooth[i] = 0.0f;
+                        inputPeakAmplitude[i] = 1.0f;  // Reset peak tracking
+                        normalizedInputPrev[i] = 0.0f;  // Reset smoothing
+                    }
+                }
+            }
             break;
             
         case PARAM_OSC_FM2_RATIO:
@@ -1915,13 +1965,19 @@ float MidiNoteToFrequency(int8_t note, int8_t channel)
 }
 
 // Process oscillator based on selected mode
-float ProcessOscillator(int voiceIndex) {
+// externalPhase: optional external phase value (0-1 range) for InterpolatedOscillator
+float ProcessOscillator(int voiceIndex, float externalPhase = -1.0f) {
     int mode = static_cast<int>(appState.oscMode * 3.99f); // 0-3
     mode = std::max(0, std::min(3, mode)); // Clamp to 0-3
     
     switch(mode) {
         case 0: // Interpolated
-            return voiceInterpOsc[voiceIndex].Process();
+            if (externalPhase >= 0.0f) {
+                // Use external phase to address the wavetable
+                return voiceInterpOsc[voiceIndex].ProcessAtPhase(externalPhase);
+            } else {
+                return voiceInterpOsc[voiceIndex].Process();
+            }
         case 1: // FM2
             return voiceFm2Osc[voiceIndex].Process();
         case 2: // Formant
@@ -1929,7 +1985,11 @@ float ProcessOscillator(int voiceIndex) {
         case 3: // Harmonic
             return voiceHarmonicOsc[voiceIndex].Process();
         default:
-            return voiceInterpOsc[voiceIndex].Process();
+            if (externalPhase >= 0.0f) {
+                return voiceInterpOsc[voiceIndex].ProcessAtPhase(externalPhase);
+            } else {
+                return voiceInterpOsc[voiceIndex].Process();
+            }
     }
 }
 
@@ -1939,6 +1999,8 @@ void SetOscillatorFrequency(int voiceIndex, float freq) {
     voiceFm2Osc[voiceIndex].SetFrequency(freq);
     voiceFormantOsc[voiceIndex].SetCarrierFreq(freq);
     voiceHarmonicOsc[voiceIndex].SetFreq(freq);
+    // Update internal phase oscillator frequency (used for phase addressing in voices 1 and 3)
+    internalPhaseOsc[voiceIndex].SetFreq(freq);
     
     // Update formant frequency as ratio of carrier frequency
     // Map 0.0-1.0 to 0.5-2.0 ratio
@@ -2049,22 +2111,117 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
     for(size_t i = 0; i < size; i++)
     {
+        // Determine mode first to know how to initialize results
+        int mode = static_cast<int>(appState.oscMode * 3.99f);
+        mode = std::max(0, std::min(3, mode));
+        
         for (size_t j = 0; j < 4; j++)
         {
-            // results[j] = const_cast<float*>(&in[j][i]);
-            results[j] = in[j][i];
+            // In Interpolated mode, voices 0 and 2 use oscillator output, not input
+            // Initialize them to zero to prevent input signal bleed
+            if (mode == 0 && (j == 0 || j == 2)) {
+                results[j] = 0.0f;  // Will be replaced with oscillator output
+            } else {
+                results[j] = in[j][i];  // Other voices use input directly
+            }
         }
 
-        // Always compute oscillator outputs for all voices
+        // Process internal phase oscillators to advance their phase
+        // These are used for phase addressing in voices 1 and 3
         for (int ch = 0; ch < 4; ch++) {
-            oscOutputs[ch] = ProcessOscillator(ch);
+            internalPhaseOsc[ch].Process();  // Advance phase, output is discarded
         }
         
-        // For voices 0 and 2: only mix into stereo output if useInternalOscillators is enabled
+        // Always compute oscillator outputs for all voices
+        // For InterpolatedOscillator: use external audio inputs or internal oscillators to address phase
+        // Mode is already calculated above, reuse it
+        for (int ch = 0; ch < 4; ch++) {
+            float externalPhase = -1.0f;  // Default: no external phase
+            
+            // Only use external phase for InterpolatedOscillator mode (mode 0)
+            // Mode variable is already set from initialization loop above
+            
+            if (mode == 0) {  // Interpolated mode
+                if (ch == 0 || ch == 2) {
+                // if (false) {
+                    // Voices 0 and 2: use external audio inputs with phase unwrapping
+                    float audioInput = 0.0f;
+                    int trackIdx = (ch == 0) ? 0 : 1;  // Index into externalPhaseTrack array
+                    
+                    if (ch == 0) {
+                        audioInput = in[0][i];
+                    } else {  // ch == 2
+                        audioInput = in[2][i];
+                    }
+                    
+                    // Normalize input to full -1 to 1 range based on detected peak amplitude
+                    // This ensures we always use the full 0-1 phase range regardless of input level
+                    // Track peak amplitude with adaptive attack/decay to handle changing input levels
+                    float absInput = fabsf(audioInput);
+                    float attackAlpha = 0.01f;   // Faster attack when input exceeds peak
+                    float decayAlpha = 0.0001f;  // Very slow decay to track decreasing levels
+                    
+                    if (absInput > inputPeakAmplitude[trackIdx]) {
+                        // Fast attack when input exceeds current peak
+                        inputPeakAmplitude[trackIdx] = inputPeakAmplitude[trackIdx] * (1.0f - attackAlpha) + absInput * attackAlpha;
+                    } else {
+                        // Slow decay to track decreasing input levels
+                        inputPeakAmplitude[trackIdx] = inputPeakAmplitude[trackIdx] * (1.0f - decayAlpha) + absInput * decayAlpha;
+                    }
+                    
+                    // Ensure minimum peak amplitude to avoid division issues
+                    if (inputPeakAmplitude[trackIdx] < 0.001f) {
+                        inputPeakAmplitude[trackIdx] = 0.001f;
+                    }
+                    
+                    // Normalize input to -1 to 1 range based on detected peak
+                    float normalizedInput = audioInput / (0.98f *inputPeakAmplitude[trackIdx]);
+                    
+                    // Clamp normalized input to prevent overshoot (keep away from edges to avoid clipping)
+                    normalizedInput = std::max(-1.0f, std::min(1.0f, normalizedInput));
+                    
+                    // Apply light smoothing to reduce high-frequency artifacts
+                    // This helps reduce aliasing and distortion from rapid phase changes
+                    float smoothingFactor = 0.95f;  // Light smoothing (95% previous, 5% new)
+                    normalizedInput = normalizedInputPrev[trackIdx] * smoothingFactor + normalizedInput * (1.0f - smoothingFactor);
+                    normalizedInputPrev[trackIdx] = normalizedInput;
+                    
+                    // Map from -1 to 1 range to 0 to 1 range (phase range)
+                    float mappedPhase = (normalizedInput + 1.0f) * 0.5f;
+                    
+                    // Normalize phase exactly like ProcessAtPhase does internally
+                    while (mappedPhase >= 1.0f) mappedPhase -= 1.0f;
+                    while (mappedPhase < 0.0f) mappedPhase += 1.0f;
+                    
+                    // Use mapped phase directly for wavetable lookup
+                    externalPhase = mappedPhase;
+                } else {
+                    // Voices 1 and 3: use internal oscillator phase
+                    externalPhase = internalPhaseOsc[ch].GetPhase();
+                }
+            }
+
+            // externalPhase = 0.25f + externalPhase / 2.0f;
+            
+            oscOutputs[ch] = ProcessOscillator(ch, externalPhase);
+        }
+        
+        // Mode is already calculated above, reuse it
+        // For voices 0 and 2: use oscillator output when in Interpolated mode (mode 0)
         // For voices 1 and 3: always mix into stereo output if useInternalOscillators is enabled
         for (int ch = 0; ch < 4; ch++) {
-            if (useInternalOscillators[ch]) {
-                results[ch] = oscOutputs[ch];
+            if (ch == 0 || ch == 2) {
+                // Voices 0 and 2: use oscillator output in Interpolated mode
+                if (mode == 0) {
+                    results[ch] = oscOutputs[ch];
+                } else if (useInternalOscillators[ch]) {
+                    results[ch] = oscOutputs[ch];
+                }
+            } else {
+                // Voices 1 and 3: use oscillator output if useInternalOscillators is enabled
+                if (useInternalOscillators[ch]) {
+                    results[ch] = oscOutputs[ch];
+                }
             }
         }
 
@@ -2273,17 +2430,18 @@ int main(void)
     sd_cfg.Defaults();
     SdmmcHandler::Result sd_result = sdcard.Init(sd_cfg);
     
-    const char* initMessage = "init failed";
+    // const char* initMessage = "init failed";
     if (sd_result == SdmmcHandler::Result::OK) {
         uint8_t bsp_result = BSP_SD_Init();
         if (bsp_result == MSD_OK) {
             sdCardInitialized = true;
             // Small delay to ensure card is ready
-            HAL_Delay(100);  // 100ms delay
-            initMessage = LoadPreset() ? "preset loaded" : "load failed";
+            // HAL_Delay(100);  // 100ms delay
+            // initMessage = LoadPreset() ? "" : "fail";
+            // LoadPreset();
         }
     }
-    SetDebugMessage(initMessage);
+    // SetDebugMessage(initMessage);
 
     // Apply loaded normalizedValues to all parameters
     for (int panel = 0; panel < panelModesCount; panel++) {
@@ -2391,9 +2549,18 @@ int main(void)
     // Initialize interpolated oscillators for all 4 voices
     for (int i = 0; i < 4; i++) {
         voiceInterpOsc[i].Init(samplerate);
-        voiceInterpOsc[i].SetFreq(440.0f);
+        voiceInterpOsc[i].SetFreq(0.0f);  // Set to 0 so phase doesn't auto-increment
         voiceInterpOsc[i].SetAmp(1.0f);
         voiceInterpOsc[i].SetWaveformParam(0.0f);  // Start with sine wave
+    }
+    
+    // Initialize internal phase oscillators for all 4 voices
+    // These follow MIDI note frequencies and are used for phase addressing (voices 1 and 3)
+    for (int i = 0; i < 4; i++) {
+        internalPhaseOsc[i].Init(samplerate);
+        internalPhaseOsc[i].SetFreq(440.0f);  // Start at A4, will be updated by MIDI
+        internalPhaseOsc[i].SetAmp(1.0f);
+        internalPhaseOsc[i].SetWaveformParam(0.0f);  // Start with sine wave
     }
     
     // Initialize FM2 oscillators
@@ -2431,7 +2598,7 @@ int main(void)
     SetParamValue(PARAM_OSC_FORMANT_FREQ, 0.5f);     // 500Hz
     SetParamValue(PARAM_OSC_FORMANT_PHASE, 0.5f);   // Center phase
     SetParamValue(PARAM_OSC_HARMONIC_IDX, 0.0f);    // First harmonic
-    SetParamValue(PARAM_OSC_HARMONIC_DECAY, 0.3f);  // Decay rate
+    SetParamValue(PARAM_OSC_HARMONIC_DECAY, 1.0f);  // Decay rate
     SetParamValue(PARAM_OSC_HARMONIC_SKEW, 0.0f);   // No skew (fundamental emphasis)
 
     // Start the ADC and Audio Peripherals on the Hardware
@@ -3281,7 +3448,6 @@ void ProcessKnobs()
     {
         // MIXER panel - all parameter updates handled by SetParamValue() via bindings
     }
-    // Removed Pluck panel processing to save memory
     else if (currentPanel.id == 'o')
     {
         // OSC panel - all parameter updates handled by SetParamValue() via bindings
@@ -3304,16 +3470,6 @@ void ProcessKnobs()
     {
         previousKnobState[i] = smoothedKnobState[i]; // Update with smoothed normalizedValues for next comparison
     }
-    
-    // Auto-save to SD card when knobs change - DISABLED to prevent audio dropouts
-    // Users can manually save via encoder press in PRESET panel
-    // if (knobChanged && sdCardInitialized) {
-    //     uint32_t currentTime = hw.seed.system.GetNow();
-    //     if (currentTime - lastSaveTime >= SAVE_DEBOUNCE_MS) {
-    //         RequestSaveToSD();
-    //         lastSaveTime = currentTime;
-    //     }
-    // }
 }
 
 
@@ -3768,8 +3924,8 @@ void ProcessCCQueue() {
     }
 }
 
+// Force immediate reset to clean state
 void ResetCCState() {
-    // Force immediate reset to clean state
     ccQueueCount = 0;
     ccQueueHead = 0;
     ccQueueTail = 0;
@@ -3777,7 +3933,6 @@ void ResetCCState() {
     lastCCValue = 0;
     ccIsLatched = false;
     ccStateInitialized = true;
-    // SetDebugMessage("CC Reset");
 }
 
 bool ShouldFireWithProbability(uint8_t probability) {
