@@ -257,7 +257,7 @@ HarmonicOscillator<> voiceHarmonicOsc[4];    // Harmonic oscillators for all 4 v
 InterpolatedOscillator panLfo;              // LFO for panning CV output
 InterpolatedOscillator internalPhaseOsc[4]; // Internal oscillators for phase generation (voices 1 and 3 use these)
 
-size_t blocksize = 8;
+size_t blocksize = 16; (333us latency vs 167us for 8)
 int panelMode;
 float voicesMinLevel = 0.0f;
 
@@ -899,6 +899,7 @@ float knobValues[11][4] = {  // panelModesCount = 11
     {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 10: PRESET
 };
 const float KNOB_CATCHUP_THRESHOLD = 0.05f;  // How close knob must be to catch up (5%)
+constexpr float MICROSOUND_MIN_ACTIVE_MIX = 0.02f; // Keep microsound fully bypassed near 0%
 
 struct voiceStruct
 {
@@ -1703,7 +1704,7 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             break;
             
         case PARAM_MICRO_WETDRY:
-            appState.microWetDry = normalizedValue;
+            appState.microWetDry = (normalizedValue < MICROSOUND_MIN_ACTIVE_MIX) ? 0.0f : normalizedValue;
             // Wet/dry mixing now happens in ApplyMicrosound, not in PulsarSynth
             break;
         
@@ -1823,7 +1824,7 @@ void ApplyMicrosound(float* data) {
     
     // Skip ALL processing if wet/dry is 0 (fully dry)
     // This ensures no interference with the normal signal path
-    if (wetDry <= 0.0f) {
+    if (wetDry <= MICROSOUND_MIN_ACTIVE_MIX) {
         return;  // Pass through unchanged
     }
     
@@ -3415,6 +3416,11 @@ void ProcessKnobs()
             float storedKnobValue = knobValues[panelMode][inputIndex];
             float knobPosition = inputs[inputIndex];
             
+            // Apply a deadzone to the microsound mix knob so it truly stays at 0% when idle
+            if (paramId == PARAM_MICRO_WETDRY && knobPosition < MICROSOUND_MIN_ACTIVE_MIX) {
+                knobPosition = 0.0f;
+            }
+            
             // Check if knob has caught up to the stored knob normalizedValue
             if (!knobCaughtUp[inputIndex]) {
                 // Check if knob is within threshold of target normalizedValue
@@ -3430,14 +3436,14 @@ void ProcessKnobs()
             }
             
             // Knob is caught up - update parameter normally
-            SetParamValue(paramId, inputs[inputIndex]);
+            SetParamValue(paramId, knobPosition);
             
             // Update knob normalizedValues storage
-            knobValues[panelMode][inputIndex] = inputs[inputIndex];
+            knobValues[panelMode][inputIndex] = knobPosition;
             
             // Update panel normalizedValues for the currently selected panel (legacy)
-            currentPanel.normalizedValues[inputIndex] = inputs[inputIndex];
-            displayPanels[panelMode].normalizedValues[inputIndex] = inputs[inputIndex];
+            currentPanel.normalizedValues[inputIndex] = knobPosition;
+            displayPanels[panelMode].normalizedValues[inputIndex] = knobPosition;
             
             knobChanged = true;
         }
