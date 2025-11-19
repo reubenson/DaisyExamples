@@ -1513,6 +1513,15 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             
         case PARAM_SEQ_BPM:
             {
+                // In latch mode the envelope timing drives the sequencer, so ignore BPM knob input
+                if (adsrLatchEnabled) {
+                    float normalizedBpm = static_cast<float>(sequencer.clockBpm - CLOCK_BPM_MIN)
+                                           / (CLOCK_BPM_MAX - CLOCK_BPM_MIN);
+                    normalizedBpm = std::max(0.0f, std::min(1.0f, normalizedBpm));
+                    appState.seqBpm = normalizedBpm;
+                    break;
+                }
+
                 // Calculate BPM from normalized value
                 int32_t newBpm = CLOCK_BPM_MIN + static_cast<int32_t>(normalizedValue * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
                 
