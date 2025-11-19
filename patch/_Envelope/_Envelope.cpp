@@ -2549,7 +2549,7 @@ int main(void)
     // Initialize interpolated oscillators for all 4 voices
     for (int i = 0; i < 4; i++) {
         voiceInterpOsc[i].Init(samplerate);
-        voiceInterpOsc[i].SetFreq(0.0f);  // Set to 0 so phase doesn't auto-increment
+        voiceInterpOsc[i].SetFreq(0.5f);  // Set to 0 so phase doesn't auto-increment
         voiceInterpOsc[i].SetAmp(1.0f);
         voiceInterpOsc[i].SetWaveformParam(0.0f);  // Start with sine wave
     }
@@ -3229,6 +3229,8 @@ void ProcessEncoder()
         for (int i = 0; i < 4; i++) {
             // If knob is unbound (PARAM_NONE), mark as caught up immediately
             knobCaughtUp[i] = (knobParams[i] == PARAM_NONE);
+            // Reset previous knob state to prevent false change detection after panel switch
+            previousKnobState[i] = smoothedKnobState[i];
         }
         
         knobChanged = true; // Trigger display update
@@ -3351,7 +3353,7 @@ void ProcessKnobs()
 {
     float inputs[4];
     int8_t inputIndex = -1; // assuming only one knob changes at a time
-    float knobThreshold = 0.0001; // lower normalizedValues for slower movement
+    float knobThreshold = 0.00005; // lower normalizedValues for slower movement
     float alpha = 0.25; // higher normalizedValue for less smoothing
     float knobMax = 0.96; // knobs don't seem to go above this normalizedValue
 
@@ -3381,6 +3383,7 @@ void ProcessKnobs()
         }
         
         // For OSC panel, route knobs to mode-specific parameters
+        // all other panels are handled by SetParamValue() via bindings
         if (currentPanel.id == 'o' && inputIndex < 3) {
             int mode = static_cast<int>(appState.oscMode * 3.99f);
             mode = std::max(0, std::min(3, mode));
@@ -3440,39 +3443,11 @@ void ProcessKnobs()
         }
     }
 
-    if (currentPanel.id == 'e')
-    {
-        // ADSR panel - all parameter updates handled by SetParamValue() via bindings
-    }
-    else if (currentPanel.id == 'm')
-    {
-        // MIXER panel - all parameter updates handled by SetParamValue() via bindings
-    }
-    else if (currentPanel.id == 'o')
-    {
-        // OSC panel - all parameter updates handled by SetParamValue() via bindings
-    }
-    else if (currentPanel.id == 's')
-    {
-        // SEQUENCER panel - all parameter updates handled by SetParamValue() via bindings
-        // sequencer.sequenceEnabled = sequencer.sequencerMode; // Enable sequence when sequencer mode is active
-    }
-    else if (currentPanel.id == 't')
-    {
-        // TUNING panel - all parameter updates handled by SetParamValue() via bindings
-    }
-    else if (currentPanel.id == 'c')
-    {
-        // SAMPLER panel - all parameter updates handled by SetParamValue() via bindings
-    }
-
     for (int i = 0; i < 4; i++)
     {
         previousKnobState[i] = smoothedKnobState[i]; // Update with smoothed normalizedValues for next comparison
     }
 }
-
-
 
 void ProcessControls()
 {
