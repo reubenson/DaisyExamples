@@ -252,12 +252,11 @@ public:
 
 InterpolatedOscillator voiceInterpOsc[4];  // Oscillators for all 4 voices
 Fm2 voiceFm2Osc[4];                        // FM2 oscillators for all 4 voices
-FormantOscillator voiceFormantOsc[4];             // Formant oscillators for all 4 voices
 HarmonicOscillator<> voiceHarmonicOsc[4];    // Harmonic oscillators for all 4 voices (default 16 harmonics)
 InterpolatedOscillator panLfo;              // LFO for panning CV output
 InterpolatedOscillator internalPhaseOsc[4]; // Internal oscillators for phase generation (voices 1 and 3 use these)
 
-size_t blocksize = 16; (333us latency vs 167us for 8)
+size_t blocksize = 16; //(333us latency vs 167us for 8)
 int panelMode;
 float voicesMinLevel = 0.0f;
 
@@ -420,66 +419,101 @@ enum SequencerOrderMode {
     SEQ_ORDER_BRN = 5     // Brownian
 };
 
+// Individual sequencer track state
+struct SequencerTrack {
+    // Track-specific parameters
+    float density = 0.0f;  // 0.0f to 16.0f - used for CC probability when SEQ mode on
+    float multiplier = 0.0f;  // 0.0f to 1.0f - maps to 1,2,4,8
+    SequencerOrderMode orderMode = SEQ_ORDER_ASC;
+    float noteLengthPercent = 0.5f;  // Note length as percentage of step (10%-90%)
+    
+    // Per-track progression state
+    uint8_t noteIndex = 0;
+    bool upDownDirection = true;  // true = ascending, false = descending (for up-down mode)
+    uint8_t lastNote = 0;  // For brownian mode
+    
+    // Per-track note scheduling
+    uint32_t lastNoteTime = 0;
+    uint32_t noteInterval = 0;  // Calculated based on multiplier and sequenceStepInterval
+    uint8_t currentNoteInSequence = 0;  // Current note position within this track's sequence (0 to noteCount-1)
+    uint8_t noteCount = 4;  // Number of notes in this track's sequence (4 * multiplier)
+    
+    // Per-track note-off scheduling
+    uint32_t noteOffTime = 0;
+    bool noteOffPending = false;
+    uint8_t noteToTurnOff = 0;
+    int8_t voiceToTurnOff = -1;
+    
+    // Inline helper to get multiplier value (1, 2, 4, or 8)
+    inline uint8_t GetMultiplierValue() {
+        if (multiplier < 0.25f) return 1;
+        else if (multiplier < 0.5f) return 2;
+        else if (multiplier < 0.75f) return 4;
+        else return 8;
+    }
+    
+    // Inline helper to get density value (0-16)
+    inline int GetDensityValue() {
+        return static_cast<int>(density + 0.5f);
+    }
+    
+    // Update note count based on multiplier (when SEQ mode on)
+    inline void UpdateNoteCount() {
+        noteCount = 4 * GetMultiplierValue();  // 4, 8, 16, or 32 notes
+    }
+    
+    // Reset track state
+    inline void Reset() {
+        noteIndex = 0;
+        upDownDirection = true;
+        lastNote = 0;
+        currentNoteInSequence = 0;
+        noteOffPending = false;
+        noteToTurnOff = 0;
+        voiceToTurnOff = -1;
+    }
+};
+
 // Sequencer parameters and state
 struct SequencerParams {
-    // Hardware parameter objects
-    // Parameter noteParam;
-    
-    // Density property (0.0f to 16.0f)
-    float density = 0.0f;
-    
-    // Sequencer mode and state
+    // Shared sequencer state
     bool sequencerMode = false;
     bool selfTriggerMode = false;  // Alternate sequencer mode: self-trigger based on envelope duration
-    SequencerOrderMode sequencerOrderMode = SEQ_ORDER_ASC;
-    uint8_t sequencerNoteIndex = 0;
-    float sequencerNoteLengthPercent = 0.5f;  // Note length as percentage of step (10%-90%)
     bool sequencerUsingInitialCapture = false;
     uint32_t envelopeDurationMs = 0;  // Calculated from attack+decay for self-trigger mode
     
-    // State for up-down mode
-    bool sequencerUpDownDirection = true;  // true = ascending, false = descending
+    // Shared density for trigger sequence generation (Euclidean rhythm)
+    float density = 0.0f;  // 0.0f to 16.0f - used to generate trigger sequence pattern
     
-    // State for brownian mode
-    uint8_t sequencerLastNote = 0;
-    
-    // Sequencer note management
+    // Shared note pool - all tracks derive notes from this
     std::vector<uint8_t> sequencerNotes;  // Array of held notes for sequencer
-    uint32_t sequencerNoteOffTime = 0;
-    bool sequencerNoteOffPending = false;
-    uint8_t sequencerNoteToTurnOff = 0;
-    int8_t sequencerVoiceToTurnOff = -1;
     
-    // Clock and timing
+    // Four independent sequencer tracks
+    SequencerTrack tracks[4];
+    
+    // Clock and timing (shared across all tracks)
     int32_t clockBpm = CLOCK_BPM_DEFAULT;
     uint32_t lastClockTime = 0;
     uint32_t clockInterval = 0;
     bool clockEnabled = true;
     
-    // Trigger sequence
+    // Trigger sequence (shared across all tracks)
     bool triggerSequence[TRIGGER_SEQUENCE_LENGTH] = {false};
     uint8_t currentSequenceStep = 0;
     uint32_t lastSequenceStepTime = 0;
     uint32_t sequenceStepInterval = 0;
-    // bool sequenceEnabled = true;
     uint8_t triggerNote = 36;  // MIDI note for triggers (C2)
     uint8_t ccTriggerChannel = 12;
     uint8_t ccValueChannel = 15;
     
-    // Subdivision timing for CC multiplier feature
+    // Subdivision timing for CC multiplier feature (shared)
     uint8_t currentSubdivision = 0; // 0-7, tracks which of 8 subdivisions we're on
     uint32_t lastSubdivisionTime = 0;
     uint32_t subdivisionInterval = 0; // Calculated as sequenceStepInterval / 8
     
     // Inline initialization (no function call overhead)
     void Init() {
-        // noteParam.Init(hw.controls[1], 36.0f, 84.0f, Parameter::LINEAR);
         sequencerNotes.clear();
-        sequencerNoteIndex = 0;
-        sequencerOrderMode = SEQ_ORDER_ASC;
-        sequencerUpDownDirection = true;
-        sequencerLastNote = 0;
-        sequencerNoteLengthPercent = 0.5f;
         clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
         lastClockTime = hw.seed.system.GetNow();
         
@@ -488,12 +522,13 @@ struct SequencerParams {
         lastSubdivisionTime = 0;
         subdivisionInterval = 0; // Will be calculated after sequenceStepInterval is set
         
+        // Initialize all tracks
+        for (int i = 0; i < 4; i++) {
+            tracks[i].Reset();
+            tracks[i].UpdateNoteCount();
+        }
+        
         InitTriggerSequence();
-    }
-    
-    // Inline helper (no function call overhead)
-    inline int GetDensityValue() {
-        return static_cast<int>(density + 0.5f);
     }
     
     inline void UpdateClockInterval() {
@@ -502,6 +537,21 @@ struct SequencerParams {
 };
 
 SequencerParams sequencer;
+
+// Helper function to update track note intervals based on total sequence duration
+// Each track plays all its notes over the total sequence duration (sequenceStepInterval * TRIGGER_SEQUENCE_LENGTH)
+inline void UpdateTrackNoteIntervals() {
+    uint32_t totalSequenceDuration = sequencer.sequenceStepInterval * TRIGGER_SEQUENCE_LENGTH;
+    for (int i = 0; i < 4; i++) {
+        SequencerTrack& track = sequencer.tracks[i];
+        track.UpdateNoteCount();  // Ensure note count is up to date
+        if (track.noteCount > 0 && totalSequenceDuration > 0) {
+            track.noteInterval = totalSequenceDuration / track.noteCount;
+        } else {
+            track.noteInterval = 0;
+        }
+    }
+}
 
 // Delay time helper (centralized) - implemented after sequencer declaration
 inline float DelayTimeToMs(float normalizedTime, bool isShortMode) {
@@ -540,8 +590,6 @@ enum ParamId {
     PARAM_OSC_MODE,
     PARAM_OSC_FM2_RATIO,
     PARAM_OSC_FM2_INDEX,
-    PARAM_OSC_FORMANT_FREQ,
-    PARAM_OSC_FORMANT_PHASE,
     PARAM_OSC_HARMONIC_IDX,
     PARAM_OSC_HARMONIC_DECAY,
     PARAM_OSC_HARMONIC_SKEW,
@@ -556,17 +604,17 @@ enum ParamId {
     PARAM_SEQ_LENGTH,
     PARAM_SEQ_BPM,
     
-    // SAMPLER Panel (CC Probabilities)
-    PARAM_CC_PROB_0_1,
-    PARAM_CC_PROB_2_3,
-    PARAM_CC_PROB_4_5,
-    PARAM_CC_PROB_6_7,
+    // SAMPLER Panel (Track Densities - replaces CC Probabilities)
+    PARAM_SEQ_TRACK0_DENSITY,
+    PARAM_SEQ_TRACK1_DENSITY,
+    PARAM_SEQ_TRACK2_DENSITY,
+    PARAM_SEQ_TRACK3_DENSITY,
     
-    // SAMPLER Panel (CC Multipliers)
-    PARAM_CC_MULT_0_1,
-    PARAM_CC_MULT_2_3,
-    PARAM_CC_MULT_4_5,
-    PARAM_CC_MULT_6_7,
+    // MULT Panel (Track Multipliers - replaces CC Multipliers)
+    PARAM_SEQ_TRACK0_MULT,
+    PARAM_SEQ_TRACK1_MULT,
+    PARAM_SEQ_TRACK2_MULT,
+    PARAM_SEQ_TRACK3_MULT,
     
     // COMP Panel
     PARAM_COMP_RATIO,
@@ -606,11 +654,9 @@ struct UserState {
     
     // OSC parameters
     float oscWaveform;          // 0.0-1.0 (sine->tri->square->saw)
-    float oscMode;              // 0.0-1.0 oscillator mode (0=Interpolated, 1=FM2, 2=Formant, 3=Harmonic)
+    float oscMode;              // 0.0-1.0 oscillator mode (0=Interpolated, 1=FM2, 2=Harmonic)
     float fm2Ratio;             // 0.0-1.0 maps to 0.125-8.0
     float fm2Index;             // 0.0-1.0 maps to 0.0-1.0
-    float formantFreq;          // 0.0-1.0 maps to 0.5-2.0 ratio of carrier frequency
-    float formantPhaseShift;   // 0.0-1.0 maps to 0.0-1.0
     float harmonicIdx;          // 0.0-1.0 maps to 1-16 as integers
     float harmonicDecay;        // 0.0-1.0 maps to 0-10 decay rate
     float harmonicSkew;         // 0.0-1.0 skew position (0=fundamental, 1=high harmonics)
@@ -619,23 +665,21 @@ struct UserState {
     float tuningIndex;          // 0.0-1.0 maps to tuning preset index
     float tuningMidiEnable;     // 0.0-1.0 (>0.5 = enabled)
     
-    // SEQUENCER parameters
-    float seqDensity;           // 0.0-1.0 maps to 0-16 triggers
-    float seqOrder;             // 0.0-1.0 (<0.5=ascending, >=0.5=descending)
-    float seqLength;            // 0.0-1.0 note length percentage
+    // SEQUENCER parameters (shared/legacy - kept for backward compatibility, but tracks use their own)
+    float seqDensity;           // 0.0-1.0 maps to 0-16 triggers (legacy, tracks have their own)
+    float seqOrder;             // 0.0-1.0 (<0.5=ascending, >=0.5=descending) (legacy, tracks have their own)
+    float seqLength;            // 0.0-1.0 note length percentage (legacy, tracks have their own)
     float seqBpm;               // 0.0-1.0 maps to CLOCK_BPM_MIN-CLOCK_BPM_MAX
     
-    // SAMPLER parameters (CC probabilities)
-    float ccProb0_1;            // 0.0-1.0 probability for CC slots 0 and 1
-    float ccProb2_3;            // 0.0-1.0 probability for CC slots 2 and 3
-    float ccProb4_5;            // 0.0-1.0 probability for CC slots 4 and 5
-    float ccProb6_7;            // 0.0-1.0 probability for CC slots 6 and 7
-    
-    // SAMPLER parameters (CC multipliers)
-    float ccMult0_1;            // 0.0-1.0 maps to multiplier 1,2,4,8 for CC slots 0 and 1
-    float ccMult2_3;            // 0.0-1.0 maps to multiplier 1,2,4,8 for CC slots 2 and 3
-    float ccMult4_5;            // 0.0-1.0 maps to multiplier 1,2,4,8 for CC slots 4 and 5
-    float ccMult6_7;            // 0.0-1.0 maps to multiplier 1,2,4,8 for CC slots 6 and 7
+    // Per-track sequencer parameters (replaces CC prob/mult)
+    float seqTrack0Density;     // 0.0-1.0 maps to 0-16 triggers for track 0 (CC probability when SEQ off)
+    float seqTrack0Multiplier;  // 0.0-1.0 maps to 1,2,4,8 for track 0 (subdivision timing when SEQ off, note count when SEQ on)
+    float seqTrack1Density;     // Track 1 density
+    float seqTrack1Multiplier;  // Track 1 multiplier
+    float seqTrack2Density;     // Track 2 density
+    float seqTrack2Multiplier;  // Track 2 multiplier
+    float seqTrack3Density;     // Track 3 density
+    float seqTrack3Multiplier;  // Track 3 multiplier
     
     // COMP parameters
     float compRatio;            // 0.0-1.0 maps to 1.0-40.0 compression ratio
@@ -670,8 +714,6 @@ struct UserState {
         oscMode(initialValue),          // Default Interpolated oscillator
         fm2Ratio(initialValue),        // Default 1.0 ratio (0.26 normalizes to 1.0)
         fm2Index(initialValue),         // Default 0.5 index
-        formantFreq(initialValue),      // Default 1.0x ratio (0.33 normalizes to ~1.0, which is 100%)
-        formantPhaseShift(initialValue), // Default 0.5 phase shift
         harmonicIdx(initialValue),      // Default harmonic index 1 (0.0 normalizes to 1)
         harmonicDecay(initialValue),    // Default decay rate
         harmonicSkew(initialValue),     // Default no skew (emphasize fundamental)
@@ -681,14 +723,14 @@ struct UserState {
         seqOrder(initialValue),         // Default ascending
         seqLength(initialValue),        // Default 50% length
         seqBpm((CLOCK_BPM_DEFAULT - CLOCK_BPM_MIN) / static_cast<float>(CLOCK_BPM_MAX - CLOCK_BPM_MIN)),  // Default 120 BPM normalized
-        ccProb0_1(initialValue),
-        ccProb2_3(initialValue),
-        ccProb4_5(initialValue),
-        ccProb6_7(initialValue),
-        ccMult0_1(initialValue),        // Default multiplier 1 (0.0 maps to multiplier 1)
-        ccMult2_3(initialValue),
-        ccMult4_5(initialValue),
-        ccMult6_7(initialValue),
+        seqTrack0Density(initialValue),  // Default 0.0 (no triggers)
+        seqTrack0Multiplier(initialValue),  // Default multiplier 1 (0.0 maps to multiplier 1)
+        seqTrack1Density(initialValue),
+        seqTrack1Multiplier(initialValue),
+        seqTrack2Density(initialValue),
+        seqTrack2Multiplier(initialValue),
+        seqTrack3Density(initialValue),
+        seqTrack3Multiplier(initialValue),
         compRatio(initialValue),        // Default 4:1 ratio (0.25 = (4-1)/(40-1) ≈ 0.077)
         compThreshold(initialValue),    // Default -12 dB (0.6 in normalized range)
         compAttack(initialValue),      // Default 0.001s attack
@@ -751,7 +793,6 @@ struct panelStruct
     const char*         input2Name;
     const char*         input3Name;
     const char*         input4Name;
-    float               normalizedValues[4];      // Legacy - will be removed in cleanup
     PanelKnobBinding    bindings;       // New binding system
 };
 
@@ -766,7 +807,6 @@ panelStruct displayPanels[] = {
         input2Name: "D/R", 
         input3Name: "S",
         input4Name: "Min",
-        normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
         bindings: {PARAM_ADSR_ATTACK, PARAM_ADSR_DECAY_RELEASE, PARAM_ADSR_SUSTAIN, PARAM_ADSR_MIN}
     },
     {
@@ -776,7 +816,6 @@ panelStruct displayPanels[] = {
         input2Name: "Amp",
         input3Name: "Wave",
         input4Name: "Vol",
-        normalizedValues: {0.0f, 0.0f, 0.0f, 0.8f},
         bindings: {PARAM_PAN_FREQ, PARAM_PAN_AMP, PARAM_PAN_WAVEFORM, PARAM_VOLUME}
     },
     {
@@ -786,7 +825,6 @@ panelStruct displayPanels[] = {
         input2Name: "",
         input3Name: "",
         input4Name: "Mode",
-        normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
         bindings: {PARAM_OSC_WAVEFORM, PARAM_NONE, PARAM_NONE, PARAM_OSC_MODE}
     },
     {
@@ -796,7 +834,6 @@ panelStruct displayPanels[] = {
         input2Name: "",
         input3Name: "",
         input4Name: "",
-        normalizedValues: {0.0f, 0.0f, 1.0f, 1.0f},
         bindings: {PARAM_TUNING_INDEX, PARAM_NONE, PARAM_TUNING_MIDI_ENABLE, PARAM_NONE}
     },
     {
@@ -806,28 +843,25 @@ panelStruct displayPanels[] = {
         input2Name: "Ord",
         input3Name: "Len",
         input4Name: "BPM",
-        normalizedValues: {0.0f, 0.0f, 0.5f, 0.0f},
         bindings: {PARAM_SEQ_DENSITY, PARAM_SEQ_ORDER, PARAM_SEQ_LENGTH, PARAM_SEQ_BPM}
     },
     {
         name: "SAMPL",
         id: 'c',
-        input1Name: "C12",
-        input2Name: "C34",
-        input3Name: "C56",
-        input4Name: "C78",
-        normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
-        bindings: {PARAM_CC_PROB_0_1, PARAM_CC_PROB_2_3, PARAM_CC_PROB_4_5, PARAM_CC_PROB_6_7}
+        input1Name: "T0D",
+        input2Name: "T1D",
+        input3Name: "T2D",
+        input4Name: "T3D",
+        bindings: {PARAM_SEQ_TRACK0_DENSITY, PARAM_SEQ_TRACK1_DENSITY, PARAM_SEQ_TRACK2_DENSITY, PARAM_SEQ_TRACK3_DENSITY}
     },
     {
         name: "MLT",
         id: 'u',
-        input1Name: "M12",
-        input2Name: "M34",
-        input3Name: "M56",
-        input4Name: "M78",
-        normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
-        bindings: {PARAM_CC_MULT_0_1, PARAM_CC_MULT_2_3, PARAM_CC_MULT_4_5, PARAM_CC_MULT_6_7}
+        input1Name: "T0M",
+        input2Name: "T1M",
+        input3Name: "T2M",
+        input4Name: "T3M",
+        bindings: {PARAM_SEQ_TRACK0_MULT, PARAM_SEQ_TRACK1_MULT, PARAM_SEQ_TRACK2_MULT, PARAM_SEQ_TRACK3_MULT}
     },
     {
         name: "CMM",
@@ -836,7 +870,6 @@ panelStruct displayPanels[] = {
         input2Name: "Th",
         input3Name: "Atk",
         input4Name: "Rel",
-        normalizedValues: {0.25f, 0.6f, 0.01f, 0.05f},
         bindings: {PARAM_COMP_RATIO, PARAM_COMP_THRESHOLD, PARAM_COMP_ATTACK, PARAM_COMP_RELEASE}
     },
     {
@@ -846,7 +879,6 @@ panelStruct displayPanels[] = {
         input2Name: "Time",
         input3Name: "Damp",
         input4Name: "Mix",
-        normalizedValues: {0.0f, 0.5f, 0.3f, 0.3f},
         bindings: {PARAM_DELAY_MODE, PARAM_DELAY_TIME, PARAM_DELAY_DAMP, PARAM_DELAY_WETDRY}
     },
     {
@@ -856,7 +888,6 @@ panelStruct displayPanels[] = {
         input2Name: "PWid",
         input3Name: "Mod",
         input4Name: "Mix",
-        normalizedValues: {0.2f, 0.5f, 0.0f, 0.0f},
         bindings: {PARAM_MICRO_PULSARET_LENGTH, PARAM_MICRO_PULSE_WIDTH, 
                    PARAM_MICRO_MODULATION, PARAM_MICRO_WETDRY}
     },
@@ -867,7 +898,6 @@ panelStruct displayPanels[] = {
         input2Name: "",
         input3Name: "",
         input4Name: "",
-        normalizedValues: {0.0f, 0.0f, 0.0f, 0.0f},
         bindings: {PARAM_NONE, PARAM_NONE, PARAM_NONE, PARAM_NONE}
     }
 };
@@ -1070,8 +1100,6 @@ float GetParamValue(ParamId paramId)
         case PARAM_OSC_MODE:            return appState.oscMode;
         case PARAM_OSC_FM2_RATIO:       return appState.fm2Ratio;
         case PARAM_OSC_FM2_INDEX:       return appState.fm2Index;
-        case PARAM_OSC_FORMANT_FREQ:    return appState.formantFreq;
-        case PARAM_OSC_FORMANT_PHASE:   return appState.formantPhaseShift;
         case PARAM_OSC_HARMONIC_IDX:    return appState.harmonicIdx;
         case PARAM_OSC_HARMONIC_DECAY:  return appState.harmonicDecay;
         case PARAM_OSC_HARMONIC_SKEW:   return appState.harmonicSkew;
@@ -1086,17 +1114,17 @@ float GetParamValue(ParamId paramId)
         case PARAM_SEQ_LENGTH:          return appState.seqLength;
         case PARAM_SEQ_BPM:             return appState.seqBpm;
         
-        // SAMPLER Panel (CC Probabilities)
-        case PARAM_CC_PROB_0_1:         return appState.ccProb0_1;
-        case PARAM_CC_PROB_2_3:         return appState.ccProb2_3;
-        case PARAM_CC_PROB_4_5:         return appState.ccProb4_5;
-        case PARAM_CC_PROB_6_7:         return appState.ccProb6_7;
+        // SAMPLER Panel (Track Densities)
+        case PARAM_SEQ_TRACK0_DENSITY:  return appState.seqTrack0Density;
+        case PARAM_SEQ_TRACK1_DENSITY:  return appState.seqTrack1Density;
+        case PARAM_SEQ_TRACK2_DENSITY:  return appState.seqTrack2Density;
+        case PARAM_SEQ_TRACK3_DENSITY:  return appState.seqTrack3Density;
         
-        // SAMPLER Panel (CC Multipliers)
-        case PARAM_CC_MULT_0_1:         return appState.ccMult0_1;
-        case PARAM_CC_MULT_2_3:         return appState.ccMult2_3;
-        case PARAM_CC_MULT_4_5:         return appState.ccMult4_5;
-        case PARAM_CC_MULT_6_7:         return appState.ccMult6_7;
+        // MULT Panel (Track Multipliers)
+        case PARAM_SEQ_TRACK0_MULT:     return appState.seqTrack0Multiplier;
+        case PARAM_SEQ_TRACK1_MULT:     return appState.seqTrack1Multiplier;
+        case PARAM_SEQ_TRACK2_MULT:     return appState.seqTrack2Multiplier;
+        case PARAM_SEQ_TRACK3_MULT:     return appState.seqTrack3Multiplier;
         
         // COMP Panel
         case PARAM_COMP_RATIO:         return appState.compRatio;
@@ -1164,6 +1192,7 @@ static void UpdateSequencerEnvelopeTiming()
         sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
         sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));
         sequencer.subdivisionInterval = sequencer.sequenceStepInterval / 8;
+        UpdateTrackNoteIntervals();
     }
 }
 
@@ -1289,8 +1318,8 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                 appState.oscMode = normalizedValue;
                 
                 // Reset phase tracking when switching to/from Interpolated mode to prevent stale values
-                int newMode = static_cast<int>(normalizedValue * 3.99f);
-                int oldModeInt = static_cast<int>(oldMode * 3.99f);
+                int newMode = static_cast<int>(normalizedValue * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
+                int oldModeInt = static_cast<int>(oldMode * 2.99f);
                 
                 if ((newMode == 0 && oldModeInt != 0) || (newMode != 0 && oldModeInt == 0)) {
                     // Switching to/from Interpolated mode - reset phase tracking
@@ -1324,36 +1353,6 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                 appState.fm2Index = normalizedValue;
             }
             break;
-            
-        case PARAM_OSC_FORMANT_FREQ:
-            {
-                appState.formantFreq = normalizedValue;
-                // Update formant frequencies for all voices based on their carrier frequencies
-                // Map 0.0-1.0 to 0.5-2.0 ratio
-                float ratio = 0.5f + normalizedValue * 1.5f;
-                ratio = std::max(0.5f, std::min(2.0f, ratio));
-                
-                for (int i = 0; i < 4; i++) {
-                    // Get current carrier frequency and apply ratio
-                    float carrierFreq = MidiNoteToFrequency(voices[i].note, 1);
-                    if (carrierFreq > 0) {
-                        float formantFreq = carrierFreq * ratio;
-                        voiceFormantOsc[i].SetFormantFreq(formantFreq);
-                    }
-                }
-            }
-            break;
-            
-        case PARAM_OSC_FORMANT_PHASE:
-            {
-                appState.formantPhaseShift = normalizedValue;
-                // Phase shift 0.0-1.0
-                for (int i = 0; i < 4; i++) {
-                    voiceFormantOsc[i].SetPhaseShift(normalizedValue);
-                }
-            }
-            break;
-            
         case PARAM_OSC_HARMONIC_IDX:
             {
                 appState.harmonicIdx = normalizedValue;
@@ -1485,27 +1484,34 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                     newMode = SEQ_ORDER_BRN;
                 }
                 
-                if (newMode != sequencer.sequencerOrderMode) {
-                    sequencer.sequencerOrderMode = newMode;
-                    SortSequencerNotes();
-                    // Reset index when mode changes
-                    sequencer.sequencerNoteIndex = 0;
-                    sequencer.sequencerUpDownDirection = true;
+                // Apply order mode to all tracks
+                for (int i = 0; i < 4; i++) {
+                    if (newMode != sequencer.tracks[i].orderMode) {
+                        sequencer.tracks[i].orderMode = newMode;
+                        sequencer.tracks[i].noteIndex = 0;
+                        sequencer.tracks[i].upDownDirection = true;
+                    }
                 }
+                SortSequencerNotes();
             }
             break;
             
         case PARAM_SEQ_LENGTH:
             appState.seqLength = normalizedValue;
             if (normalizedValue < 0.5f) {
-                // 0-50%: Map to note length percentage (0.1-0.9 range)
-                sequencer.sequencerNoteLengthPercent = 0.1f + (normalizedValue * 2.0f) * 0.8f;  // Map 0-0.5 to 0.1-0.9
+                // 0-50%: Map to note length percentage (0.1-0.9 range) - apply to all tracks
+                float noteLength = 0.1f + (normalizedValue * 2.0f) * 0.8f;  // Map 0-0.5 to 0.1-0.9
+                for (int i = 0; i < 4; i++) {
+                    sequencer.tracks[i].noteLengthPercent = noteLength;
+                }
                 sequencer.selfTriggerMode = false;
             } else {
                 // 50-100%: Enable self-trigger mode
                 sequencer.selfTriggerMode = true;
                 // Note length is not used in self-trigger mode, but keep it at a reasonable default
-                sequencer.sequencerNoteLengthPercent = 0.5f;
+                for (int i = 0; i < 4; i++) {
+                    sequencer.tracks[i].noteLengthPercent = 0.5f;
+                }
                 // Update timing based on current envelope settings
                 UpdateSequencerEnvelopeTiming();
             }
@@ -1537,52 +1543,59 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                     sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
                     sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));
                     sequencer.subdivisionInterval = sequencer.sequenceStepInterval / 8;
+                    UpdateTrackNoteIntervals();
                     // Update delay time if in BPM-sync mode
                     UpdateDelayTime();
                 }
             }
             break;
         
-        // SAMPLER Panel
-        case PARAM_CC_PROB_0_1:
-            appState.ccProb0_1 = normalizedValue;
-            {
+        // SAMPLER Panel (Track Densities)
+        case PARAM_SEQ_TRACK0_DENSITY:
+            appState.seqTrack0Density = normalizedValue;
+            sequencer.tracks[0].density = normalizedValue * 16.0f;  // Map 0.0-1.0 to 0-16
+            // Update CC probability when SEQ mode is off
+            if (!sequencer.sequencerMode) {
                 uint8_t prob = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
                 ccSlotProbabilities[0] = prob;
                 ccSlotProbabilities[1] = prob;
             }
             break;
             
-        case PARAM_CC_PROB_2_3:
-            appState.ccProb2_3 = normalizedValue;
-            {
+        case PARAM_SEQ_TRACK1_DENSITY:
+            appState.seqTrack1Density = normalizedValue;
+            sequencer.tracks[1].density = normalizedValue * 16.0f;
+            if (!sequencer.sequencerMode) {
                 uint8_t prob = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
                 ccSlotProbabilities[2] = prob;
                 ccSlotProbabilities[3] = prob;
             }
             break;
             
-        case PARAM_CC_PROB_4_5:
-            appState.ccProb4_5 = normalizedValue;
-            {
+        case PARAM_SEQ_TRACK2_DENSITY:
+            appState.seqTrack2Density = normalizedValue;
+            sequencer.tracks[2].density = normalizedValue * 16.0f;
+            if (!sequencer.sequencerMode) {
                 uint8_t prob = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
                 ccSlotProbabilities[4] = prob;
                 ccSlotProbabilities[5] = prob;
             }
             break;
             
-        case PARAM_CC_PROB_6_7:
-            appState.ccProb6_7 = normalizedValue;
-            {
+        case PARAM_SEQ_TRACK3_DENSITY:
+            appState.seqTrack3Density = normalizedValue;
+            sequencer.tracks[3].density = normalizedValue * 16.0f;
+            if (!sequencer.sequencerMode) {
                 uint8_t prob = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
                 ccSlotProbabilities[6] = prob;
                 ccSlotProbabilities[7] = prob;
             }
             break;
             
-        // SAMPLER Panel (CC Multipliers)
-        case PARAM_CC_MULT_0_1:
-            appState.ccMult0_1 = normalizedValue;
+        // MULT Panel (Track Multipliers)
+        case PARAM_SEQ_TRACK0_MULT:
+            appState.seqTrack0Multiplier = normalizedValue;
+            sequencer.tracks[0].multiplier = normalizedValue;
             {
                 // Map 0.0-1.0 to discrete multipliers: 1, 2, 4, 8
                 uint8_t mult;
@@ -1590,50 +1603,85 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                 else if (normalizedValue < 0.5f) mult = 2;
                 else if (normalizedValue < 0.75f) mult = 4;
                 else mult = 8;
+                
+                // Update CC multiplier when SEQ mode is off (controls subdivision timing)
+                if (!sequencer.sequencerMode) {
                 ccSlotMultipliers[0] = mult;
                 ccSlotMultipliers[1] = mult;
+                }
+                
+                // Update note count when SEQ mode is on
+                if (sequencer.sequencerMode) {
+                    sequencer.tracks[0].UpdateNoteCount();
+                    // Recalculate note interval using total sequence duration
+                    UpdateTrackNoteIntervals();
+                }
             }
             break;
             
-        case PARAM_CC_MULT_2_3:
-            appState.ccMult2_3 = normalizedValue;
+        case PARAM_SEQ_TRACK1_MULT:
+            appState.seqTrack1Multiplier = normalizedValue;
+            sequencer.tracks[1].multiplier = normalizedValue;
             {
-                // Map 0.0-1.0 to discrete multipliers: 1, 2, 4, 8
                 uint8_t mult;
                 if (normalizedValue < 0.25f) mult = 1;
                 else if (normalizedValue < 0.5f) mult = 2;
                 else if (normalizedValue < 0.75f) mult = 4;
                 else mult = 8;
+                
+                if (!sequencer.sequencerMode) {
                 ccSlotMultipliers[2] = mult;
                 ccSlotMultipliers[3] = mult;
+                }
+                
+                if (sequencer.sequencerMode) {
+                    sequencer.tracks[1].UpdateNoteCount();
+                    UpdateTrackNoteIntervals();
+                }
             }
             break;
             
-        case PARAM_CC_MULT_4_5:
-            appState.ccMult4_5 = normalizedValue;
+        case PARAM_SEQ_TRACK2_MULT:
+            appState.seqTrack2Multiplier = normalizedValue;
+            sequencer.tracks[2].multiplier = normalizedValue;
             {
-                // Map 0.0-1.0 to discrete multipliers: 1, 2, 4, 8
                 uint8_t mult;
                 if (normalizedValue < 0.25f) mult = 1;
                 else if (normalizedValue < 0.5f) mult = 2;
                 else if (normalizedValue < 0.75f) mult = 4;
                 else mult = 8;
+                
+                if (!sequencer.sequencerMode) {
                 ccSlotMultipliers[4] = mult;
                 ccSlotMultipliers[5] = mult;
+                }
+                
+                if (sequencer.sequencerMode) {
+                    sequencer.tracks[2].UpdateNoteCount();
+                    UpdateTrackNoteIntervals();
+                }
             }
             break;
             
-        case PARAM_CC_MULT_6_7:
-            appState.ccMult6_7 = normalizedValue;
+        case PARAM_SEQ_TRACK3_MULT:
+            appState.seqTrack3Multiplier = normalizedValue;
+            sequencer.tracks[3].multiplier = normalizedValue;
             {
-                // Map 0.0-1.0 to discrete multipliers: 1, 2, 4, 8
                 uint8_t mult;
                 if (normalizedValue < 0.25f) mult = 1;
                 else if (normalizedValue < 0.5f) mult = 2;
                 else if (normalizedValue < 0.75f) mult = 4;
                 else mult = 8;
+                
+                if (!sequencer.sequencerMode) {
                 ccSlotMultipliers[6] = mult;
                 ccSlotMultipliers[7] = mult;
+                }
+                
+                if (sequencer.sequencerMode) {
+                    sequencer.tracks[3].UpdateNoteCount();
+                    UpdateTrackNoteIntervals();
+                }
             }
             break;
         
@@ -1977,8 +2025,8 @@ float MidiNoteToFrequency(int8_t note, int8_t channel)
 // Process oscillator based on selected mode
 // externalPhase: optional external phase value (0-1 range) for InterpolatedOscillator
 float ProcessOscillator(int voiceIndex, float externalPhase = -1.0f) {
-    int mode = static_cast<int>(appState.oscMode * 3.99f); // 0-3
-    mode = std::max(0, std::min(3, mode)); // Clamp to 0-3
+    int mode = static_cast<int>(appState.oscMode * 2.99f); // 0-2: Interpolated, FM2, Harmonic
+    mode = std::max(0, std::min(2, mode)); // Clamp to 0-2
     
     switch(mode) {
         case 0: // Interpolated
@@ -1990,9 +2038,7 @@ float ProcessOscillator(int voiceIndex, float externalPhase = -1.0f) {
             }
         case 1: // FM2
             return voiceFm2Osc[voiceIndex].Process();
-        case 2: // Formant
-            return voiceFormantOsc[voiceIndex].Process();
-        case 3: // Harmonic
+        case 2: // Harmonic
             return voiceHarmonicOsc[voiceIndex].Process();
         default:
             if (externalPhase >= 0.0f) {
@@ -2007,17 +2053,9 @@ void SetOscillatorFrequency(int voiceIndex, float freq) {
     // Set frequency for all oscillator types so mode switching doesn't lose the pitch
     voiceInterpOsc[voiceIndex].SetFreq(freq);
     voiceFm2Osc[voiceIndex].SetFrequency(freq);
-    voiceFormantOsc[voiceIndex].SetCarrierFreq(freq);
     voiceHarmonicOsc[voiceIndex].SetFreq(freq);
     // Update internal phase oscillator frequency (used for phase addressing in voices 1 and 3)
     internalPhaseOsc[voiceIndex].SetFreq(freq);
-    
-    // Update formant frequency as ratio of carrier frequency
-    // Map 0.0-1.0 to 0.5-2.0 ratio
-    float ratio = 0.5f + appState.formantFreq * 1.5f;
-    ratio = std::max(0.5f, std::min(2.0f, ratio));
-    float formantFreq = freq * ratio;
-    voiceFormantOsc[voiceIndex].SetFormantFreq(formantFreq);
 }
 
 // Apply VCA to inputs based on envelope normalizedValues
@@ -2122,8 +2160,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     for(size_t i = 0; i < size; i++)
     {
         // Determine mode first to know how to initialize results
-        int mode = static_cast<int>(appState.oscMode * 3.99f);
-        mode = std::max(0, std::min(3, mode));
+        int mode = static_cast<int>(appState.oscMode * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
+        mode = std::max(0, std::min(2, mode));
         
         for (size_t j = 0; j < 4; j++)
         {
@@ -2581,17 +2619,6 @@ int main(void)
         voiceFm2Osc[i].SetIndex(1.0f);
     }
     
-    // Initialize Formant oscillators
-    for (int i = 0; i < 4; i++) {
-        voiceFormantOsc[i].Init(samplerate);
-        voiceFormantOsc[i].SetCarrierFreq(440.0f);
-        // Formant frequency will be set correctly when SetParamValue is called
-        // Default ratio is 1.0x (0.33 normalized), so formant = 440 * 1.0 = 440
-        float defaultRatio = 0.5f + appState.formantFreq * 1.5f;
-        voiceFormantOsc[i].SetFormantFreq(440.0f * defaultRatio);
-        voiceFormantOsc[i].SetPhaseShift(0.5f);
-    }
-    
     // Initialize Harmonic oscillators
     for (int i = 0; i < 4; i++) {
         voiceHarmonicOsc[i].Init(samplerate);
@@ -2605,8 +2632,6 @@ int main(void)
     SetParamValue(PARAM_OSC_WAVEFORM, 0.0f);        // Start with sine
     SetParamValue(PARAM_OSC_FM2_RATIO, 0.26f);       // 1:1 ratio
     SetParamValue(PARAM_OSC_FM2_INDEX, 0.5f);        // Medium index
-    SetParamValue(PARAM_OSC_FORMANT_FREQ, 0.5f);     // 500Hz
-    SetParamValue(PARAM_OSC_FORMANT_PHASE, 0.5f);   // Center phase
     SetParamValue(PARAM_OSC_HARMONIC_IDX, 0.0f);    // First harmonic
     SetParamValue(PARAM_OSC_HARMONIC_DECAY, 1.0f);  // Decay rate
     SetParamValue(PARAM_OSC_HARMONIC_SKEW, 0.0f);   // No skew (fundamental emphasis)
@@ -2660,32 +2685,7 @@ int main(void)
         //     sequenceTriggerOffPending = false;
         // }
         
-        // Check for sequencer note-off timing
-        if (sequencer.sequencerNoteOffPending && currentTime >= sequencer.sequencerNoteOffTime)
-        {
-            if (shiftRegisterMode) {
-                // Send note-off to shift register system
-                RemoveNoteFromQueue(static_cast<int8_t>(sequencer.sequencerNoteToTurnOff));
-            } else if (sequencer.sequencerVoiceToTurnOff >= 0) {
-                // Send MIDI note-off to external devices (when shift register mode is off)
-                uint8_t bytes[3] = {
-                    static_cast<uint8_t>(0x80 + sequencer.sequencerVoiceToTurnOff), 
-                    sequencer.sequencerNoteToTurnOff, 
-                    0
-                };
-                hw.midi.SendMessage(bytes, 3);
-                
-                // Turn off the envelope gate
-                envelopes[sequencer.sequencerVoiceToTurnOff].gate = false;
-                envelopes[sequencer.sequencerVoiceToTurnOff].noteGate = false;
-                envelopes[sequencer.sequencerVoiceToTurnOff].latchActive = false;
-                
-                // Clear voice data
-                voices[sequencer.sequencerVoiceToTurnOff].note = 0;
-                voices[sequencer.sequencerVoiceToTurnOff].velocity = 0;
-            }
-            sequencer.sequencerNoteOffPending = false;
-        }
+        // Note: Sequencer note-off timing is now handled per-track in SequencerMidiSource::Process()
 
         // Check for MIDI clock timing
         if (sequencer.clockEnabled && (currentTime - sequencer.lastClockTime) >= sequencer.clockInterval)
@@ -2735,8 +2735,8 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
         switch(paramIndex) {
             case 0: // Knob 1 - Mode specific
                 {
-                    int mode = static_cast<int>(appState.oscMode * 3.99f);
-                    mode = std::max(0, std::min(3, mode));
+                    int mode = static_cast<int>(appState.oscMode * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
+                    mode = std::max(0, std::min(2, mode));
                     switch(mode) {
                         case 0: // Interpolated - waveform
                             if (normalizedValue < 0.25f) return "Sine";
@@ -2749,14 +2749,7 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                                 ratio = std::max(0.125f, std::min(8.0f, ratio));
                                 return std::to_string(static_cast<int>(ratio * 100.0f)) + "%";
                             }
-                        case 2: // Formant - ratio
-                            {
-                                float ratio = 0.5f + normalizedValue * 1.5f;
-                                ratio = std::max(0.5f, std::min(2.0f, ratio));
-                                // Display as percentage (e.g., "150%" for 1.5x)
-                                return std::to_string(static_cast<int>(ratio * 100.0f)) + "%";
-                            }
-                        case 3: // Harmonic - idx
+                        case 2: // Harmonic - idx
                             {
                                 int idx = 1 + static_cast<int>(normalizedValue * 15.99f);
                                 idx = std::max(1, std::min(16, idx));
@@ -2768,16 +2761,14 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                 }
             case 1: // Knob 2 - Mode specific
                 {
-                    int mode = static_cast<int>(appState.oscMode * 3.99f);
-                    mode = std::max(0, std::min(3, mode));
+                    int mode = static_cast<int>(appState.oscMode * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
+                    mode = std::max(0, std::min(2, mode));
                     switch(mode) {
                         case 0: // Interpolated - empty
                             return "";
                         case 1: // FM2 - index
                             return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
-                        case 2: // Formant - phase
-                            return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
-                        case 3: // Harmonic - decay
+                        case 2: // Harmonic - decay
                             {
                                 float decay = normalizedValue * 10.0f;
                                 return std::to_string(static_cast<int>(decay * 10.0f)) + "x";
@@ -2788,14 +2779,13 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                 }
             case 2: // Knob 3 - Mode specific
                 {
-                    int mode = static_cast<int>(appState.oscMode * 3.99f);
-                    mode = std::max(0, std::min(3, mode));
+                    int mode = static_cast<int>(appState.oscMode * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
+                    mode = std::max(0, std::min(2, mode));
                     switch(mode) {
                         case 0: // Interpolated - empty
                         case 1: // FM2 - empty
-                        case 2: // Formant - empty
                             return "";
-                        case 3: // Harmonic - skew
+                        case 2: // Harmonic - skew
                             return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
                         default:
                             return "";
@@ -2803,13 +2793,12 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                 }
             case 3: // Oscillator Mode
                 {
-                    int mode = static_cast<int>(normalizedValue * 3.99f); // 0-3
-                    mode = std::max(0, std::min(3, mode));
+                    int mode = static_cast<int>(normalizedValue * 2.99f); // 0-2: Interpolated, FM2, Harmonic
+                    mode = std::max(0, std::min(2, mode));
                     switch(mode) {
                         case 0: return "Inter";
                         case 1: return "FM2";
-                        case 2: return "Form";
-                        case 3: return "Harm";
+                        case 2: return "Harm";
                         default: return "Inter";
                     }
                 }
@@ -2959,12 +2948,7 @@ void GetOscLabels(int mode, std::string& label1, std::string& label2, std::strin
             label2 = "Index";
             label3 = "";
             break;
-        case 2: // Formant
-            label1 = "Freq";
-            label2 = "Phase";
-            label3 = "";
-            break;
-        case 3: // Harmonic
+        case 2: // Harmonic
             label1 = "Idx";
             label2 = "Decay";
             label3 = "Skew";
@@ -3013,8 +2997,8 @@ void UpdateOled()
     int oscMode = 0;
     
     if (isOscPanel) {
-        oscMode = static_cast<int>(appState.oscMode * 3.99f);
-        oscMode = std::max(0, std::min(3, oscMode));
+        oscMode = static_cast<int>(appState.oscMode * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
+        oscMode = std::max(0, std::min(2, oscMode));
         std::string label1, label2, label3;
         GetOscLabels(oscMode, label1, label2, label3);
         WriteFixedString(hw, knobPositions[0], labelY, 5, font_s, label1.c_str());
@@ -3049,11 +3033,7 @@ void UpdateOled()
                     if (i == 0) val = appState.fm2Ratio;
                     else if (i == 1) val = appState.fm2Index;
                     break;
-                case 2: // Formant
-                    if (i == 0) val = appState.formantFreq;
-                    else if (i == 1) val = appState.formantPhaseShift;
-                    break;
-                case 3: // Harmonic
+                case 2: // Harmonic
                     if (i == 0) val = appState.harmonicIdx;
                     else if (i == 1) val = appState.harmonicDecay;
                     else if (i == 2) val = appState.harmonicSkew;
@@ -3091,11 +3071,7 @@ void UpdateOled()
                     if (i == 0) paramValue = appState.fm2Ratio;
                     else if (i == 1) paramValue = appState.fm2Index;
                     break;
-                case 2: // Formant
-                    if (i == 0) paramValue = appState.formantFreq;
-                    else if (i == 1) paramValue = appState.formantPhaseShift;
-                    break;
-                case 3: // Harmonic
+                case 2: // Harmonic
                     if (i == 0) paramValue = appState.harmonicIdx;
                     else if (i == 1) paramValue = appState.harmonicDecay;
                     else if (i == 2) paramValue = appState.harmonicSkew;
@@ -3129,9 +3105,9 @@ void UpdateOled()
         
         // Show sequencer-specific information
         if (sequencer.sequencerMode) {
-            // Show note ordering mode
+            // Show note ordering mode (use first track's mode as reference)
             const char* modeStr;
-            switch (sequencer.sequencerOrderMode) {
+            switch (sequencer.tracks[0].orderMode) {
                 case SEQ_ORDER_ASC: modeStr = "ASC"; break;
                 case SEQ_ORDER_DESC: modeStr = "DESC"; break;
                 case SEQ_ORDER_UPD: modeStr = "UPD"; break;
@@ -3284,6 +3260,47 @@ void ProcessEncoder()
                 sequencer.sequencerMode = !sequencer.sequencerMode;
                 
                 if (sequencer.sequencerMode) {
+                    // Initialize tracks from UserState
+                    sequencer.tracks[0].density = appState.seqTrack0Density * 16.0f;
+                    sequencer.tracks[0].multiplier = appState.seqTrack0Multiplier;
+                    sequencer.tracks[1].density = appState.seqTrack1Density * 16.0f;
+                    sequencer.tracks[1].multiplier = appState.seqTrack1Multiplier;
+                    sequencer.tracks[2].density = appState.seqTrack2Density * 16.0f;
+                    sequencer.tracks[2].multiplier = appState.seqTrack2Multiplier;
+                    sequencer.tracks[3].density = appState.seqTrack3Density * 16.0f;
+                    sequencer.tracks[3].multiplier = appState.seqTrack3Multiplier;
+                    
+                    // Apply shared order mode and note length to all tracks
+                    SequencerOrderMode orderMode;
+                    float orderVal = appState.seqOrder;
+                    if (orderVal < 0.1667f) {
+                        orderMode = SEQ_ORDER_ASC;
+                    } else if (orderVal < 0.3333f) {
+                        orderMode = SEQ_ORDER_DESC;
+                    } else if (orderVal < 0.5f) {
+                        orderMode = SEQ_ORDER_UPD;
+                    } else if (orderVal < 0.6667f) {
+                        orderMode = SEQ_ORDER_FWD;
+                    } else if (orderVal < 0.8333f) {
+                        orderMode = SEQ_ORDER_RND;
+                    } else {
+                        orderMode = SEQ_ORDER_BRN;
+                    }
+                    
+                    for (int i = 0; i < 4; i++) {
+                        sequencer.tracks[i].orderMode = orderMode;
+                        if (appState.seqLength < 0.5f) {
+                            sequencer.tracks[i].noteLengthPercent = 0.1f + (appState.seqLength * 2.0f) * 0.8f;
+                        } else {
+                            sequencer.tracks[i].noteLengthPercent = 0.5f;
+                        }
+                        sequencer.tracks[i].UpdateNoteCount();
+                        sequencer.tracks[i].Reset();
+                    }
+                    
+                    // Update track note intervals
+                    UpdateTrackNoteIntervals();
+                    
                     // When enabling sequencer mode, capture currently held notes
                     CaptureCurrentlyHeldNotes();
                     
@@ -3346,6 +3363,23 @@ void ProcessEncoder()
                     // Clear sequencer notes when disabling sequencer mode to prevent artifacts
                     ClearSequencerNotes();
                     ResetCCState(); // Reset CC state when disabling sequencer
+                    
+                    // Update CC slot arrays from track values (for when SEQ mode is off)
+                    for (int i = 0; i < 4; i++) {
+                        SequencerTrack& track = sequencer.tracks[i];
+                        int slotBase = i * 2;
+                        
+                        // Update CC probability from track density
+                        uint8_t prob = static_cast<uint8_t>((track.density / 16.0f) * 100.0f);
+                        prob = std::min(static_cast<uint8_t>(100), prob);
+                        ccSlotProbabilities[slotBase] = prob;
+                        ccSlotProbabilities[slotBase + 1] = prob;
+                        
+                        // Update CC multiplier from track multiplier
+                        uint8_t mult = track.GetMultiplierValue();
+                        ccSlotMultipliers[slotBase] = mult;
+                        ccSlotMultipliers[slotBase + 1] = mult;
+                    }
                 }
                 
                 UpdateOled();
@@ -3395,8 +3429,8 @@ void ProcessKnobs()
         // For OSC panel, route knobs to mode-specific parameters
         // all other panels are handled by SetParamValue() via bindings
         if (currentPanel.id == 'o' && inputIndex < 3) {
-            int mode = static_cast<int>(appState.oscMode * 3.99f);
-            mode = std::max(0, std::min(3, mode));
+            int mode = static_cast<int>(appState.oscMode * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
+            mode = std::max(0, std::min(2, mode));
             
             ParamId modeSpecificParam = PARAM_NONE;
             switch(mode) {
@@ -3407,11 +3441,7 @@ void ProcessKnobs()
                     if (inputIndex == 0) modeSpecificParam = PARAM_OSC_FM2_RATIO;
                     else if (inputIndex == 1) modeSpecificParam = PARAM_OSC_FM2_INDEX;
                     break;
-                case 2: // Formant
-                    if (inputIndex == 0) modeSpecificParam = PARAM_OSC_FORMANT_FREQ;
-                    else if (inputIndex == 1) modeSpecificParam = PARAM_OSC_FORMANT_PHASE;
-                    break;
-                case 3: // Harmonic
+                case 2: // Harmonic
                     if (inputIndex == 0) modeSpecificParam = PARAM_OSC_HARMONIC_IDX;
                     else if (inputIndex == 1) modeSpecificParam = PARAM_OSC_HARMONIC_DECAY;
                     else if (inputIndex == 2) modeSpecificParam = PARAM_OSC_HARMONIC_SKEW;
@@ -3449,10 +3479,6 @@ void ProcessKnobs()
             
             // Update knob normalizedValues storage
             knobValues[panelMode][inputIndex] = knobPosition;
-            
-            // Update panel normalizedValues for the currently selected panel (legacy)
-            currentPanel.normalizedValues[inputIndex] = knobPosition;
-            displayPanels[panelMode].normalizedValues[inputIndex] = knobPosition;
             
             knobChanged = true;
         }
@@ -3652,13 +3678,15 @@ void AddNoteToSequencer(uint8_t note)
     sequencer.sequencerNotes.push_back(note);
     
     // For FWD mode, don't sort - preserve order as notes are added
-    // For other modes, sort based on current ordering preference
-    if (sequencer.sequencerOrderMode != SEQ_ORDER_FWD) {
+    // For other modes, sort based on current ordering preference (check first track's mode)
+    if (sequencer.tracks[0].orderMode != SEQ_ORDER_FWD) {
         SortSequencerNotes();
     }
     
-    // Reset sequencer note index when new notes are added
-    sequencer.sequencerNoteIndex = 0;
+    // Reset all tracks' note indices when new notes are added
+    for (int i = 0; i < 4; i++) {
+        sequencer.tracks[i].noteIndex = 0;
+    }
     
     // If we're adding notes after initial capture, reset the flag
     // This means sequencer will now stop when notes are released (normal behavior)
@@ -3706,26 +3734,28 @@ void RemoveNoteFromSequencer(uint8_t note)
         }
     }
     
-    // For brownian mode, reset last note if it was the one removed
-    if (sequencer.sequencerOrderMode == SEQ_ORDER_BRN && sequencer.sequencerLastNote == note) {
-        sequencer.sequencerLastNote = 0;  // Reset to trigger random selection next time
-    }
-    
-    // Adjust sequencer note index if needed
-    if (!sequencer.sequencerNotes.empty() && sequencer.sequencerNoteIndex >= sequencer.sequencerNotes.size()) {
-        sequencer.sequencerNoteIndex = 0;
+    // For brownian mode, reset last note if it was the one removed (for all tracks)
+    for (int i = 0; i < 4; i++) {
+        if (sequencer.tracks[i].orderMode == SEQ_ORDER_BRN && sequencer.tracks[i].lastNote == note) {
+            sequencer.tracks[i].lastNote = 0;  // Reset to trigger random selection next time
+        }
+        
+        // Adjust track note index if needed
+        if (!sequencer.sequencerNotes.empty() && sequencer.tracks[i].noteIndex >= sequencer.sequencerNotes.size()) {
+            sequencer.tracks[i].noteIndex = 0;
+        }
     }
 }
 
 void SortSequencerNotes()
 {
-    // For FWD mode, don't sort - preserve order as notes were added
-    if (sequencer.sequencerOrderMode == SEQ_ORDER_FWD) {
+    // For FWD mode, don't sort - preserve order as notes were added (check first track's mode)
+    if (sequencer.tracks[0].orderMode == SEQ_ORDER_FWD) {
         return;
     }
     
-    // For other modes, sort based on mode
-    switch (sequencer.sequencerOrderMode) {
+    // For other modes, sort based on mode (use first track's mode as reference)
+    switch (sequencer.tracks[0].orderMode) {
         case SEQ_ORDER_ASC:
             std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end());
             break;
@@ -3735,7 +3765,9 @@ void SortSequencerNotes()
         case SEQ_ORDER_UPD:
             // For up-down, start with ascending order
             std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end());
-            sequencer.sequencerUpDownDirection = true;
+            for (int i = 0; i < 4; i++) {
+                sequencer.tracks[i].upDownDirection = true;
+            }
             break;
         case SEQ_ORDER_RND:
         case SEQ_ORDER_BRN:
@@ -3747,15 +3779,20 @@ void SortSequencerNotes()
             break;
     }
     
-    sequencer.sequencerNoteIndex = 0;
+    // Reset all tracks' note indices
+    for (int i = 0; i < 4; i++) {
+        sequencer.tracks[i].noteIndex = 0;
+    }
 }
 
 void ClearSequencerNotes()
 {
     sequencer.sequencerNotes.clear();
-    sequencer.sequencerNoteIndex = 0;
-    sequencer.sequencerUpDownDirection = true;
-    sequencer.sequencerLastNote = 0;
+    for (int i = 0; i < 4; i++) {
+        sequencer.tracks[i].noteIndex = 0;
+        sequencer.tracks[i].upDownDirection = true;
+        sequencer.tracks[i].lastNote = 0;
+    }
     sequencer.sequencerUsingInitialCapture = false;  // Reset flag when clearing notes
 }
 
@@ -3772,8 +3809,10 @@ void CaptureCurrentlyHeldNotes()
         }
     }
     
-    // Reset sequencer note index to start from the beginning
-    sequencer.sequencerNoteIndex = 0;
+    // Reset all tracks' note indices to start from the beginning
+    for (int i = 0; i < 4; i++) {
+        sequencer.tracks[i].noteIndex = 0;
+    }
     
     // Set flag to indicate we're using initially captured notes
     // This means sequencer won't stop when these notes are released
@@ -3830,6 +3869,9 @@ void InitTriggerSequence()
     sequencer.currentSubdivision = 0;
     sequencer.lastSubdivisionTime = hw.seed.system.GetNow();
     sequencer.subdivisionInterval = sequencer.sequenceStepInterval / 8;
+    
+    // Initialize track note intervals
+    UpdateTrackNoteIntervals();
 }
 
 
@@ -3968,8 +4010,27 @@ void ProcessCCSlotsWithSubdivision(uint8_t subdivision)
     int triggeredSlots = 0;
     uint8_t triggeredValues[8];
     
-    // Check each slot to see if it should trigger on this subdivision
-    // based on its multiplier
+    if (sequencer.sequencerMode) {
+        // SEQ mode ON: Process per-track CC pairs using track density as probability
+        // Track 0 -> CC slots 0-1, Track 1 -> CC slots 2-3, etc.
+        for (int trackIdx = 0; trackIdx < 4; trackIdx++) {
+            SequencerTrack& track = sequencer.tracks[trackIdx];
+            int slotBase = trackIdx * 2;  // 0, 2, 4, 6
+            
+            // Convert density (0-16) to probability (0-100)
+            uint8_t prob = static_cast<uint8_t>((track.density / 16.0f) * 100.0f);
+            prob = std::min(static_cast<uint8_t>(100), prob);  // Clamp to 100
+            
+            // Check probability for this track's CC pair
+            if (ShouldFireWithProbability(prob)) {
+                // Fire both CC slots for this track
+                triggeredValues[triggeredSlots++] = ccSlotValues[slotBase];
+                triggeredValues[triggeredSlots++] = ccSlotValues[slotBase + 1];
+            }
+        }
+    } else {
+        // SEQ mode OFF: Use traditional CC slot processing with multipliers for subdivision timing
+        // Check each slot to see if it should trigger on this subdivision based on its multiplier
     for (int i = 7; i >= 0; i--) {
         uint8_t multiplier = ccSlotMultipliers[i];
         
@@ -3992,6 +4053,7 @@ void ProcessCCSlotsWithSubdivision(uint8_t subdivision)
         if (shouldTrigger && ShouldFireWithProbability(ccSlotProbabilities[i])) {
             triggeredValues[triggeredSlots] = ccSlotValues[i];
             triggeredSlots++;
+            }
         }
     }
     
@@ -4157,13 +4219,30 @@ public:
 };
 
 // NormalVoiceHandler - direct voice allocation (round-robin)
+// If channel is already set (0-3), use it directly (for sequencer notes)
 template<typename NextHandler>
 class NormalVoiceHandler : public HandlerBase<NextHandler> {
 public:
     bool HandleNoteOn(NoteOnEvent& event) {
-        // Voice allocation: Round-robin distribution across voices 0-3
         int8_t voiceIndex = -1;
         
+        // Check if channel is already set (0-3) AND we're in sequencer mode - this indicates sequencer routing
+        // Regular MIDI input on channels 0-3 should still use round-robin allocation
+        if (sequencer.sequencerMode && event.channel >= 0 && event.channel < 4) {
+            // Use the pre-set channel (sequencer track routing)
+            voiceIndex = event.channel;
+            
+            // If voice is busy, send note-off for the stolen voice
+            if (envelopes[voiceIndex].noteGate && voices[voiceIndex].note > 0) {
+                uint8_t noteOffBytes[3] = {
+                    static_cast<uint8_t>(0x80 + voiceIndex), 
+                    static_cast<uint8_t>(voices[voiceIndex].note), 
+                    0
+                };
+                hw.midi.SendMessage(noteOffBytes, 3);
+            }
+        } else {
+            // Voice allocation: Round-robin distribution across voices 0-3 (for manual keyboard input)
         // Step 1: Try the next voice in round-robin sequence if it's free
         if (!envelopes[nextVoiceIndex].noteGate) {
             voiceIndex = nextVoiceIndex;
@@ -4197,8 +4276,9 @@ public:
         // Store the allocated voice channel
         event.channel = voiceIndex;
         
-        // Advance round-robin index for next note
+            // Advance round-robin index for next note (only for manual input)
         nextVoiceIndex = (voiceIndex + 1) % 4;
+        }
         
         // Send pitch bend before note-on if tuning is enabled
         if (sendPitchBendMidi) {
@@ -4400,109 +4480,78 @@ void ProcessHandlerChainNoteOff(NoteOffEvent& event) {
 }
 
 // SequencerMidiSource - generates notes from sequencer array based on clock
+// Now supports four independent tracks, each with its own note count and timing
 class SequencerMidiSource {
-public:
-    void Process() {
-        if (!sequencer.sequencerMode || sequencer.sequencerNotes.empty()) {
-            return;
+private:
+    // Helper to select next note for a track based on its order mode
+    uint8_t SelectNoteForTrack(int trackIdx) {
+        SequencerTrack& track = sequencer.tracks[trackIdx];
+        
+        if (sequencer.sequencerNotes.empty()) {
+            return 0;
         }
         
-        // Check if it's time for the next subdivision
-        uint32_t currentTime = hw.seed.system.GetNow();
-        
-        // Check subdivision timing (every 1/8 of a sequencer step)
-        if ((currentTime - sequencer.lastSubdivisionTime) >= sequencer.subdivisionInterval) {
-            // Only process CC slots if current step should trigger a note
-            bool currentStepTriggers = sequencer.triggerSequence[sequencer.currentSequenceStep];
+        uint8_t noteToTrigger = 0;
             
-            if (currentStepTriggers) {
-                // Process CC slots for this subdivision
-                ProcessCCSlotsWithSubdivision(sequencer.currentSubdivision);
-            }
-            
-            sequencer.lastSubdivisionTime = currentTime;
-            
-            // Advance to next subdivision
-            sequencer.currentSubdivision++;
-            
-            // When we've completed all 8 subdivisions, advance to next sequence step
-            if (sequencer.currentSubdivision >= 8) {
-                sequencer.currentSubdivision = 0;
-                AdvanceSequenceStep();  // Only triggers note if step has trigger
-                sequencer.lastSequenceStepTime = currentTime;
-                
-                // Start fresh at subdivision 0 for the new step
-                sequencer.lastSubdivisionTime = currentTime;  // Reset subdivision timer
-            }
-        }
-    }
-    
-    // Public method to advance sequencer step (used by self-trigger mode)
-    void AdvanceSequenceStep() {
-        // Check if current step should trigger
-        if (sequencer.triggerSequence[sequencer.currentSequenceStep]) {
-            uint8_t noteToTrigger;
-            
-            // Select note based on sequencer order mode
-            switch (sequencer.sequencerOrderMode) {
+        switch (track.orderMode) {
                 case SEQ_ORDER_ASC:
                 case SEQ_ORDER_DESC:
                     // Linear progression through sorted array
-                    noteToTrigger = sequencer.sequencerNotes[sequencer.sequencerNoteIndex];
-                    sequencer.sequencerNoteIndex = (sequencer.sequencerNoteIndex + 1) % sequencer.sequencerNotes.size();
+                noteToTrigger = sequencer.sequencerNotes[track.noteIndex];
+                track.noteIndex = (track.noteIndex + 1) % sequencer.sequencerNotes.size();
                     break;
                     
                 case SEQ_ORDER_FWD:
                     // Use sequencerNotes directly - in FWD mode it's not sorted, so it preserves original order
-                    noteToTrigger = sequencer.sequencerNotes[sequencer.sequencerNoteIndex];
-                    sequencer.sequencerNoteIndex = (sequencer.sequencerNoteIndex + 1) % sequencer.sequencerNotes.size();
+                noteToTrigger = sequencer.sequencerNotes[track.noteIndex];
+                track.noteIndex = (track.noteIndex + 1) % sequencer.sequencerNotes.size();
                     break;
                     
                 case SEQ_ORDER_UPD:
                     // Up-down: go up then down, reversing at ends
-                    noteToTrigger = sequencer.sequencerNotes[sequencer.sequencerNoteIndex];
-                    if (sequencer.sequencerUpDownDirection) {
+                noteToTrigger = sequencer.sequencerNotes[track.noteIndex];
+                if (track.upDownDirection) {
                         // Going up
-                        if (sequencer.sequencerNoteIndex >= sequencer.sequencerNotes.size() - 1) {
+                    if (track.noteIndex >= sequencer.sequencerNotes.size() - 1) {
                             // Reached end, reverse direction
-                            sequencer.sequencerUpDownDirection = false;
+                        track.upDownDirection = false;
                             if (sequencer.sequencerNotes.size() > 1) {
-                                sequencer.sequencerNoteIndex--;
+                            track.noteIndex--;
                             }
                         } else {
-                            sequencer.sequencerNoteIndex++;
+                        track.noteIndex++;
                         }
                     } else {
                         // Going down
-                        if (sequencer.sequencerNoteIndex == 0) {
+                    if (track.noteIndex == 0) {
                             // Reached start, reverse direction
-                            sequencer.sequencerUpDownDirection = true;
+                        track.upDownDirection = true;
                             if (sequencer.sequencerNotes.size() > 1) {
-                                sequencer.sequencerNoteIndex++;
+                            track.noteIndex++;
                             }
                         } else {
-                            sequencer.sequencerNoteIndex--;
+                        track.noteIndex--;
                         }
                     }
                     break;
                     
                 case SEQ_ORDER_RND:
                     // Random selection
-                    sequencer.sequencerNoteIndex = rand() % sequencer.sequencerNotes.size();
-                    noteToTrigger = sequencer.sequencerNotes[sequencer.sequencerNoteIndex];
+                track.noteIndex = rand() % sequencer.sequencerNotes.size();
+                noteToTrigger = sequencer.sequencerNotes[track.noteIndex];
                     break;
                     
                 case SEQ_ORDER_BRN:
                     // Brownian: random distance from last note
-                    if (sequencer.sequencerLastNote == 0 || sequencer.sequencerNotes.size() == 1) {
+                if (track.lastNote == 0 || sequencer.sequencerNotes.size() == 1) {
                         // First note or only one note - pick randomly
-                        sequencer.sequencerNoteIndex = rand() % sequencer.sequencerNotes.size();
-                        noteToTrigger = sequencer.sequencerNotes[sequencer.sequencerNoteIndex];
+                    track.noteIndex = rand() % sequencer.sequencerNotes.size();
+                    noteToTrigger = sequencer.sequencerNotes[track.noteIndex];
                     } else {
                         // Find current note index in sorted array
                         size_t currentIdx = 0;
                         for (size_t i = 0; i < sequencer.sequencerNotes.size(); i++) {
-                            if (sequencer.sequencerNotes[i] == sequencer.sequencerLastNote) {
+                        if (sequencer.sequencerNotes[i] == track.lastNote) {
                                 currentIdx = i;
                                 break;
                             }
@@ -4518,46 +4567,144 @@ public:
                             newIdx = static_cast<int>(sequencer.sequencerNotes.size()) - 1;
                         }
                         
-                        sequencer.sequencerNoteIndex = static_cast<size_t>(newIdx);
-                        noteToTrigger = sequencer.sequencerNotes[sequencer.sequencerNoteIndex];
+                    track.noteIndex = static_cast<size_t>(newIdx);
+                    noteToTrigger = sequencer.sequencerNotes[track.noteIndex];
                     }
-                    sequencer.sequencerLastNote = noteToTrigger;
+                track.lastNote = noteToTrigger;
                     break;
             }
             
-            // Create note event and send through handler chain
+        return noteToTrigger;
+    }
+    
+public:
+    void Process() {
+        if (!sequencer.sequencerMode || sequencer.sequencerNotes.empty()) {
+            return;
+        }
+        
+        uint32_t currentTime = hw.seed.system.GetNow();
+        
+        // Check if it's time to advance to the next sequence step (based on sequenceStepInterval time)
+        if ((currentTime - sequencer.lastSequenceStepTime) >= sequencer.sequenceStepInterval) {
+            sequencer.lastSequenceStepTime = currentTime;
+            
+            // Advance to next step
+            uint8_t previousStep = sequencer.currentSequenceStep;
+            sequencer.currentSequenceStep = (sequencer.currentSequenceStep + 1) % TRIGGER_SEQUENCE_LENGTH;
+            
+            // Only reset tracks when sequence loops back to step 0 (full sequence completed)
+            if (sequencer.currentSequenceStep == 0 && previousStep == TRIGGER_SEQUENCE_LENGTH - 1) {
+                // Full sequence completed - reset all tracks for new loop
+                for (int i = 0; i < 4; i++) {
+                    sequencer.tracks[i].currentNoteInSequence = 0;
+                    // Set lastNoteTime to trigger first note immediately when sequence loops
+                    // Subtract noteInterval so (currentTime - lastNoteTime) >= noteInterval on first check
+                    if (sequencer.tracks[i].noteInterval > 0) {
+                        sequencer.tracks[i].lastNoteTime = currentTime - sequencer.tracks[i].noteInterval;
+                    } else {
+                        sequencer.tracks[i].lastNoteTime = currentTime;
+                    }
+                }
+            }
+        }
+        
+        // Check subdivision timing (every 1/8 of a sequencer step) for CC processing
+        if ((currentTime - sequencer.lastSubdivisionTime) >= sequencer.subdivisionInterval) {
+            // Only process CC slots if current step should trigger
+            bool currentStepTriggers = sequencer.triggerSequence[sequencer.currentSequenceStep];
+            
+            if (currentStepTriggers) {
+                // Process CC slots for this subdivision
+                ProcessCCSlotsWithSubdivision(sequencer.currentSubdivision);
+            }
+            
+            sequencer.lastSubdivisionTime = currentTime;
+            sequencer.currentSubdivision++;
+            
+            // Reset subdivision counter when it reaches 8 (but don't advance sequence step here)
+            if (sequencer.currentSubdivision >= 8) {
+                sequencer.currentSubdivision = 0;
+            }
+        }
+        
+        // Process each track independently - check if it's time for the next note in each track's sequence
+        // Notes play continuously across all steps, not just when current step triggers
+        for (int trackIdx = 0; trackIdx < 4; trackIdx++) {
+            SequencerTrack& track = sequencer.tracks[trackIdx];
+            
+            // Skip if track has no notes to play
+            if (track.noteCount == 0 || track.noteInterval == 0) {
+                continue;
+            }
+            
+            // Check if it's time for the next note in this track's sequence
+            if ((currentTime - track.lastNoteTime) >= track.noteInterval) {
+                // Check if we've played all notes in this track's sequence for the full loop
+                if (track.currentNoteInSequence < track.noteCount) {
+                        // Select and trigger note for this track
+                        uint8_t noteToTrigger = SelectNoteForTrack(trackIdx);
+                        
+                        // Create note event and route directly to this track's voice
             NoteOnEvent event;
             event.note = noteToTrigger;
             event.velocity = 127;
-            event.channel = 0; // Will be set by voice allocation
+                        event.channel = trackIdx;  // Route directly to track's voice (bypass round-robin)
             
+                        // Send directly to voice handler, bypassing normal voice allocation
+                        // We need to manually trigger the voice since we're bypassing the handler chain
+                        // For now, we'll still use the handler chain but set the channel explicitly
             ProcessHandlerChainNoteOn(event);
             
-            // Note: CC processing happens via subdivision loop, not here
-            // This ensures proper timing aligned with subdivisions
-            
-            // Schedule note-off based on note length percentage (only when not using shift register)
+                        // Schedule note-off based on track's note length percentage
             if (!shiftRegisterMode) {
-                uint32_t noteOffDelay = static_cast<uint32_t>(sequencer.sequenceStepInterval * sequencer.sequencerNoteLengthPercent);
-                noteOffDelay = std::min(noteOffDelay, sequencer.sequenceStepInterval - 10); // Leave at least 10ms before next step
-                sequencer.sequencerNoteOffTime = hw.seed.system.GetNow() + noteOffDelay;
-                sequencer.sequencerNoteOffPending = true;
-                sequencer.sequencerNoteToTurnOff = noteToTrigger;
-                sequencer.sequencerVoiceToTurnOff = event.channel; // Will be set by voice allocation
+                            uint32_t noteOffDelay = static_cast<uint32_t>(track.noteInterval * track.noteLengthPercent);
+                            noteOffDelay = std::min(noteOffDelay, track.noteInterval - 10); // Leave at least 10ms
+                            track.noteOffTime = currentTime + noteOffDelay;
+                            track.noteOffPending = true;
+                            track.noteToTurnOff = noteToTrigger;
+                            track.voiceToTurnOff = trackIdx;
+                        }
+                        
+                        // Advance to next note in this track's sequence
+                        track.currentNoteInSequence++;
+                        track.lastNoteTime = currentTime;
+                    }
+                }
             }
-        } else {
-            // Original trigger behavior for keyboard mode or when no sequencer notes
-            // Use CC queue system instead of direct SendMidiMesssage to ensure proper state management
-            // AddCCToQueue(127, false);
-            // SendMidiMesssage(triggerNote, 15, "TRIGGER_ON");
-
-            // Schedule trigger off after a short duration (50ms)
-            // sequenceTriggerOffTime = hw.seed.system.GetNow() + 50;
-            // sequenceTriggerOffPending = true;
-        }
         
-        // Advance to next step
-        sequencer.currentSequenceStep = (sequencer.currentSequenceStep + 1) % TRIGGER_SEQUENCE_LENGTH;
+        // Process note-offs for all tracks
+        for (int trackIdx = 0; trackIdx < 4; trackIdx++) {
+            SequencerTrack& track = sequencer.tracks[trackIdx];
+            if (track.noteOffPending && currentTime >= track.noteOffTime) {
+                // Send note-off for this track's voice
+                NoteOffEvent event;
+                event.note = track.noteToTurnOff;
+                event.velocity = 0;
+                event.channel = trackIdx;
+                
+                // Find and turn off the voice playing this note
+                if (voices[trackIdx].note == track.noteToTurnOff) {
+                    uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + trackIdx), track.noteToTurnOff, 0};
+                    hw.midi.SendMessage(bytes, 3);
+                    
+                    envelopes[trackIdx].gate = false;
+                    envelopes[trackIdx].noteGate = false;
+                    envelopes[trackIdx].latchActive = false;
+                    
+                    voices[trackIdx].note = 0;
+                    voices[trackIdx].velocity = 0;
+                }
+                
+                track.noteOffPending = false;
+            }
+        }
+    }
+    
+    // Public method to advance sequencer step (used by self-trigger mode)
+    void AdvanceSequenceStep() {
+        // This is now handled in Process() - kept for compatibility
+        // In self-trigger mode, this would be called externally
     }
 };
 
