@@ -25,7 +25,7 @@ DaisyPatch      hw;
 Fm2             osc1, osc2;
 Oscillator      pan, lfo1, lfo2, lfo3;
 SdmmcHandler    sdcard;
-Compressor      compressor;
+Limiter         limiter;
 microsound::PulsarSynth pulsarSynth;
 int8_t microsoundNote = 60;  // Current MIDI note for microsound
 
@@ -71,18 +71,33 @@ namespace ParamConfig {
     // Pan parameters
     static constexpr float PAN_FREQ_MAX_HZ = 10.0f;
     
-    // Compressor parameters
-    static constexpr float COMP_RATIO_MIN = 1.0f;
-    static constexpr float COMP_RATIO_MAX = 40.0f;
-    static constexpr float COMP_THRESHOLD_MIN_DB = -80.0f;
-    static constexpr float COMP_THRESHOLD_MAX_DB = 0.0f;
-    static constexpr float COMP_TIME_MIN_S = 0.001f;
-    static constexpr float COMP_TIME_MAX_S = 10.0f;
-    
     // Sequencer parameters
     static constexpr int SEQ_DENSITY_MAX = 16;
     static constexpr int SEQ_ORDER_MODES = 6;
 }
+
+// ============================================================================
+// String Constants - Shared to Reduce Flash Usage
+// ============================================================================
+static const char* STR_ASC = "ASC";
+static const char* STR_DESC = "DESC";
+static const char* STR_UPD = "UPD";
+static const char* STR_FWD = "FWD";
+static const char* STR_RND = "RND";
+static const char* STR_BRN = "BRN";
+static const char* STR_ON = "ON";
+static const char* STR_OFF = "OFF";
+static const char* STR_SINE = "Sine";
+static const char* STR_TRI = "Tri";
+static const char* STR_SQR = "Sqr";
+static const char* STR_SAW = "Saw";
+static const char* STR_INTER = "Inter";
+static const char* STR_SHORT = "SHORT";
+static const char* STR_LONG = "LONG";
+static const char* STR_DENS = "Dens";
+static const char* STR_ORD = "Ord";
+static const char* STR_CCP = "CC%";
+static const char* STR_MULT = "Mult";
 
 // ============================================================================
 // Parameter Transformation Helpers - Inline (Zero Function Call Overhead)
@@ -103,23 +118,27 @@ inline float LogMap(float normalized, float min, float max) {
     return min * powf(max / min, normalized);
 }
 
-// Percentage formatter (0-100%)
-inline std::string FormatPercent(float normalized) {
-    return std::to_string(static_cast<int>(normalized * 100)) + "%";
+// Percentage formatter (0-100%) - uses static buffer to avoid allocations
+inline const char* FormatPercent(float normalized) {
+    static char buf[8];
+    snprintf(buf, sizeof(buf), "%d%%", static_cast<int>(normalized * 100));
+    return buf;
 }
 
-// Milliseconds formatter
-inline std::string FormatMs(float ms) {
+// Milliseconds formatter - uses static buffer to avoid allocations
+inline const char* FormatMs(float ms) {
+    static char buf[12];
     if (ms < 1.0f) {
         int msInt = static_cast<int>(ms * 100);
         if (msInt < 10) {
-            return "0.0" + std::to_string(msInt) + "ms";
+            snprintf(buf, sizeof(buf), "0.0%dms", msInt);
         } else {
-            return "0." + std::to_string(msInt) + "ms";
+            snprintf(buf, sizeof(buf), "0.%dms", msInt);
         }
     } else {
-        return std::to_string(static_cast<int>(ms)) + "ms";
+        snprintf(buf, sizeof(buf), "%dms", static_cast<int>(ms));
     }
+    return buf;
 }
 
 // Custom oscillator class for waveform interpolation
@@ -256,7 +275,7 @@ HarmonicOscillator<> voiceHarmonicOsc[4];    // Harmonic oscillators for all 4 v
 InterpolatedOscillator panLfo;              // LFO for panning CV output
 InterpolatedOscillator internalPhaseOsc[4]; // Internal oscillators for phase generation (voices 1 and 3 use these)
 
-size_t blocksize = 16; //(333us latency vs 167us for 8)
+size_t blocksize = 32; //(333us latency vs 167us for 8)
 int panelMode;
 float voicesMinLevel = 0.0f;
 
@@ -422,10 +441,13 @@ enum SequencerOrderMode {
 // Individual sequencer track state
 struct SequencerTrack {
     // Track-specific parameters
-    float density = 0.0f;  // 0.0f to 16.0f - used for CC probability when SEQ mode on
+    float density = 0.0f;  // 0.0f to 16.0f - determines number of notes in Euclidean rhythm pattern
     float multiplier = 0.0f;  // 0.0f to 1.0f - maps to 1,2,4,8
     SequencerOrderMode orderMode = SEQ_ORDER_ASC;
     float noteLengthPercent = 0.5f;  // Note length as percentage of step (10%-90%)
+    
+    // Per-track Euclidean rhythm pattern (density determines how many of 16 steps trigger)
+    bool triggerSequence[TRIGGER_SEQUENCE_LENGTH] = {false};
     
     // Per-track progression state
     uint8_t noteIndex = 0;
@@ -497,8 +519,8 @@ struct SequencerParams {
     uint32_t clockInterval = 0;
     bool clockEnabled = true;
     
-    // Trigger sequence (shared across all tracks)
-    bool triggerSequence[TRIGGER_SEQUENCE_LENGTH] = {false};
+    // Deprecated: Shared trigger sequence removed - each track now has its own triggerSequence
+    // bool triggerSequence[TRIGGER_SEQUENCE_LENGTH] = {false};  // DEPRECATED
     uint8_t currentSequenceStep = 0;
     uint32_t lastSequenceStepTime = 0;
     uint32_t sequenceStepInterval = 0;
@@ -597,30 +619,45 @@ enum ParamId {
     // TUNING Panel
     PARAM_TUNING_INDEX,
     PARAM_TUNING_MIDI_ENABLE,
+    PARAM_TUNING_BPM,  // BPM moved from SEQ panel
     
-    // SEQUENCER Panel
-    PARAM_SEQ_DENSITY,
-    PARAM_SEQ_ORDER,
-    PARAM_SEQ_LENGTH,
-    PARAM_SEQ_BPM,
+    // Sequencer Track 0 Panel
+    PARAM_SEQ0_DENSITY,
+    PARAM_SEQ0_ORDER,
+    PARAM_SEQ0_CC_PROB,
+    PARAM_SEQ0_MULT,
     
-    // SAMPLER Panel (Track Densities - replaces CC Probabilities)
-    PARAM_SEQ_TRACK0_DENSITY,
-    PARAM_SEQ_TRACK1_DENSITY,
-    PARAM_SEQ_TRACK2_DENSITY,
-    PARAM_SEQ_TRACK3_DENSITY,
+    // Sequencer Track 1 Panel
+    PARAM_SEQ1_DENSITY,
+    PARAM_SEQ1_ORDER,
+    PARAM_SEQ1_CC_PROB,
+    PARAM_SEQ1_MULT,
     
-    // MULT Panel (Track Multipliers - replaces CC Multipliers)
-    PARAM_SEQ_TRACK0_MULT,
-    PARAM_SEQ_TRACK1_MULT,
-    PARAM_SEQ_TRACK2_MULT,
-    PARAM_SEQ_TRACK3_MULT,
+    // Sequencer Track 2 Panel
+    PARAM_SEQ2_DENSITY,
+    PARAM_SEQ2_ORDER,
+    PARAM_SEQ2_CC_PROB,
+    PARAM_SEQ2_MULT,
     
-    // COMP Panel
-    PARAM_COMP_RATIO,
-    PARAM_COMP_THRESHOLD,
-    PARAM_COMP_ATTACK,
-    PARAM_COMP_RELEASE,
+    // Sequencer Track 3 Panel
+    PARAM_SEQ3_DENSITY,
+    PARAM_SEQ3_ORDER,
+    PARAM_SEQ3_CC_PROB,
+    PARAM_SEQ3_MULT,
+    
+    // Deprecated parameters (kept for backward compatibility, but not used in UI)
+    PARAM_SEQ_DENSITY,  // Deprecated - use per-track density
+    PARAM_SEQ_ORDER,    // Deprecated - use per-track order
+    PARAM_SEQ_LENGTH,   // Deprecated - no longer used
+    PARAM_SEQ_BPM,      // Deprecated - moved to TUNING panel
+    PARAM_SEQ_TRACK0_DENSITY,  // Deprecated - use PARAM_SEQ0_DENSITY
+    PARAM_SEQ_TRACK1_DENSITY,  // Deprecated - use PARAM_SEQ1_DENSITY
+    PARAM_SEQ_TRACK2_DENSITY,  // Deprecated - use PARAM_SEQ2_DENSITY
+    PARAM_SEQ_TRACK3_DENSITY,  // Deprecated - use PARAM_SEQ3_DENSITY
+    PARAM_SEQ_TRACK0_MULT,     // Deprecated - use PARAM_SEQ0_MULT
+    PARAM_SEQ_TRACK1_MULT,     // Deprecated - use PARAM_SEQ1_MULT
+    PARAM_SEQ_TRACK2_MULT,     // Deprecated - use PARAM_SEQ2_MULT
+    PARAM_SEQ_TRACK3_MULT,     // Deprecated - use PARAM_SEQ3_MULT
     
     // DELAY Panel
     PARAM_DELAY_MODE,
@@ -664,28 +701,43 @@ struct UserState {
     // TUNING parameters
     float tuningIndex;          // 0.0-1.0 maps to tuning preset index
     float tuningMidiEnable;     // 0.0-1.0 (>0.5 = enabled)
+    float tuningBpm;            // 0.0-1.0 maps to CLOCK_BPM_MIN-CLOCK_BPM_MAX (moved from SEQ panel)
     
-    // SEQUENCER parameters (shared/legacy - kept for backward compatibility, but tracks use their own)
-    float seqDensity;           // 0.0-1.0 maps to 0-16 triggers (legacy, tracks have their own)
-    float seqOrder;             // 0.0-1.0 (<0.5=ascending, >=0.5=descending) (legacy, tracks have their own)
-    float seqLength;            // 0.0-1.0 note length percentage (legacy, tracks have their own)
-    float seqBpm;               // 0.0-1.0 maps to CLOCK_BPM_MIN-CLOCK_BPM_MAX
+    // Per-track sequencer parameters (4 parameters per track: density, order, cc probability, multiplier)
+    // Track 0
+    float seq0Density;          // 0.0-1.0 maps to 0-16 triggers for track 0
+    float seq0Order;            // 0.0-1.0 maps to order mode for track 0
+    float seq0CcProb;           // 0.0-1.0 maps to 0-100% CC probability for track 0
+    float seq0Multiplier;       // 0.0-1.0 maps to 1,2,4,8 for track 0
+    // Track 1
+    float seq1Density;
+    float seq1Order;
+    float seq1CcProb;
+    float seq1Multiplier;
+    // Track 2
+    float seq2Density;
+    float seq2Order;
+    float seq2CcProb;
+    float seq2Multiplier;
+    // Track 3
+    float seq3Density;
+    float seq3Order;
+    float seq3CcProb;
+    float seq3Multiplier;
     
-    // Per-track sequencer parameters (replaces CC prob/mult)
-    float seqTrack0Density;     // 0.0-1.0 maps to 0-16 triggers for track 0 (CC probability when SEQ off)
-    float seqTrack0Multiplier;  // 0.0-1.0 maps to 1,2,4,8 for track 0 (subdivision timing when SEQ off, note count when SEQ on)
-    float seqTrack1Density;     // Track 1 density
-    float seqTrack1Multiplier;  // Track 1 multiplier
-    float seqTrack2Density;     // Track 2 density
-    float seqTrack2Multiplier;  // Track 2 multiplier
-    float seqTrack3Density;     // Track 3 density
-    float seqTrack3Multiplier;  // Track 3 multiplier
-    
-    // COMP parameters
-    float compRatio;            // 0.0-1.0 maps to 1.0-40.0 compression ratio
-    float compThreshold;       // 0.0-1.0 maps to 0.0 to -80.0 dB
-    float compAttack;          // 0.0-1.0 maps to 0.001-10.0 seconds
-    float compRelease;         // 0.0-1.0 maps to 0.001-10.0 seconds
+    // Deprecated SEQUENCER parameters (kept for backward compatibility)
+    float seqDensity;           // Deprecated - use per-track density
+    float seqOrder;             // Deprecated - use per-track order
+    float seqLength;            // Deprecated - no longer used
+    float seqBpm;               // Deprecated - use tuningBpm
+    float seqTrack0Density;     // Deprecated - use seq0Density
+    float seqTrack0Multiplier;  // Deprecated - use seq0Multiplier
+    float seqTrack1Density;     // Deprecated - use seq1Density
+    float seqTrack1Multiplier;  // Deprecated - use seq1Multiplier
+    float seqTrack2Density;     // Deprecated - use seq2Density
+    float seqTrack2Multiplier;  // Deprecated - use seq2Multiplier
+    float seqTrack3Density;     // Deprecated - use seq3Density
+    float seqTrack3Multiplier;  // Deprecated - use seq3Multiplier
     
     // DELAY parameters
     float delayMode;           // 0.0-1.0 (short=0.0-0.5, long=0.5-1.0)
@@ -719,6 +771,28 @@ struct UserState {
         harmonicSkew(initialValue),     // Default no skew (emphasize fundamental)
         tuningIndex(initialValue),      // Default 12-TET
         tuningMidiEnable(initialValue), // Default enabled
+        tuningBpm((CLOCK_BPM_DEFAULT - CLOCK_BPM_MIN) / static_cast<float>(CLOCK_BPM_MAX - CLOCK_BPM_MIN)),  // Default 120 BPM normalized
+        // Track 0 sequencer parameters
+        seq0Density(initialValue),      // Default 0.0 (no triggers)
+        seq0Order(initialValue),        // Default ascending
+        seq0CcProb(initialValue),       // Default 0% CC probability
+        seq0Multiplier(initialValue),   // Default multiplier 1 (0.0 maps to multiplier 1)
+        // Track 1 sequencer parameters
+        seq1Density(initialValue),
+        seq1Order(initialValue),
+        seq1CcProb(initialValue),
+        seq1Multiplier(initialValue),
+        // Track 2 sequencer parameters
+        seq2Density(initialValue),
+        seq2Order(initialValue),
+        seq2CcProb(initialValue),
+        seq2Multiplier(initialValue),
+        // Track 3 sequencer parameters
+        seq3Density(initialValue),
+        seq3Order(initialValue),
+        seq3CcProb(initialValue),
+        seq3Multiplier(initialValue),
+        // Deprecated parameters (kept for backward compatibility)
         seqDensity(0.0f),
         seqOrder(initialValue),         // Default ascending
         seqLength(initialValue),        // Default 50% length
@@ -731,10 +805,6 @@ struct UserState {
         seqTrack2Multiplier(initialValue),
         seqTrack3Density(initialValue),
         seqTrack3Multiplier(initialValue),
-        compRatio(initialValue),        // Default 4:1 ratio (0.25 = (4-1)/(40-1) ≈ 0.077)
-        compThreshold(initialValue),    // Default -12 dB (0.6 in normalized range)
-        compAttack(initialValue),      // Default 0.001s attack
-        compRelease(initialValue),      // Default 0.1s release
         delayMode(initialValue),        // Default short mode
         delayTime(initialValue),        // Default 50% delay time
         delayDamp(initialValue),        // Default 30% damping (pluck-like filter)
@@ -748,6 +818,107 @@ struct UserState {
 
 // Global state instance
 UserState appState;
+
+// Helper functions to get track parameter values from appState
+inline float GetTrackDensity(int trackIdx) {
+    switch(trackIdx) {
+        case 0: return appState.seq0Density;
+        case 1: return appState.seq1Density;
+        case 2: return appState.seq2Density;
+        case 3: return appState.seq3Density;
+        default: return 0.0f;
+    }
+}
+
+inline float GetTrackOrder(int trackIdx) {
+    switch(trackIdx) {
+        case 0: return appState.seq0Order;
+        case 1: return appState.seq1Order;
+        case 2: return appState.seq2Order;
+        case 3: return appState.seq3Order;
+        default: return 0.0f;
+    }
+}
+
+inline float GetTrackCcProb(int trackIdx) {
+    switch(trackIdx) {
+        case 0: return appState.seq0CcProb;
+        case 1: return appState.seq1CcProb;
+        case 2: return appState.seq2CcProb;
+        case 3: return appState.seq3CcProb;
+        default: return 0.0f;
+    }
+}
+
+inline float GetTrackMultiplier(int trackIdx) {
+    switch(trackIdx) {
+        case 0: return appState.seq0Multiplier;
+        case 1: return appState.seq1Multiplier;
+        case 2: return appState.seq2Multiplier;
+        case 3: return appState.seq3Multiplier;
+        default: return 0.0f;
+    }
+}
+
+// Helper function to map normalized value to SequencerOrderMode
+inline SequencerOrderMode NormalizedToOrderMode(float normalizedValue) {
+    if (normalizedValue < 0.1667f) return SEQ_ORDER_ASC;
+    else if (normalizedValue < 0.3333f) return SEQ_ORDER_DESC;
+    else if (normalizedValue < 0.5f) return SEQ_ORDER_UPD;
+    else if (normalizedValue < 0.6667f) return SEQ_ORDER_FWD;
+    else if (normalizedValue < 0.8333f) return SEQ_ORDER_RND;
+    else return SEQ_ORDER_BRN;
+}
+
+// Helper function to update track density and regenerate trigger sequence
+inline void SetTrackDensity(int trackIdx, float normalizedValue) {
+    SequencerTrack& track = sequencer.tracks[trackIdx];
+    track.density = normalizedValue * 16.0f;  // Map 0.0-1.0 to 0-16
+    
+    if (sequencer.sequencerMode) {
+        int numTriggers = static_cast<int>(track.density + 0.5f);
+        numTriggers = std::max(0, std::min(numTriggers, static_cast<int>(TRIGGER_SEQUENCE_LENGTH)));
+        GenerateEuclideanRhythm(numTriggers, TRIGGER_SEQUENCE_LENGTH, track.triggerSequence);
+    }
+}
+
+// Helper function to update track order mode (declared after SortSequencerNotes)
+inline void SetTrackOrder(int trackIdx, float normalizedValue);
+
+// Helper function to update track CC probability
+inline void SetTrackCcProb(int trackIdx, float normalizedValue) {
+    if (!sequencer.sequencerMode) {
+        uint8_t prob = static_cast<uint8_t>(normalizedValue * 100.0f);
+        prob = std::min(static_cast<uint8_t>(100), prob);
+        int slotBase = trackIdx * 2;
+        ccSlotProbabilities[slotBase] = prob;
+        ccSlotProbabilities[slotBase + 1] = prob;
+    }
+}
+
+// Helper function to update track multiplier
+inline void SetTrackMultiplier(int trackIdx, float normalizedValue) {
+    SequencerTrack& track = sequencer.tracks[trackIdx];
+    track.multiplier = normalizedValue;
+    
+    // Map 0.0-1.0 to discrete multipliers: 1, 2, 4, 8
+    uint8_t mult;
+    if (normalizedValue < 0.25f) mult = 1;
+    else if (normalizedValue < 0.5f) mult = 2;
+    else if (normalizedValue < 0.75f) mult = 4;
+    else mult = 8;
+    
+    if (!sequencer.sequencerMode) {
+        int slotBase = trackIdx * 2;
+        ccSlotMultipliers[slotBase] = mult;
+        ccSlotMultipliers[slotBase + 1] = mult;
+    }
+    
+    if (sequencer.sequencerMode) {
+        track.UpdateNoteCount();
+        UpdateTrackNoteIntervals();
+    }
+}
 
 // Function to update delay time calculation (called when parameters change)
 void UpdateDelayTime() {
@@ -799,6 +970,9 @@ struct panelStruct
 // Maximum number of panels - increase this if adding more panels
 constexpr int MAX_PANELS = 16;
 
+// Shared strings to reduce flash usage
+static const char* SEQ_INPUT_NAMES[] = {"Dens", "Ord", "CC%", "Mult"};
+
 panelStruct displayPanels[] = {
     { 
         name: "ENV",
@@ -833,44 +1007,44 @@ panelStruct displayPanels[] = {
         input1Name: "T",
         input2Name: "",
         input3Name: "",
-        input4Name: "",
-        bindings: {PARAM_TUNING_INDEX, PARAM_NONE, PARAM_TUNING_MIDI_ENABLE, PARAM_NONE}
-    },
-    {
-        name: "SEQ",
-        id: 's',
-        input1Name: "Num",
-        input2Name: "Ord",
-        input3Name: "Len",
         input4Name: "BPM",
-        bindings: {PARAM_SEQ_DENSITY, PARAM_SEQ_ORDER, PARAM_SEQ_LENGTH, PARAM_SEQ_BPM}
+        bindings: {PARAM_TUNING_INDEX, PARAM_NONE, PARAM_TUNING_MIDI_ENABLE, PARAM_TUNING_BPM}
     },
     {
-        name: "SAMPL",
-        id: 'c',
-        input1Name: "T0D",
-        input2Name: "T1D",
-        input3Name: "T2D",
-        input4Name: "T3D",
-        bindings: {PARAM_SEQ_TRACK0_DENSITY, PARAM_SEQ_TRACK1_DENSITY, PARAM_SEQ_TRACK2_DENSITY, PARAM_SEQ_TRACK3_DENSITY}
+        name: "SEQ0",
+        id: '0',
+        input1Name: STR_DENS,
+        input2Name: STR_ORD,
+        input3Name: STR_CCP,
+        input4Name: STR_MULT,
+        bindings: {PARAM_SEQ0_DENSITY, PARAM_SEQ0_ORDER, PARAM_SEQ0_CC_PROB, PARAM_SEQ0_MULT}
     },
     {
-        name: "MLT",
-        id: 'u',
-        input1Name: "T0M",
-        input2Name: "T1M",
-        input3Name: "T2M",
-        input4Name: "T3M",
-        bindings: {PARAM_SEQ_TRACK0_MULT, PARAM_SEQ_TRACK1_MULT, PARAM_SEQ_TRACK2_MULT, PARAM_SEQ_TRACK3_MULT}
+        name: "SEQ1",
+        id: '1',
+        input1Name: STR_DENS,
+        input2Name: STR_ORD,
+        input3Name: STR_CCP,
+        input4Name: STR_MULT,
+        bindings: {PARAM_SEQ1_DENSITY, PARAM_SEQ1_ORDER, PARAM_SEQ1_CC_PROB, PARAM_SEQ1_MULT}
     },
     {
-        name: "CMM",
-        id: 'x',
-        input1Name: "Rt",
-        input2Name: "Th",
-        input3Name: "Atk",
-        input4Name: "Rel",
-        bindings: {PARAM_COMP_RATIO, PARAM_COMP_THRESHOLD, PARAM_COMP_ATTACK, PARAM_COMP_RELEASE}
+        name: "SEQ2",
+        id: '2',
+        input1Name: STR_DENS,
+        input2Name: STR_ORD,
+        input3Name: STR_CCP,
+        input4Name: STR_MULT,
+        bindings: {PARAM_SEQ2_DENSITY, PARAM_SEQ2_ORDER, PARAM_SEQ2_CC_PROB, PARAM_SEQ2_MULT}
+    },
+    {
+        name: "SEQ3",
+        id: '3',
+        input1Name: STR_DENS,
+        input2Name: STR_ORD,
+        input3Name: STR_CCP,
+        input4Name: STR_MULT,
+        bindings: {PARAM_SEQ3_DENSITY, PARAM_SEQ3_ORDER, PARAM_SEQ3_CC_PROB, PARAM_SEQ3_MULT}
     },
     {
         name: "DLY",
@@ -916,15 +1090,15 @@ bool knobCaughtUp[4] = {false, false, false, false};  // Track if knob has caugh
 // Global knob normalizedValues storage - stores all knob positions for all panels (0.0-1.0 normalized)
 // Size matches actual panel count to save memory
 float knobValues[11][4] = {  // panelModesCount = 11
-    {0.0f, 0.5f, 0.7f, 0.0f},  // Panel 0: ADSR
-    {0.0f, 1.0f, 0.0f, 0.8f},  // Panel 1: MIXER
-    {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 2: OSC
-    {0.9f, 0.0f, 1.0f, 1.0f},  // Panel 3: TUNING
-    {0.0f, 0.0f, 0.5f, 0.0f},  // Panel 4: SEQUENCER
-    {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 5: SAMPLER
-    {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 6: MULT 
-    {0.25f, 0.6f, 0.01f, 0.05f}, // Panel 7: COMP
-    {0.7f, 0.5f, 0.5f, 0.2f},  // Panel 8: DELAY (Mode, Time, Damp, Mix)
+    {0.0f, 0.5f, 0.8f, 0.0f},  // Panel 0: ADSR
+    {0.1f, 1.0f, 0.0f, 0.8f},  // Panel 1: MIXER
+    {0.5f, 0.0f, 0.0f, 0.5},  // Panel 2: OSC
+    {0.9f, 0.0f, 1.0f, 0.186441f},  // Panel 3: TUNING (T, empty, MIDI, BPM) - Default 120 BPM normalized (110/590)
+    {0.25f, 0.0f, 0.0f, 0.0f},  // Panel 4: SEQ0 (Dens, Ord, CC%, Mult)
+    {0.25f, 0.0f, 0.0f, 0.0f},  // Panel 5: SEQ1 (Dens, Ord, CC%, Mult)
+    {0.25f, 0.0f, 0.0f, 0.0f},  // Panel 6: SEQ2 (Dens, Ord, CC%, Mult)
+    {0.25f, 0.0f, 0.0f, 0.0f},  // Panel 7: SEQ3 (Dens, Ord, CC%, Mult)
+    {0.7f, 0.5f, 0.5f, 0.0f},  // Panel 8: DELAY (Mode, Time, Damp, Mix)
     {0.2f, 0.5f, 0.0f, 0.0f},  // Panel 9: MICRO (PLen, PWid, Mod, Mix)
     {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 10: PRESET
 };
@@ -967,9 +1141,9 @@ envStruct envelopes[4];
 void      ProcessControls();
 void      ApplyVCAs();
 void      ApplyPanning(float* data);
-void      ApplyCompression(float* data);
 void      ApplyMicrosound(float* data);
 void      ApplyDelay(float* data);
+void      ApplyLimiter(float* data);
 void      UpdateDelayTime();
 void      UpdateOled();
 // void      plucksApply();
@@ -1006,9 +1180,8 @@ void      ApplyTuningToSequencerNotes();
 
 bool      knobChanged = false;
 
-// SD Card auto-save debouncing
-uint32_t  lastSaveTime = 0;
-const uint32_t SAVE_DEBOUNCE_MS = 2000; // Save 2 seconds after last knob change
+
+
 bool      sdCardInitialized = false;
 
 constexpr float ADSR_SUSTAIN_FULL_LEVEL_ZONE_START   = 0.75f;
@@ -1107,30 +1280,45 @@ float GetParamValue(ParamId paramId)
         // TUNING Panel
         case PARAM_TUNING_INDEX:        return appState.tuningIndex;
         case PARAM_TUNING_MIDI_ENABLE:  return appState.tuningMidiEnable;
+        case PARAM_TUNING_BPM:          return appState.tuningBpm;
         
-        // SEQUENCER Panel
+        // Sequencer Track 0 Panel
+        case PARAM_SEQ0_DENSITY:        return GetTrackDensity(0);
+        case PARAM_SEQ0_ORDER:          return GetTrackOrder(0);
+        case PARAM_SEQ0_CC_PROB:       return GetTrackCcProb(0);
+        case PARAM_SEQ0_MULT:           return GetTrackMultiplier(0);
+        
+        // Sequencer Track 1 Panel
+        case PARAM_SEQ1_DENSITY:        return GetTrackDensity(1);
+        case PARAM_SEQ1_ORDER:          return GetTrackOrder(1);
+        case PARAM_SEQ1_CC_PROB:        return GetTrackCcProb(1);
+        case PARAM_SEQ1_MULT:           return GetTrackMultiplier(1);
+        
+        // Sequencer Track 2 Panel
+        case PARAM_SEQ2_DENSITY:        return GetTrackDensity(2);
+        case PARAM_SEQ2_ORDER:          return GetTrackOrder(2);
+        case PARAM_SEQ2_CC_PROB:        return GetTrackCcProb(2);
+        case PARAM_SEQ2_MULT:           return GetTrackMultiplier(2);
+        
+        // Sequencer Track 3 Panel
+        case PARAM_SEQ3_DENSITY:        return GetTrackDensity(3);
+        case PARAM_SEQ3_ORDER:          return GetTrackOrder(3);
+        case PARAM_SEQ3_CC_PROB:        return GetTrackCcProb(3);
+        case PARAM_SEQ3_MULT:           return GetTrackMultiplier(3);
+        
+        // Deprecated parameters (kept for backward compatibility)
         case PARAM_SEQ_DENSITY:         return appState.seqDensity;
         case PARAM_SEQ_ORDER:           return appState.seqOrder;
         case PARAM_SEQ_LENGTH:          return appState.seqLength;
         case PARAM_SEQ_BPM:             return appState.seqBpm;
-        
-        // SAMPLER Panel (Track Densities)
         case PARAM_SEQ_TRACK0_DENSITY:  return appState.seqTrack0Density;
         case PARAM_SEQ_TRACK1_DENSITY:  return appState.seqTrack1Density;
         case PARAM_SEQ_TRACK2_DENSITY:  return appState.seqTrack2Density;
         case PARAM_SEQ_TRACK3_DENSITY:  return appState.seqTrack3Density;
-        
-        // MULT Panel (Track Multipliers)
         case PARAM_SEQ_TRACK0_MULT:     return appState.seqTrack0Multiplier;
         case PARAM_SEQ_TRACK1_MULT:     return appState.seqTrack1Multiplier;
         case PARAM_SEQ_TRACK2_MULT:     return appState.seqTrack2Multiplier;
         case PARAM_SEQ_TRACK3_MULT:     return appState.seqTrack3Multiplier;
-        
-        // COMP Panel
-        case PARAM_COMP_RATIO:         return appState.compRatio;
-        case PARAM_COMP_THRESHOLD:     return appState.compThreshold;
-        case PARAM_COMP_ATTACK:        return appState.compAttack;
-        case PARAM_COMP_RELEASE:       return appState.compRelease;
         
         // DELAY Panel
         case PARAM_DELAY_MODE:         return appState.delayMode;
@@ -1321,6 +1509,14 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                 int newMode = static_cast<int>(normalizedValue * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
                 int oldModeInt = static_cast<int>(oldMode * 2.99f);
                 
+                // Reset catch-up state for knobs 0-2 when mode changes
+                // The same physical knobs control different parameters in different modes
+                if (newMode != oldModeInt) {
+                    for (int i = 0; i < 3; i++) {
+                        knobCaughtUp[i] = false;
+                    }
+                }
+                
                 if ((newMode == 0 && oldModeInt != 0) || (newMode != 0 && oldModeInt == 0)) {
                     // Switching to/from Interpolated mode - reset phase tracking
                     for (int i = 0; i < 2; i++) {
@@ -1350,7 +1546,8 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             {
                 // FM index is now controlled by envelope amplitude per voice
                 // This parameter is kept for UI display purposes but doesn't control the index
-                appState.fm2Index = normalizedValue;
+                // Clamp to 0 when below 0.1 to prevent unwanted modulation
+                appState.fm2Index = (normalizedValue < 0.1f) ? 0.0f : normalizedValue;
             }
             break;
         case PARAM_OSC_HARMONIC_IDX:
@@ -1454,14 +1651,136 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             sendPitchBendMidi = (normalizedValue > 0.5f);
             break;
         
-        // SEQUENCER Panel
+        case PARAM_TUNING_BPM:
+            {
+                // In latch mode the envelope timing drives the sequencer, so ignore BPM knob input
+                if (adsrLatchEnabled) {
+                    float normalizedBpm = static_cast<float>(sequencer.clockBpm - CLOCK_BPM_MIN)
+                                           / (CLOCK_BPM_MAX - CLOCK_BPM_MIN);
+                    normalizedBpm = std::max(0.0f, std::min(1.0f, normalizedBpm));
+                    appState.tuningBpm = normalizedBpm;
+                    break;
+                }
+
+                // Calculate BPM from normalized value
+                int32_t newBpm = CLOCK_BPM_MIN + static_cast<int32_t>(normalizedValue * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
+                
+                // Quantize to nearest multiple of 5
+                newBpm = ((newBpm + 2) / 5) * 5;
+                newBpm = std::max(CLOCK_BPM_MIN, std::min(CLOCK_BPM_MAX, newBpm));
+                
+                // Update normalized value to match quantized BPM so display reflects actual value
+                appState.tuningBpm = static_cast<float>(newBpm - CLOCK_BPM_MIN) / (CLOCK_BPM_MAX - CLOCK_BPM_MIN);
+                
+                if (newBpm != sequencer.clockBpm) {
+                    sequencer.clockBpm = newBpm;
+                    sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
+                    sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));
+                    sequencer.subdivisionInterval = sequencer.sequenceStepInterval / 8;
+                    UpdateTrackNoteIntervals();
+                    // Update delay time if in BPM-sync mode
+                    UpdateDelayTime();
+                }
+            }
+            break;
+        
+        // Sequencer Track 0 Panel
+        case PARAM_SEQ0_DENSITY:
+            appState.seq0Density = normalizedValue;
+            SetTrackDensity(0, normalizedValue);
+            break;
+            
+        case PARAM_SEQ0_ORDER:
+            appState.seq0Order = normalizedValue;
+            SetTrackOrder(0, normalizedValue);
+            break;
+            
+        case PARAM_SEQ0_CC_PROB:
+            appState.seq0CcProb = normalizedValue;
+            SetTrackCcProb(0, normalizedValue);
+            break;
+            
+        case PARAM_SEQ0_MULT:
+            appState.seq0Multiplier = normalizedValue;
+            SetTrackMultiplier(0, normalizedValue);
+            break;
+        
+        // Sequencer Track 1 Panel
+        case PARAM_SEQ1_DENSITY:
+            appState.seq1Density = normalizedValue;
+            SetTrackDensity(1, normalizedValue);
+            break;
+            
+        case PARAM_SEQ1_ORDER:
+            appState.seq1Order = normalizedValue;
+            SetTrackOrder(1, normalizedValue);
+            break;
+            
+        case PARAM_SEQ1_CC_PROB:
+            appState.seq1CcProb = normalizedValue;
+            SetTrackCcProb(1, normalizedValue);
+            break;
+            
+        case PARAM_SEQ1_MULT:
+            appState.seq1Multiplier = normalizedValue;
+            SetTrackMultiplier(1, normalizedValue);
+            break;
+        
+        // Sequencer Track 2 Panel
+        case PARAM_SEQ2_DENSITY:
+            appState.seq2Density = normalizedValue;
+            SetTrackDensity(2, normalizedValue);
+            break;
+            
+        case PARAM_SEQ2_ORDER:
+            appState.seq2Order = normalizedValue;
+            SetTrackOrder(2, normalizedValue);
+            break;
+            
+        case PARAM_SEQ2_CC_PROB:
+            appState.seq2CcProb = normalizedValue;
+            SetTrackCcProb(2, normalizedValue);
+            break;
+            
+        case PARAM_SEQ2_MULT:
+            appState.seq2Multiplier = normalizedValue;
+            SetTrackMultiplier(2, normalizedValue);
+            break;
+        
+        // Sequencer Track 3 Panel
+        case PARAM_SEQ3_DENSITY:
+            appState.seq3Density = normalizedValue;
+            SetTrackDensity(3, normalizedValue);
+            break;
+            
+        case PARAM_SEQ3_ORDER:
+            appState.seq3Order = normalizedValue;
+            SetTrackOrder(3, normalizedValue);
+            break;
+            
+        case PARAM_SEQ3_CC_PROB:
+            appState.seq3CcProb = normalizedValue;
+            SetTrackCcProb(3, normalizedValue);
+            break;
+            
+        case PARAM_SEQ3_MULT:
+            appState.seq3Multiplier = normalizedValue;
+            SetTrackMultiplier(3, normalizedValue);
+            break;
+        
+        // SEQUENCER Panel (deprecated - kept for backward compatibility)
         case PARAM_SEQ_DENSITY:
+            // Deprecated parameter - update all tracks' densities to maintain backward compatibility
             appState.seqDensity = normalizedValue;
             sequencer.density = normalizedValue * static_cast<float>(TRIGGER_SEQUENCE_LENGTH);
-            {
-                int numTriggers = static_cast<int>(sequencer.density);
-                numTriggers = std::max(0, std::min(numTriggers, static_cast<int>(TRIGGER_SEQUENCE_LENGTH)));
-                GenerateEuclideanRhythm(numTriggers, TRIGGER_SEQUENCE_LENGTH, sequencer.triggerSequence);
+            // Apply to all tracks
+            for (int i = 0; i < 4; i++) {
+                sequencer.tracks[i].density = sequencer.density;
+                if (sequencer.sequencerMode) {
+                    int numTriggers = static_cast<int>(sequencer.tracks[i].density + 0.5f);
+                    numTriggers = std::max(0, std::min(numTriggers, static_cast<int>(TRIGGER_SEQUENCE_LENGTH)));
+                    GenerateEuclideanRhythm(numTriggers, TRIGGER_SEQUENCE_LENGTH, sequencer.tracks[i].triggerSequence);
+                }
             }
             break;
             
@@ -1488,7 +1807,12 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                 for (int i = 0; i < 4; i++) {
                     if (newMode != sequencer.tracks[i].orderMode) {
                         sequencer.tracks[i].orderMode = newMode;
-                        sequencer.tracks[i].noteIndex = 0;
+                        // Set noteIndex based on order mode
+                        if (newMode == SEQ_ORDER_DESC && !sequencer.sequencerNotes.empty()) {
+                            sequencer.tracks[i].noteIndex = sequencer.sequencerNotes.size() - 1;
+                        } else {
+                            sequencer.tracks[i].noteIndex = 0;
+                        }
                         sequencer.tracks[i].upDownDirection = true;
                     }
                 }
@@ -1553,8 +1877,8 @@ void SetParamValue(ParamId paramId, float normalizedValue)
         // SAMPLER Panel (Track Densities)
         case PARAM_SEQ_TRACK0_DENSITY:
             appState.seqTrack0Density = normalizedValue;
-            sequencer.tracks[0].density = normalizedValue * 16.0f;  // Map 0.0-1.0 to 0-16
-            // Update CC probability when SEQ mode is off
+            SetTrackDensity(0, normalizedValue);
+            // Update CC probability when SEQ mode is off (SAMPLER panel uses density as CC prob)
             if (!sequencer.sequencerMode) {
                 uint8_t prob = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
                 ccSlotProbabilities[0] = prob;
@@ -1564,7 +1888,7 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             
         case PARAM_SEQ_TRACK1_DENSITY:
             appState.seqTrack1Density = normalizedValue;
-            sequencer.tracks[1].density = normalizedValue * 16.0f;
+            SetTrackDensity(1, normalizedValue);
             if (!sequencer.sequencerMode) {
                 uint8_t prob = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
                 ccSlotProbabilities[2] = prob;
@@ -1574,7 +1898,7 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             
         case PARAM_SEQ_TRACK2_DENSITY:
             appState.seqTrack2Density = normalizedValue;
-            sequencer.tracks[2].density = normalizedValue * 16.0f;
+            SetTrackDensity(2, normalizedValue);
             if (!sequencer.sequencerMode) {
                 uint8_t prob = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
                 ccSlotProbabilities[4] = prob;
@@ -1584,7 +1908,7 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             
         case PARAM_SEQ_TRACK3_DENSITY:
             appState.seqTrack3Density = normalizedValue;
-            sequencer.tracks[3].density = normalizedValue * 16.0f;
+            SetTrackDensity(3, normalizedValue);
             if (!sequencer.sequencerMode) {
                 uint8_t prob = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
                 ccSlotProbabilities[6] = prob;
@@ -1595,131 +1919,22 @@ void SetParamValue(ParamId paramId, float normalizedValue)
         // MULT Panel (Track Multipliers)
         case PARAM_SEQ_TRACK0_MULT:
             appState.seqTrack0Multiplier = normalizedValue;
-            sequencer.tracks[0].multiplier = normalizedValue;
-            {
-                // Map 0.0-1.0 to discrete multipliers: 1, 2, 4, 8
-                uint8_t mult;
-                if (normalizedValue < 0.25f) mult = 1;
-                else if (normalizedValue < 0.5f) mult = 2;
-                else if (normalizedValue < 0.75f) mult = 4;
-                else mult = 8;
-                
-                // Update CC multiplier when SEQ mode is off (controls subdivision timing)
-                if (!sequencer.sequencerMode) {
-                ccSlotMultipliers[0] = mult;
-                ccSlotMultipliers[1] = mult;
-                }
-                
-                // Update note count when SEQ mode is on
-                if (sequencer.sequencerMode) {
-                    sequencer.tracks[0].UpdateNoteCount();
-                    // Recalculate note interval using total sequence duration
-                    UpdateTrackNoteIntervals();
-                }
-            }
+            SetTrackMultiplier(0, normalizedValue);
             break;
             
         case PARAM_SEQ_TRACK1_MULT:
             appState.seqTrack1Multiplier = normalizedValue;
-            sequencer.tracks[1].multiplier = normalizedValue;
-            {
-                uint8_t mult;
-                if (normalizedValue < 0.25f) mult = 1;
-                else if (normalizedValue < 0.5f) mult = 2;
-                else if (normalizedValue < 0.75f) mult = 4;
-                else mult = 8;
-                
-                if (!sequencer.sequencerMode) {
-                ccSlotMultipliers[2] = mult;
-                ccSlotMultipliers[3] = mult;
-                }
-                
-                if (sequencer.sequencerMode) {
-                    sequencer.tracks[1].UpdateNoteCount();
-                    UpdateTrackNoteIntervals();
-                }
-            }
+            SetTrackMultiplier(1, normalizedValue);
             break;
             
         case PARAM_SEQ_TRACK2_MULT:
             appState.seqTrack2Multiplier = normalizedValue;
-            sequencer.tracks[2].multiplier = normalizedValue;
-            {
-                uint8_t mult;
-                if (normalizedValue < 0.25f) mult = 1;
-                else if (normalizedValue < 0.5f) mult = 2;
-                else if (normalizedValue < 0.75f) mult = 4;
-                else mult = 8;
-                
-                if (!sequencer.sequencerMode) {
-                ccSlotMultipliers[4] = mult;
-                ccSlotMultipliers[5] = mult;
-                }
-                
-                if (sequencer.sequencerMode) {
-                    sequencer.tracks[2].UpdateNoteCount();
-                    UpdateTrackNoteIntervals();
-                }
-            }
+            SetTrackMultiplier(2, normalizedValue);
             break;
             
         case PARAM_SEQ_TRACK3_MULT:
             appState.seqTrack3Multiplier = normalizedValue;
-            sequencer.tracks[3].multiplier = normalizedValue;
-            {
-                uint8_t mult;
-                if (normalizedValue < 0.25f) mult = 1;
-                else if (normalizedValue < 0.5f) mult = 2;
-                else if (normalizedValue < 0.75f) mult = 4;
-                else mult = 8;
-                
-                if (!sequencer.sequencerMode) {
-                ccSlotMultipliers[6] = mult;
-                ccSlotMultipliers[7] = mult;
-                }
-                
-                if (sequencer.sequencerMode) {
-                    sequencer.tracks[3].UpdateNoteCount();
-                    UpdateTrackNoteIntervals();
-                }
-            }
-            break;
-        
-        // COMP Panel
-        case PARAM_COMP_RATIO:
-            {
-                appState.compRatio = normalizedValue;
-                // Map 0.0-1.0 to 1.0-40.0 compression ratio
-                float ratio = 1.0f + normalizedValue * 39.0f;
-                compressor.SetRatio(ratio);
-            }
-            break;
-            
-        case PARAM_COMP_THRESHOLD:
-            {
-                appState.compThreshold = normalizedValue;
-                // Map 0.0-1.0 to 0.0 to -80.0 dB threshold
-                float threshold = -80.0f * normalizedValue;
-                compressor.SetThreshold(threshold);
-            }
-            break;
-            
-        case PARAM_COMP_ATTACK:
-            {
-                appState.compAttack = normalizedValue;
-                // Map 0.0-1.0 to 0.001-10.0 seconds with logarithmic curve
-                float attack = 0.001f * powf(10000.0f, normalizedValue);
-                compressor.SetAttack(attack);
-            }
-            break;
-            
-        case PARAM_COMP_RELEASE:
-            {
-                appState.compRelease = normalizedValue;
-                // Map 0.0-1.0 to 0.001-10.0 seconds with logarithmic curve
-                float release = 0.001f * powf(10000.0f, normalizedValue);
-                compressor.SetRelease(release);
-            }
+            SetTrackMultiplier(3, normalizedValue);
             break;
         
         // DELAY Panel
@@ -1867,14 +2082,6 @@ void ApplyCrossfader(float* processedLeft, float* processedRight,
     *processedRight = *processedRight * volume + externalRight * (1.0f - volume);
 }
 
-void ApplyCompression(float* data) {
-    // Compress each individual voice before mixing
-    data[0] = compressor.Process(data[0]);
-    data[1] = compressor.Process(data[1]);
-    data[2] = compressor.Process(data[2]);
-    data[3] = compressor.Process(data[3]);
-}
-
 void ApplyMicrosound(float* data) {
     // Get wet/dry parameter
     float wetDry = appState.microWetDry;
@@ -1974,6 +2181,36 @@ void ApplyDelay(float* data) {
     // Final safety check
     if (!std::isfinite(data[0])) data[0] = 0.0f;
     if (!std::isfinite(data[1])) data[1] = 0.0f;
+}
+
+void ApplyLimiter(float* data) {
+    // Process limiter on stereo channels (left and right)
+    // The limiter's ProcessBlock works on buffers, so we'll process sample-by-sample
+    // using a simple peak-tracking approach similar to the limiter's internal logic
+    
+    static float limiterPeakL = 0.5f;
+    static float limiterPeakR = 0.5f;
+    
+    // Pre-gain (can be adjusted if needed, 1.0 = no pre-gain)
+    float preGain = 0.7f;
+    
+    // Process left channel
+    float leftPre = data[0] * preGain;
+    float leftPeak = fabsf(leftPre);
+    // SLOPE: smooth peak tracking (attack: 0.05, release: 0.00002)
+    float leftError = leftPeak - limiterPeakL;
+    limiterPeakL += (leftError > 0 ? 0.05f : 0.00002f) * leftError;
+    float leftGain = (limiterPeakL <= 1.0f ? 1.0f : 1.0f / limiterPeakL);
+    data[0] = SoftLimit(leftPre * leftGain * 0.7f);
+    
+    // Process right channel
+    float rightPre = data[1] * preGain;
+    float rightPeak = fabsf(rightPre);
+    // SLOPE: smooth peak tracking (attack: 0.05, release: 0.00002)
+    float rightError = rightPeak - limiterPeakR;
+    limiterPeakR += (rightError > 0 ? 0.05f : 0.00002f) * rightError;
+    float rightGain = (limiterPeakR <= 1.0f ? 1.0f : 1.0f / limiterPeakR);
+    data[1] = SoftLimit(rightPre * rightGain * 0.65f);
 }
 
 float IncrementTowards(float normalizedValue, float target)
@@ -2276,10 +2513,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         // Panel 1 - Envelope/Gain
         ApplyVCAs(results);
 
-        // Panel 2 - Compression (before panning)
-        ApplyCompression(results);
-
-        // Panel 3 - Panning and mixing
+        // Panel 2 - Panning and mixing
         ApplyPanning(results);
 
         // Panel 4 - Microsound (reads from separate microsound buffer, mixes into results)
@@ -2287,6 +2521,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
         // Panel 5 - Delay effect (independent from microsound)
         ApplyDelay(results);
+
+        // Limiter - final stage to prevent clipping
+        ApplyLimiter(results);
 
         // Crossfader: mix processed output with external audio from inputs 1 and 3
         // Input 1 goes to left channel, input 3 goes to right channel
@@ -2525,7 +2762,8 @@ int main(void)
     // Initialize BPM state normalizedValue based on current BPM
     // Map BPM to 0-1 range for state storage
     float bpmKnobValue = static_cast<float>(sequencer.clockBpm - CLOCK_BPM_MIN) / (CLOCK_BPM_MAX - CLOCK_BPM_MIN);
-    appState.seqBpm = bpmKnobValue;
+    appState.tuningBpm = bpmKnobValue;
+    appState.seqBpm = bpmKnobValue;  // Keep deprecated for backward compatibility
 
     UpdateOled();
 
@@ -2549,13 +2787,8 @@ int main(void)
     // 
     InitPan(samplerate);
     
-    // Initialize compressor
-    compressor.Init(samplerate);
-    compressor.SetRatio(4.0f);           // Default 4:1 ratio
-    compressor.SetThreshold(-12.0f);     // Default -12 dB
-    compressor.SetAttack(0.003f);        // Default 3ms attack
-    compressor.SetRelease(0.1f);         // Default 100ms release
-    compressor.AutoMakeup(true);         // Enable auto makeup gain
+    // Initialize limiter
+    limiter.Init();
     
     // Initialize delay lines
     delaySampleRate = samplerate;
@@ -2705,29 +2938,33 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
     if (panelId == 'e') {
         switch(paramIndex) {
             case 0: // Attack time - convert normalized value to milliseconds
-                return FormatMs(appState.adsrAttackMs);
+                return std::string(FormatMs(appState.adsrAttackMs));
             case 1: // Decay/Release time - convert normalized value to milliseconds
-                return FormatMs(appState.adsrDecayReleaseMs);
+                return std::string(FormatMs(appState.adsrDecayReleaseMs));
             case 2: // Sustain level
-                return FormatPercent(normalizedValue);
+                return std::string(FormatPercent(normalizedValue));
             case 3: // Minimum level
-                return FormatPercent(normalizedValue);
+                return std::string(FormatPercent(normalizedValue));
             default: return "0%";
         }
     }
     else if (panelId == 'm') {
         switch(paramIndex) {
             case 0: // Frequency
-                return std::to_string(static_cast<int>(LinearMap(normalizedValue, 0.0f, ParamConfig::PAN_FREQ_MAX_HZ))) + "Hz";
+                {
+                    static char buf[8];
+                    snprintf(buf, sizeof(buf), "%dHz", static_cast<int>(LinearMap(normalizedValue, 0.0f, ParamConfig::PAN_FREQ_MAX_HZ)));
+                    return std::string(buf);
+                }
             case 1: // Amplitude
-                return FormatPercent(normalizedValue);
+                return std::string(FormatPercent(normalizedValue));
             case 2: // Waveform
-                if (normalizedValue < 0.25f) return "Sine";
-                else if (normalizedValue < 0.5f) return "Tri";
-                else if (normalizedValue < 0.75f) return "Sqr";
-                else return "Saw";
+                if (normalizedValue < 0.25f) return STR_SINE;
+                else if (normalizedValue < 0.5f) return STR_TRI;
+                else if (normalizedValue < 0.75f) return STR_SQR;
+                else return STR_SAW;
             case 3: // Volume
-                return FormatPercent(normalizedValue);
+                return std::string(FormatPercent(normalizedValue));
             default: return "0%";
         }
     }
@@ -2739,24 +2976,28 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                     mode = std::max(0, std::min(2, mode));
                     switch(mode) {
                         case 0: // Interpolated - waveform
-                            if (normalizedValue < 0.25f) return "Sine";
-                            else if (normalizedValue < 0.5f) return "Tri";
-                            else if (normalizedValue < 0.75f) return "Sqr";
-                            else return "Saw";
+                            if (normalizedValue < 0.25f) return STR_SINE;
+                            else if (normalizedValue < 0.5f) return STR_TRI;
+                            else if (normalizedValue < 0.75f) return STR_SQR;
+                            else return STR_SAW;
                         case 1: // FM2 - ratio
                             {
                                 float ratio = 0.125f * powf(64.0f, normalizedValue);
                                 ratio = std::max(0.125f, std::min(8.0f, ratio));
-                                return std::to_string(static_cast<int>(ratio * 100.0f)) + "%";
+                                static char buf[8];
+                                snprintf(buf, sizeof(buf), "%d%%", static_cast<int>(ratio * 100.0f));
+                                return std::string(buf);
                             }
                         case 2: // Harmonic - idx
                             {
                                 int idx = 1 + static_cast<int>(normalizedValue * 15.99f);
                                 idx = std::max(1, std::min(16, idx));
-                                return "H" + std::to_string(idx);
+                                static char buf[4];
+                                snprintf(buf, sizeof(buf), "H%d", idx);
+                                return std::string(buf);
                             }
                         default:
-                            return "Sine";
+                            return STR_SINE;
                     }
                 }
             case 1: // Knob 2 - Mode specific
@@ -2767,11 +3008,17 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                         case 0: // Interpolated - empty
                             return "";
                         case 1: // FM2 - index
-                            return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
+                            {
+                                static char buf[8];
+                                snprintf(buf, sizeof(buf), "%d%%", static_cast<int>(normalizedValue * 100));
+                                return std::string(buf);
+                            }
                         case 2: // Harmonic - decay
                             {
                                 float decay = normalizedValue * 10.0f;
-                                return std::to_string(static_cast<int>(decay * 10.0f)) + "x";
+                                static char buf[6];
+                                snprintf(buf, sizeof(buf), "%dx", static_cast<int>(decay * 10.0f));
+                                return std::string(buf);
                             }
                         default:
                             return "";
@@ -2796,10 +3043,10 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                     int mode = static_cast<int>(normalizedValue * 2.99f); // 0-2: Interpolated, FM2, Harmonic
                     mode = std::max(0, std::min(2, mode));
                     switch(mode) {
-                        case 0: return "Inter";
+                        case 0: return STR_INTER;
                         case 1: return "FM2";
                         case 2: return "Harm";
-                        default: return "Inter";
+                        default: return STR_INTER;
                     }
                 }
             default: return "Inter";
@@ -2808,22 +3055,26 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
     else if (panelId == 's') {
         switch(paramIndex) {
             case 0: // Density
-                return std::to_string(static_cast<int>(normalizedValue * ParamConfig::SEQ_DENSITY_MAX)) + "/" + std::to_string(ParamConfig::SEQ_DENSITY_MAX);
+                {
+                    static char buf[8];
+                    snprintf(buf, sizeof(buf), "%d/%d", static_cast<int>(normalizedValue * ParamConfig::SEQ_DENSITY_MAX), ParamConfig::SEQ_DENSITY_MAX);
+                    return std::string(buf);
+                }
             case 1: // Order
                 {
                     // Map normalized value (0.0-1.0) to 6 modes
                     if (normalizedValue < 0.1667f) {
-                        return "ASC";
+                        return STR_ASC;
                     } else if (normalizedValue < 0.3333f) {
-                        return "DESC";
+                        return STR_DESC;
                     } else if (normalizedValue < 0.5f) {
-                        return "UPD";
+                        return STR_UPD;
                     } else if (normalizedValue < 0.6667f) {
-                        return "FWD";
+                        return STR_FWD;
                     } else if (normalizedValue < 0.8333f) {
-                        return "RND";
+                        return STR_RND;
                     } else {
-                        return "BRN";
+                        return STR_BRN;
                     }
                 }
             case 2: // Length
@@ -2842,10 +3093,113 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
     else if (panelId == 't') {
         switch(paramIndex) {
             case 0: // Tuning selector
-                return std::to_string(static_cast<int>(normalizedValue * 9)) + "/9";
+                {
+                    static char buf[4];
+                    snprintf(buf, sizeof(buf), "%d/9", static_cast<int>(normalizedValue * 9));
+                    return std::string(buf);
+                }
             case 2: // MIDI
-                return normalizedValue > 0.5f ? "ON" : "OFF";
+                return normalizedValue > 0.5f ? STR_ON : STR_OFF;
+            case 3: // BPM
+                {
+                    // Map 0-1 to CLOCK_BPM_MIN-CLOCK_BPM_MAX and quantize to multiple of 5
+                    int32_t bpm = CLOCK_BPM_MIN + static_cast<int32_t>(normalizedValue * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
+                    bpm = ((bpm + 2) / 5) * 5;  // Round to nearest multiple of 5
+                    bpm = std::max(CLOCK_BPM_MIN, std::min(CLOCK_BPM_MAX, bpm));
+                    return std::to_string(static_cast<int>(bpm));
+                }
             default: return "OFF";
+        }
+    }
+    // Sequencer Track panels (SEQ0, SEQ1, SEQ2, SEQ3) - panel IDs '0', '1', '2', '3'
+    else if (panelId == '0' || panelId == '1' || panelId == '2' || panelId == '3') {
+        switch(paramIndex) {
+            case 0: // Density
+                {
+                    static char buf[8];
+                    snprintf(buf, sizeof(buf), "%d/%d", static_cast<int>(normalizedValue * ParamConfig::SEQ_DENSITY_MAX), ParamConfig::SEQ_DENSITY_MAX);
+                    return std::string(buf);
+                }
+            case 1: // Order
+                {
+                    // Map normalized value (0.0-1.0) to 6 modes
+                    if (normalizedValue < 0.1667f) {
+                        return STR_ASC;
+                    } else if (normalizedValue < 0.3333f) {
+                        return STR_DESC;
+                    } else if (normalizedValue < 0.5f) {
+                        return STR_UPD;
+                    } else if (normalizedValue < 0.6667f) {
+                        return STR_FWD;
+                    } else if (normalizedValue < 0.8333f) {
+                        return STR_RND;
+                    } else {
+                        return STR_BRN;
+                    }
+                }
+            case 2: // CC Probability
+                {
+                    uint8_t probability = static_cast<uint8_t>(normalizedValue * 100.0f);
+                    probability = std::min(static_cast<uint8_t>(100), probability);
+                    static char buf[8];
+                    if (probability == 0) return STR_OFF;
+                    snprintf(buf, sizeof(buf), "%d%%", probability);
+                    return std::string(buf);
+                }
+            case 3: // Multiplier
+                {
+                    // Map normalized 0.0-1.0 to discrete multipliers: 1, 2, 4, 8
+                    uint8_t mult;
+                    if (normalizedValue < 0.25f) mult = 1;
+                    else if (normalizedValue < 0.5f) mult = 2;
+                    else if (normalizedValue < 0.75f) mult = 4;
+                    else mult = 8;
+                    {
+                        static char buf[4];
+                        snprintf(buf, sizeof(buf), "x%d", mult);
+                        return std::string(buf);
+                    }
+                }
+            default: return "0";
+        }
+    }
+    // Deprecated panels (kept for backward compatibility)
+    else if (panelId == 's') {
+        switch(paramIndex) {
+            case 0: // Density
+                {
+                    static char buf[8];
+                    snprintf(buf, sizeof(buf), "%d/%d", static_cast<int>(normalizedValue * ParamConfig::SEQ_DENSITY_MAX), ParamConfig::SEQ_DENSITY_MAX);
+                    return std::string(buf);
+                }
+            case 1: // Order
+                {
+                    // Map normalized value (0.0-1.0) to 6 modes
+                    if (normalizedValue < 0.1667f) {
+                        return STR_ASC;
+                    } else if (normalizedValue < 0.3333f) {
+                        return STR_DESC;
+                    } else if (normalizedValue < 0.5f) {
+                        return STR_UPD;
+                    } else if (normalizedValue < 0.6667f) {
+                        return STR_FWD;
+                    } else if (normalizedValue < 0.8333f) {
+                        return STR_RND;
+                    } else {
+                        return STR_BRN;
+                    }
+                }
+            case 2: // Length
+                return FormatPercent(normalizedValue);
+            case 3: // BPM
+                {
+                    // Map 0-1 to CLOCK_BPM_MIN-CLOCK_BPM_MAX and quantize to multiple of 5
+                    int32_t bpm = CLOCK_BPM_MIN + static_cast<int32_t>(normalizedValue * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
+                    bpm = ((bpm + 2) / 5) * 5;  // Round to nearest multiple of 5
+                    bpm = std::max(CLOCK_BPM_MIN, std::min(CLOCK_BPM_MAX, bpm));
+                    return std::to_string(static_cast<int>(bpm));
+                }
+            default: return "0";
         }
     }
     else if (panelId == 'c') {
@@ -2856,7 +3210,10 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
             case 3: // CC7-8
                 {
                     uint8_t probability = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
-                    return (probability == 0) ? "OFF" : std::to_string(probability) + "%";
+                    static char buf[8];
+                    if (probability == 0) return STR_OFF;
+                    snprintf(buf, sizeof(buf), "%d%%", probability);
+                    return std::string(buf);
                 }
             default: return "OFF";
         }
@@ -2874,7 +3231,11 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                     else if (normalizedValue < 0.5f) mult = 2;
                     else if (normalizedValue < 0.75f) mult = 4;
                     else mult = 8;
-                    return "x" + std::to_string(mult);
+                    {
+                        static char buf[4];
+                        snprintf(buf, sizeof(buf), "x%d", mult);
+                        return std::string(buf);
+                    }
                 }
             default: return "x1";
         }
@@ -2882,7 +3243,7 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
     else if (panelId == 'd') {
         switch(paramIndex) {
             case 0: // Mode
-                return normalizedValue < 0.5f ? "SHORT" : "LONG";
+                return normalizedValue < 0.5f ? STR_SHORT : STR_LONG;
             case 1: // Time
                 {
                     // Check if we're in short or long mode
@@ -2935,28 +3296,36 @@ void CalculateKnobPositions(int knobWidth, int knobPadding, int knobPositions[4]
     }
 }
 
-// Get dynamic OSC panel label names based on current mode
-void GetOscLabels(int mode, std::string& label1, std::string& label2, std::string& label3) {
+// Get dynamic OSC panel label names based on current mode - returns const char* to save memory
+void GetOscLabels(int mode, const char*& label1, const char*& label2, const char*& label3) {
+    static const char* wave = "Wave";
+    static const char* ratio = "Ratio";
+    static const char* index = "Index";
+    static const char* idx = "Idx";
+    static const char* decay = "Decay";
+    static const char* skew = "Skew";
+    static const char* empty = "";
+    
     switch(mode) {
         case 0: // Interpolated
-            label1 = "Wave";
-            label2 = "";
-            label3 = "";
+            label1 = wave;
+            label2 = empty;
+            label3 = empty;
             break;
         case 1: // FM2
-            label1 = "Ratio";
-            label2 = "Index";
-            label3 = "";
+            label1 = ratio;
+            label2 = index;
+            label3 = empty;
             break;
         case 2: // Harmonic
-            label1 = "Idx";
-            label2 = "Decay";
-            label3 = "Skew";
+            label1 = idx;
+            label2 = decay;
+            label3 = skew;
             break;
         default:
-            label1 = "Wave";
-            label2 = "";
-            label3 = "";
+            label1 = wave;
+            label2 = empty;
+            label3 = empty;
             break;
     }
 }
@@ -2999,11 +3368,11 @@ void UpdateOled()
     if (isOscPanel) {
         oscMode = static_cast<int>(appState.oscMode * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
         oscMode = std::max(0, std::min(2, oscMode));
-        std::string label1, label2, label3;
+        const char* label1, *label2, *label3;
         GetOscLabels(oscMode, label1, label2, label3);
-        WriteFixedString(hw, knobPositions[0], labelY, 5, font_s, label1.c_str());
-        WriteFixedString(hw, knobPositions[1], labelY, 5, font_s, label2.c_str());
-        WriteFixedString(hw, knobPositions[2], labelY, 5, font_s, label3.c_str());
+        WriteFixedString(hw, knobPositions[0], labelY, 5, font_s, label1);
+        WriteFixedString(hw, knobPositions[1], labelY, 5, font_s, label2);
+        WriteFixedString(hw, knobPositions[2], labelY, 5, font_s, label3);
         WriteFixedString(hw, knobPositions[3], labelY, 5, font_s, currentPanel.input4Name);
     } else {
         WriteFixedString(hw, knobPositions[0], labelY, 5, font_s, currentPanel.input1Name);
@@ -3088,17 +3457,17 @@ void UpdateOled()
         // Show step counter with fixed width - move to avoid bottom-right area
         WriteFixedStringF(hw, knobPositions[0], 24, 8, font_s, "Step:%02d", sequencer.currentSequenceStep);
 
-        // Show density normalizedValue with fixed width - move to avoid bottom-right area
+        // Show density for track 0 (first track) - each track now has its own pattern
         int numTriggers = 0;
         for (int i = 0; i < TRIGGER_SEQUENCE_LENGTH; i++) {
-            if (sequencer.triggerSequence[i]) numTriggers++;
+            if (sequencer.tracks[0].triggerSequence[i]) numTriggers++;
         }
         WriteFixedStringF(hw, knobPositions[2], 24, 5, font_s, "D:%02d", numTriggers);
         
-        // Show sequence pattern as dots in one fixed-width string
+        // Show sequence pattern for track 0 as dots in one fixed-width string
         char patternStr[TRIGGER_SEQUENCE_LENGTH + 1];
         for (int i = 0; i < TRIGGER_SEQUENCE_LENGTH; i++) {
-            patternStr[i] = sequencer.triggerSequence[i] ? '*' : '-';
+            patternStr[i] = sequencer.tracks[0].triggerSequence[i] ? '*' : '-';
         }
         patternStr[TRIGGER_SEQUENCE_LENGTH] = '\0';
         WriteFixedString(hw, knobPositions[0], 32, TRIGGER_SEQUENCE_LENGTH, font_s, patternStr);
@@ -3108,13 +3477,13 @@ void UpdateOled()
             // Show note ordering mode (use first track's mode as reference)
             const char* modeStr;
             switch (sequencer.tracks[0].orderMode) {
-                case SEQ_ORDER_ASC: modeStr = "ASC"; break;
-                case SEQ_ORDER_DESC: modeStr = "DESC"; break;
-                case SEQ_ORDER_UPD: modeStr = "UPD"; break;
-                case SEQ_ORDER_FWD: modeStr = "FWD"; break;
-                case SEQ_ORDER_RND: modeStr = "RND"; break;
-                case SEQ_ORDER_BRN: modeStr = "BRN"; break;
-                default: modeStr = "ASC"; break;
+                case SEQ_ORDER_ASC: modeStr = STR_ASC; break;
+                case SEQ_ORDER_DESC: modeStr = STR_DESC; break;
+                case SEQ_ORDER_UPD: modeStr = STR_UPD; break;
+                case SEQ_ORDER_FWD: modeStr = STR_FWD; break;
+                case SEQ_ORDER_RND: modeStr = STR_RND; break;
+                case SEQ_ORDER_BRN: modeStr = STR_BRN; break;
+                default: modeStr = STR_ASC; break;
             }
             WriteFixedString(hw, knobPositions[3], 32, 4, font_s, modeStr);
             
@@ -3135,8 +3504,13 @@ void UpdateOled()
         for (int i = 0; i < 4; i++) {
             float normalizedValue = GetKnobValue(5, i);  // Panel 5 = SAMPLER
             uint8_t probability = (normalizedValue < 0.01f) ? 0 : static_cast<uint8_t>(normalizedValue * 100.0f);
-            std::string display = (probability == 0) ? "OFF" : std::to_string(probability) + "%";
-            WriteFixedStringF(hw, knobPositions[i], 24, 6, font_s, "%s:%s", slotLabels[i], display.c_str());
+            const char* display = STR_OFF;
+            static char probBuf[8];
+            if (probability > 0) {
+                snprintf(probBuf, sizeof(probBuf), "%d%%", probability);
+                display = probBuf;
+            }
+            WriteFixedStringF(hw, knobPositions[i], 24, 6, font_s, "%s:%s", slotLabels[i], display);
         }
         
         // Show global note counter and queue status - move to avoid bottom-right area
@@ -3213,8 +3587,14 @@ void ProcessEncoder()
         ParamId knobParams[4] = {binding.knob1, binding.knob2, binding.knob3, binding.knob4};
         
         for (int i = 0; i < 4; i++) {
-            // If knob is unbound (PARAM_NONE), mark as caught up immediately
-            knobCaughtUp[i] = (knobParams[i] == PARAM_NONE);
+            // Special handling for OSC panel: knobs 0-2 are used for mode-specific parameters
+            // even though they may be PARAM_NONE in the bindings, so don't mark them as caught up
+            if (currentPanel.id == 'o' && i < 3) {
+                knobCaughtUp[i] = false;  // Force catch-up check for mode-specific params
+            } else {
+                // If knob is unbound (PARAM_NONE), mark as caught up immediately
+                knobCaughtUp[i] = (knobParams[i] == PARAM_NONE);
+            }
             // Reset previous knob state to prevent false change detection after panel switch
             previousKnobState[i] = smoothedKnobState[i];
         }
@@ -3260,52 +3640,83 @@ void ProcessEncoder()
                 sequencer.sequencerMode = !sequencer.sequencerMode;
                 
                 if (sequencer.sequencerMode) {
-                    // Initialize tracks from UserState
-                    sequencer.tracks[0].density = appState.seqTrack0Density * 16.0f;
-                    sequencer.tracks[0].multiplier = appState.seqTrack0Multiplier;
-                    sequencer.tracks[1].density = appState.seqTrack1Density * 16.0f;
-                    sequencer.tracks[1].multiplier = appState.seqTrack1Multiplier;
-                    sequencer.tracks[2].density = appState.seqTrack2Density * 16.0f;
-                    sequencer.tracks[2].multiplier = appState.seqTrack2Multiplier;
-                    sequencer.tracks[3].density = appState.seqTrack3Density * 16.0f;
-                    sequencer.tracks[3].multiplier = appState.seqTrack3Multiplier;
-                    
-                    // Apply shared order mode and note length to all tracks
-                    SequencerOrderMode orderMode;
-                    float orderVal = appState.seqOrder;
-                    if (orderVal < 0.1667f) {
-                        orderMode = SEQ_ORDER_ASC;
-                    } else if (orderVal < 0.3333f) {
-                        orderMode = SEQ_ORDER_DESC;
-                    } else if (orderVal < 0.5f) {
-                        orderMode = SEQ_ORDER_UPD;
-                    } else if (orderVal < 0.6667f) {
-                        orderMode = SEQ_ORDER_FWD;
-                    } else if (orderVal < 0.8333f) {
-                        orderMode = SEQ_ORDER_RND;
-                    } else {
-                        orderMode = SEQ_ORDER_BRN;
-                    }
-                    
+                    // Initialize tracks from UserState (using new per-track parameters)
                     for (int i = 0; i < 4; i++) {
-                        sequencer.tracks[i].orderMode = orderMode;
-                        if (appState.seqLength < 0.5f) {
-                            sequencer.tracks[i].noteLengthPercent = 0.1f + (appState.seqLength * 2.0f) * 0.8f;
-                        } else {
-                            sequencer.tracks[i].noteLengthPercent = 0.5f;
-                        }
+                        float density = GetTrackDensity(i);
+                        float orderVal = GetTrackOrder(i);
+                        float multiplier = GetTrackMultiplier(i);
+                        
+                        // Set track parameters using helper functions
+                        SetTrackDensity(i, density);
+                        SetTrackMultiplier(i, multiplier);
+                        SetTrackOrder(i, orderVal);
+                        
+                        // Use default note length (50%) - len parameter is deprecated
+                        sequencer.tracks[i].noteLengthPercent = 0.5f;
                         sequencer.tracks[i].UpdateNoteCount();
                         sequencer.tracks[i].Reset();
+                        // For DESC mode, start at the end of the array
+                        if (sequencer.tracks[i].orderMode == SEQ_ORDER_DESC && !sequencer.sequencerNotes.empty()) {
+                            sequencer.tracks[i].noteIndex = sequencer.sequencerNotes.size() - 1;
+                        }
                     }
                     
                     // Update track note intervals
                     UpdateTrackNoteIntervals();
                     
+                    // Initialize sequence step timing
+                    sequencer.lastSequenceStepTime = hw.seed.system.GetNow();
+                    sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));  // 16th note timing
+                    sequencer.currentSequenceStep = 0;
+                    
                     // When enabling sequencer mode, capture currently held notes
                     CaptureCurrentlyHeldNotes();
                     
-                    // Reset sequencer step when enabling sequencer mode
-                    sequencer.currentSequenceStep = 0;
+                    // Check if step 0 should trigger for any track and play notes immediately
+                    if (!sequencer.sequencerNotes.empty()) {
+                        for (int trackIdx = 0; trackIdx < 4; trackIdx++) {
+                            SequencerTrack& track = sequencer.tracks[trackIdx];
+                            if (track.noteCount > 0 && track.triggerSequence[0]) {
+                                // Step 0 triggers for this track - play note immediately
+                                // Select note based on order mode (simplified version for initial trigger)
+                                uint8_t noteToTrigger = 0;
+                                if (!sequencer.sequencerNotes.empty()) {
+                                    noteToTrigger = sequencer.sequencerNotes[track.noteIndex % sequencer.sequencerNotes.size()];
+                                    // Advance noteIndex for next trigger (matching SelectNoteForTrack behavior)
+                                    if (track.orderMode == SEQ_ORDER_ASC || track.orderMode == SEQ_ORDER_FWD) {
+                                        track.noteIndex = (track.noteIndex + 1) % sequencer.sequencerNotes.size();
+                                    } else if (track.orderMode == SEQ_ORDER_DESC) {
+                                        // DESC mode: go backward
+                                        if (track.noteIndex == 0) {
+                                            track.noteIndex = sequencer.sequencerNotes.size() - 1;
+                                        } else {
+                                            track.noteIndex--;
+                                        }
+                                    }
+                                }
+                                
+                                NoteOnEvent event;
+                                event.note = noteToTrigger;
+                                event.velocity = 127;
+                                event.channel = trackIdx;
+                                
+                                ProcessHandlerChainNoteOn(event);
+                                
+                                // Schedule note-off
+                                if (!shiftRegisterMode) {
+                                    uint32_t noteOffDelay = static_cast<uint32_t>(sequencer.sequenceStepInterval * track.noteLengthPercent);
+                                    noteOffDelay = std::min(noteOffDelay, sequencer.sequenceStepInterval - 10);
+                                    track.noteOffTime = hw.seed.system.GetNow() + noteOffDelay;
+                                    track.noteOffPending = true;
+                                    track.noteToTurnOff = noteToTrigger;
+                                    track.voiceToTurnOff = trackIdx;
+                                }
+                                
+                                // Note: SelectNoteForTrack already advances noteIndex for ASC, DESC, FWD modes
+                                // For RND and BRN modes, it sets noteIndex directly
+                            }
+                        }
+                    }
                     
                     // In self-trigger mode, mark existing voices as sequencer-controlled and set sustain to 0
                     if (sequencer.selfTriggerMode && !sequencer.sequencerNotes.empty()) {
@@ -3369,8 +3780,16 @@ void ProcessEncoder()
                         SequencerTrack& track = sequencer.tracks[i];
                         int slotBase = i * 2;
                         
-                        // Update CC probability from track density
-                        uint8_t prob = static_cast<uint8_t>((track.density / 16.0f) * 100.0f);
+                        // Update CC probability from per-track CC probability parameter
+                        float ccProb;
+                        switch(i) {
+                            case 0: ccProb = appState.seq0CcProb; break;
+                            case 1: ccProb = appState.seq1CcProb; break;
+                            case 2: ccProb = appState.seq2CcProb; break;
+                            case 3: ccProb = appState.seq3CcProb; break;
+                            default: ccProb = 0.0f; break;
+                        }
+                        uint8_t prob = static_cast<uint8_t>(ccProb * 100.0f);
                         prob = std::min(static_cast<uint8_t>(100), prob);
                         ccSlotProbabilities[slotBase] = prob;
                         ccSlotProbabilities[slotBase + 1] = prob;
@@ -3452,7 +3871,6 @@ void ProcessKnobs()
         
         // Implement catch-up logic to prevent parameter jumps when switching panels
         if (paramId != PARAM_NONE) {
-            float storedKnobValue = knobValues[panelMode][inputIndex];
             float knobPosition = inputs[inputIndex];
             
             // Apply a deadzone to the microsound mix knob so it truly stays at 0% when idle
@@ -3460,10 +3878,28 @@ void ProcessKnobs()
                 knobPosition = 0.0f;
             }
             
-            // Check if knob has caught up to the stored knob normalizedValue
+            // For OSC panel mode-specific parameters, compare against actual parameter value
+            // instead of stored knob position, since the same physical knob controls different
+            // parameters depending on the mode
+            float targetValue;
+            bool isOscModeSpecificParam = (paramId == PARAM_OSC_FM2_RATIO || 
+                                          paramId == PARAM_OSC_FM2_INDEX ||
+                                          paramId == PARAM_OSC_HARMONIC_IDX ||
+                                          paramId == PARAM_OSC_HARMONIC_DECAY ||
+                                          paramId == PARAM_OSC_HARMONIC_SKEW);
+            
+            if (isOscModeSpecificParam) {
+                // Use actual parameter value for catch-up comparison
+                targetValue = GetParamValue(paramId);
+            } else {
+                // Use stored knob position for catch-up comparison (standard behavior)
+                targetValue = knobValues[panelMode][inputIndex];
+            }
+            
+            // Check if knob has caught up to the target normalizedValue
             if (!knobCaughtUp[inputIndex]) {
                 // Check if knob is within threshold of target normalizedValue
-                if (fabs(knobPosition - storedKnobValue) < KNOB_CATCHUP_THRESHOLD) {
+                if (fabs(knobPosition - targetValue) < KNOB_CATCHUP_THRESHOLD) {
                     // Knob has caught up - enable tracking
                     knobCaughtUp[inputIndex] = true;
                 } else {
@@ -3677,16 +4113,41 @@ void AddNoteToSequencer(uint8_t note)
     // Add note to array
     sequencer.sequencerNotes.push_back(note);
     
-    // For FWD mode, don't sort - preserve order as notes are added
-    // For other modes, sort based on current ordering preference (check first track's mode)
-    if (sequencer.tracks[0].orderMode != SEQ_ORDER_FWD) {
+    // Check if any track needs sorting (i.e., is not in FWD mode)
+    // If all tracks are FWD, preserve order as notes were added
+    bool needsSort = false;
+    for (int i = 0; i < 4; i++) {
+        if (sequencer.tracks[i].orderMode != SEQ_ORDER_FWD) {
+            needsSort = true;
+            break;
+        }
+    }
+    if (needsSort) {
         SortSequencerNotes();
     }
     
-    // Reset all tracks' note indices when new notes are added
-    for (int i = 0; i < 4; i++) {
-        sequencer.tracks[i].noteIndex = 0;
+    // Only reset note indices if this was the first note (sequencer was empty)
+    // Otherwise, preserve current position to avoid disrupting playback
+    if (wasEmpty) {
+        for (int i = 0; i < 4; i++) {
+            sequencer.tracks[i].noteIndex = 0;
+            // For DESC mode, start at the end
+            if (sequencer.tracks[i].orderMode == SEQ_ORDER_DESC && sequencer.sequencerNotes.size() > 0) {
+                sequencer.tracks[i].noteIndex = sequencer.sequencerNotes.size() - 1;
+            }
+        }
+    } else if (needsSort) {
+        // If we sorted, we need to find the current note in the new sorted array
+        // For now, just reset to 0 (or end for DESC) - this is a limitation but better than breaking playback
+        for (int i = 0; i < 4; i++) {
+            if (sequencer.tracks[i].orderMode == SEQ_ORDER_DESC && sequencer.sequencerNotes.size() > 0) {
+                sequencer.tracks[i].noteIndex = sequencer.sequencerNotes.size() - 1;
+            } else {
+                sequencer.tracks[i].noteIndex = 0;
+            }
+        }
     }
+    // If FWD mode and not empty, don't reset - preserve current position
     
     // If we're adding notes after initial capture, reset the flag
     // This means sequencer will now stop when notes are released (normal behavior)
@@ -3740,48 +4201,77 @@ void RemoveNoteFromSequencer(uint8_t note)
             sequencer.tracks[i].lastNote = 0;  // Reset to trigger random selection next time
         }
         
-        // Adjust track note index if needed
+        // Adjust track note index if needed (out of bounds after note removal)
         if (!sequencer.sequencerNotes.empty() && sequencer.tracks[i].noteIndex >= sequencer.sequencerNotes.size()) {
-            sequencer.tracks[i].noteIndex = 0;
+            // Set to end for DESC mode, 0 for other modes
+            if (sequencer.tracks[i].orderMode == SEQ_ORDER_DESC) {
+                sequencer.tracks[i].noteIndex = sequencer.sequencerNotes.size() - 1;
+            } else {
+                sequencer.tracks[i].noteIndex = 0;
+            }
         }
     }
 }
 
 void SortSequencerNotes()
 {
-    // For FWD mode, don't sort - preserve order as notes were added (check first track's mode)
-    if (sequencer.tracks[0].orderMode == SEQ_ORDER_FWD) {
+    // Check if any track needs sorting (i.e., is not in FWD mode)
+    bool needsSort = false;
+    for (int i = 0; i < 4; i++) {
+        if (sequencer.tracks[i].orderMode != SEQ_ORDER_FWD) {
+            needsSort = true;
+            break;
+        }
+    }
+    
+    // If all tracks are in FWD mode, don't sort - preserve order as notes were added
+    if (!needsSort) {
         return;
     }
     
-    // For other modes, sort based on mode (use first track's mode as reference)
-    switch (sequencer.tracks[0].orderMode) {
-        case SEQ_ORDER_ASC:
-            std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end());
-            break;
-        case SEQ_ORDER_DESC:
-            std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end(), std::greater<uint8_t>());
-            break;
-        case SEQ_ORDER_UPD:
-            // For up-down, start with ascending order
-            std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end());
-            for (int i = 0; i < 4; i++) {
-                sequencer.tracks[i].upDownDirection = true;
-            }
-            break;
-        case SEQ_ORDER_RND:
-        case SEQ_ORDER_BRN:
-            // For random and brownian, we don't need sorted order
-            // But we can keep them sorted for easier brownian distance calculation
-            std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end());
-            break;
-        default:
-            break;
+    // Sort in ascending order - this works for all modes:
+    // - ASC: traverse forward (0, 1, 2, ...)
+    // - DESC: traverse backward (n-1, n-2, ..., 0)
+    // - UPD: traverse up then down (0, 1, 2, ..., n-1, n-2, ..., 0)
+    // - RND/BRN: use sorted array for easier calculations
+    std::sort(sequencer.sequencerNotes.begin(), sequencer.sequencerNotes.end());
+    
+    // Reset upDownDirection for UPD mode tracks
+    for (int i = 0; i < 4; i++) {
+        if (sequencer.tracks[i].orderMode == SEQ_ORDER_UPD) {
+            sequencer.tracks[i].upDownDirection = true;
+        }
     }
     
-    // Reset all tracks' note indices
+    // Reset all tracks' note indices based on their order mode
     for (int i = 0; i < 4; i++) {
-        sequencer.tracks[i].noteIndex = 0;
+        if (sequencer.tracks[i].orderMode == SEQ_ORDER_DESC && !sequencer.sequencerNotes.empty()) {
+            // DESC mode: start at the end (highest note)
+            sequencer.tracks[i].noteIndex = sequencer.sequencerNotes.size() - 1;
+        } else {
+            // ASC, FWD, UPD, RND, BRN modes: start at the beginning
+            sequencer.tracks[i].noteIndex = 0;
+        }
+    }
+}
+
+// Helper function to update track order mode (implemented after SortSequencerNotes declaration)
+inline void SetTrackOrder(int trackIdx, float normalizedValue) {
+    SequencerTrack& track = sequencer.tracks[trackIdx];
+    SequencerOrderMode newMode = NormalizedToOrderMode(normalizedValue);
+    
+    if (newMode != track.orderMode) {
+        track.orderMode = newMode;
+        // Set noteIndex based on order mode for this track only
+        if (newMode == SEQ_ORDER_DESC && !sequencer.sequencerNotes.empty()) {
+            track.noteIndex = sequencer.sequencerNotes.size() - 1;
+        } else {
+            track.noteIndex = 0;
+        }
+        track.upDownDirection = true;
+        // Don't call SortSequencerNotes() here - it would affect all tracks
+        // The array is already sorted (or unsorted for FWD mode) from when notes were added
+        // Each track traverses the array according to its own order mode
     }
 }
 
@@ -3809,9 +4299,13 @@ void CaptureCurrentlyHeldNotes()
         }
     }
     
-    // Reset all tracks' note indices to start from the beginning
+    // Reset all tracks' note indices based on their order mode
     for (int i = 0; i < 4; i++) {
-        sequencer.tracks[i].noteIndex = 0;
+        if (sequencer.tracks[i].orderMode == SEQ_ORDER_DESC && !sequencer.sequencerNotes.empty()) {
+            sequencer.tracks[i].noteIndex = sequencer.sequencerNotes.size() - 1;
+        } else {
+            sequencer.tracks[i].noteIndex = 0;
+        }
     }
     
     // Set flag to indicate we're using initially captured notes
@@ -3857,8 +4351,13 @@ void ApplyTuningToSequencerNotes()
 // Trigger Sequence Generator Implementation
 void InitTriggerSequence()
 {
-    // Initialize sequence with Euclidean rhythm (4 triggers out of 16 steps)
-    GenerateEuclideanRhythm(4, TRIGGER_SEQUENCE_LENGTH, sequencer.triggerSequence);
+    // Initialize per-track trigger sequences based on each track's density
+    // Each track now has its own independent trigger sequence
+    for (int i = 0; i < 4; i++) {
+        int numTriggers = static_cast<int>(sequencer.tracks[i].density + 0.5f);
+        numTriggers = std::max(0, std::min(numTriggers, static_cast<int>(TRIGGER_SEQUENCE_LENGTH)));
+        GenerateEuclideanRhythm(numTriggers, TRIGGER_SEQUENCE_LENGTH, sequencer.tracks[i].triggerSequence);
+    }
 
     // Initialize timing
     sequencer.currentSequenceStep = 0;
@@ -4011,21 +4510,35 @@ void ProcessCCSlotsWithSubdivision(uint8_t subdivision)
     uint8_t triggeredValues[8];
     
     if (sequencer.sequencerMode) {
-        // SEQ mode ON: Process per-track CC pairs using track density as probability
+        // SEQ mode ON: Process per-track CC pairs using track trigger sequence and CC probability
         // Track 0 -> CC slots 0-1, Track 1 -> CC slots 2-3, etc.
         for (int trackIdx = 0; trackIdx < 4; trackIdx++) {
             SequencerTrack& track = sequencer.tracks[trackIdx];
             int slotBase = trackIdx * 2;  // 0, 2, 4, 6
             
-            // Convert density (0-16) to probability (0-100)
-            uint8_t prob = static_cast<uint8_t>((track.density / 16.0f) * 100.0f);
-            prob = std::min(static_cast<uint8_t>(100), prob);  // Clamp to 100
+            // Check if current step triggers for this track
+            bool stepTriggers = track.triggerSequence[sequencer.currentSequenceStep];
             
-            // Check probability for this track's CC pair
-            if (ShouldFireWithProbability(prob)) {
-                // Fire both CC slots for this track
-                triggeredValues[triggeredSlots++] = ccSlotValues[slotBase];
-                triggeredValues[triggeredSlots++] = ccSlotValues[slotBase + 1];
+            if (stepTriggers) {
+                // Get CC probability for this track from appState
+                float ccProb = 0.0f;
+                switch(trackIdx) {
+                    case 0: ccProb = appState.seq0CcProb; break;
+                    case 1: ccProb = appState.seq1CcProb; break;
+                    case 2: ccProb = appState.seq2CcProb; break;
+                    case 3: ccProb = appState.seq3CcProb; break;
+                }
+                
+                // Convert CC probability (0.0-1.0) to percentage (0-100)
+                uint8_t prob = static_cast<uint8_t>(ccProb * 100.0f);
+                prob = std::min(static_cast<uint8_t>(100), prob);  // Clamp to 100
+                
+                // Check probability for this track's CC pair
+                if (ShouldFireWithProbability(prob)) {
+                    // Fire both CC slots for this track
+                    triggeredValues[triggeredSlots++] = ccSlotValues[slotBase];
+                    triggeredValues[triggeredSlots++] = ccSlotValues[slotBase + 1];
+                }
             }
         }
     } else {
@@ -4482,7 +4995,7 @@ void ProcessHandlerChainNoteOff(NoteOffEvent& event) {
 // SequencerMidiSource - generates notes from sequencer array based on clock
 // Now supports four independent tracks, each with its own note count and timing
 class SequencerMidiSource {
-private:
+public:
     // Helper to select next note for a track based on its order mode
     uint8_t SelectNoteForTrack(int trackIdx) {
         SequencerTrack& track = sequencer.tracks[trackIdx];
@@ -4495,10 +5008,19 @@ private:
             
         switch (track.orderMode) {
                 case SEQ_ORDER_ASC:
-                case SEQ_ORDER_DESC:
-                    // Linear progression through sorted array
+                    // Ascending: forward through sorted array
                 noteToTrigger = sequencer.sequencerNotes[track.noteIndex];
                 track.noteIndex = (track.noteIndex + 1) % sequencer.sequencerNotes.size();
+                    break;
+                    
+                case SEQ_ORDER_DESC:
+                    // Descending: backward through sorted array
+                noteToTrigger = sequencer.sequencerNotes[track.noteIndex];
+                if (track.noteIndex == 0) {
+                    track.noteIndex = sequencer.sequencerNotes.size() - 1;
+                } else {
+                    track.noteIndex--;
+                }
                     break;
                     
                 case SEQ_ORDER_FWD:
@@ -4593,31 +5115,65 @@ public:
             uint8_t previousStep = sequencer.currentSequenceStep;
             sequencer.currentSequenceStep = (sequencer.currentSequenceStep + 1) % TRIGGER_SEQUENCE_LENGTH;
             
+            // Check each track's trigger sequence and play notes when steps trigger
+            for (int trackIdx = 0; trackIdx < 4; trackIdx++) {
+                SequencerTrack& track = sequencer.tracks[trackIdx];
+                
+                // Skip if track has no notes to play or density is 0
+                if (track.noteCount == 0 || sequencer.sequencerNotes.empty() || track.density <= 0.0f) {
+                    continue;
+                }
+                
+                // Check if the current sequence step should trigger a note for this track
+                bool currentStepTriggers = track.triggerSequence[sequencer.currentSequenceStep];
+                
+                if (currentStepTriggers) {
+                    // Select and trigger note for this track
+                    uint8_t noteToTrigger = SelectNoteForTrack(trackIdx);
+                    
+                    // Create note event and route directly to this track's voice
+                    NoteOnEvent event;
+                    event.note = noteToTrigger;
+                    event.velocity = 127;
+                    event.channel = trackIdx;  // Route directly to track's voice (bypass round-robin)
+        
+                    // Send directly to voice handler
+                    ProcessHandlerChainNoteOn(event);
+        
+                    // Schedule note-off based on track's note length percentage
+                    if (!shiftRegisterMode) {
+                        uint32_t noteOffDelay = static_cast<uint32_t>(sequencer.sequenceStepInterval * track.noteLengthPercent);
+                        noteOffDelay = std::min(noteOffDelay, sequencer.sequenceStepInterval - 10); // Leave at least 10ms
+                        track.noteOffTime = currentTime + noteOffDelay;
+                        track.noteOffPending = true;
+                        track.noteToTurnOff = noteToTrigger;
+                        track.voiceToTurnOff = trackIdx;
+                    }
+                    
+                    // Note: SelectNoteForTrack already advances noteIndex for ASC, DESC, FWD modes
+                    // For RND and BRN modes, it sets noteIndex directly, so no additional advance needed
+                }
+            }
+            
             // Only reset tracks when sequence loops back to step 0 (full sequence completed)
             if (sequencer.currentSequenceStep == 0 && previousStep == TRIGGER_SEQUENCE_LENGTH - 1) {
                 // Full sequence completed - reset all tracks for new loop
+                // Note: We don't reset noteIndex here because we want notes to continue cycling
+                // through the sequence across multiple loops. Each track's noteIndex will
+                // naturally wrap around due to modulo operations in SelectNoteForTrack.
                 for (int i = 0; i < 4; i++) {
                     sequencer.tracks[i].currentNoteInSequence = 0;
-                    // Set lastNoteTime to trigger first note immediately when sequence loops
-                    // Subtract noteInterval so (currentTime - lastNoteTime) >= noteInterval on first check
-                    if (sequencer.tracks[i].noteInterval > 0) {
-                        sequencer.tracks[i].lastNoteTime = currentTime - sequencer.tracks[i].noteInterval;
-                    } else {
-                        sequencer.tracks[i].lastNoteTime = currentTime;
-                    }
+                    // Reset upDownDirection for UPD mode
+                    sequencer.tracks[i].upDownDirection = true;
                 }
             }
         }
         
         // Check subdivision timing (every 1/8 of a sequencer step) for CC processing
         if ((currentTime - sequencer.lastSubdivisionTime) >= sequencer.subdivisionInterval) {
-            // Only process CC slots if current step should trigger
-            bool currentStepTriggers = sequencer.triggerSequence[sequencer.currentSequenceStep];
-            
-            if (currentStepTriggers) {
-                // Process CC slots for this subdivision
-                ProcessCCSlotsWithSubdivision(sequencer.currentSubdivision);
-            }
+            // Process CC slots for this subdivision
+            // ProcessCCSlotsWithSubdivision will check per-track trigger sequences internally
+            ProcessCCSlotsWithSubdivision(sequencer.currentSubdivision);
             
             sequencer.lastSubdivisionTime = currentTime;
             sequencer.currentSubdivision++;
@@ -4628,50 +5184,8 @@ public:
             }
         }
         
-        // Process each track independently - check if it's time for the next note in each track's sequence
-        // Notes play continuously across all steps, not just when current step triggers
-        for (int trackIdx = 0; trackIdx < 4; trackIdx++) {
-            SequencerTrack& track = sequencer.tracks[trackIdx];
-            
-            // Skip if track has no notes to play
-            if (track.noteCount == 0 || track.noteInterval == 0) {
-                continue;
-            }
-            
-            // Check if it's time for the next note in this track's sequence
-            if ((currentTime - track.lastNoteTime) >= track.noteInterval) {
-                // Check if we've played all notes in this track's sequence for the full loop
-                if (track.currentNoteInSequence < track.noteCount) {
-                        // Select and trigger note for this track
-                        uint8_t noteToTrigger = SelectNoteForTrack(trackIdx);
-                        
-                        // Create note event and route directly to this track's voice
-            NoteOnEvent event;
-            event.note = noteToTrigger;
-            event.velocity = 127;
-                        event.channel = trackIdx;  // Route directly to track's voice (bypass round-robin)
-            
-                        // Send directly to voice handler, bypassing normal voice allocation
-                        // We need to manually trigger the voice since we're bypassing the handler chain
-                        // For now, we'll still use the handler chain but set the channel explicitly
-            ProcessHandlerChainNoteOn(event);
-            
-                        // Schedule note-off based on track's note length percentage
-            if (!shiftRegisterMode) {
-                            uint32_t noteOffDelay = static_cast<uint32_t>(track.noteInterval * track.noteLengthPercent);
-                            noteOffDelay = std::min(noteOffDelay, track.noteInterval - 10); // Leave at least 10ms
-                            track.noteOffTime = currentTime + noteOffDelay;
-                            track.noteOffPending = true;
-                            track.noteToTurnOff = noteToTrigger;
-                            track.voiceToTurnOff = trackIdx;
-                        }
-                        
-                        // Advance to next note in this track's sequence
-                        track.currentNoteInSequence++;
-                        track.lastNoteTime = currentTime;
-                    }
-                }
-            }
+        // Note: Notes are now played when sequence steps advance (see above), not based on noteInterval timing
+        // This allows density to control which steps trigger notes via Euclidean rhythm patterns
         
         // Process note-offs for all tracks
         for (int trackIdx = 0; trackIdx < 4; trackIdx++) {
