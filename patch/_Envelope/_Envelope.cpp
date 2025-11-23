@@ -275,7 +275,7 @@ HarmonicOscillator<> voiceHarmonicOsc[4];    // Harmonic oscillators for all 4 v
 InterpolatedOscillator panLfo;              // LFO for panning CV output
 InterpolatedOscillator internalPhaseOsc[4]; // Internal oscillators for phase generation (voices 1 and 3 use these)
 
-size_t blocksize = 32; //(333us latency vs 167us for 8)
+size_t blocksize = 16; //(333us latency vs 167us for 8)
 int panelMode;
 float voicesMinLevel = 0.0f;
 
@@ -2192,7 +2192,7 @@ void ApplyLimiter(float* data) {
     static float limiterPeakR = 0.5f;
     
     // Pre-gain (can be adjusted if needed, 1.0 = no pre-gain)
-    float preGain = 0.7f;
+    float preGain = 0.45f;
     
     // Process left channel
     float leftPre = data[0] * preGain;
@@ -2201,7 +2201,7 @@ void ApplyLimiter(float* data) {
     float leftError = leftPeak - limiterPeakL;
     limiterPeakL += (leftError > 0 ? 0.05f : 0.00002f) * leftError;
     float leftGain = (limiterPeakL <= 1.0f ? 1.0f : 1.0f / limiterPeakL);
-    data[0] = SoftLimit(leftPre * leftGain * 0.7f);
+    data[0] = SoftLimit(leftPre * leftGain * 0.65f);
     
     // Process right channel
     float rightPre = data[1] * preGain;
@@ -2536,20 +2536,23 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         out[0][i] = processedLeft;
         out[1][i] = processedRight;
         
-        // Output voices 0 and 2 to audio outputs 2 and 3 with envelope amplitude scaling (VCA)
-        // Always use internal oscillators for these outputs
+        // Output modulator signals for voices 0 and 2 to audio outputs 2 and 3
+        // Only output modulator when in FM mode (mode == 1)
         float output2 = 0.0f;
-        if (envelopes[0].noteGate) {
-            output2 = oscOutputs[0];
+        float output3 = 0.0f;
+        
+        if (mode == 1) {
+            // Get modulator output from FM2 oscillators for voices 0 and 2
+            if (envelopes[0].noteGate) {
+                output2 = voiceFm2Osc[0].GetModulatorOutput();
+            }
+            if (envelopes[2].noteGate) {
+                output3 = voiceFm2Osc[2].GetModulatorOutput();
+            }
         }
+        
         // Scale by envelope amplitude (VCA behavior)
         out[2][i] = output2 * envelopes[0].envSig;
-        
-        float output3 = 0.0f;
-        if (envelopes[2].noteGate) {
-            output3 = oscOutputs[2];
-        }
-        // Scale by envelope amplitude (VCA behavior)
         out[3][i] = output3 * envelopes[2].envSig;
     }
 
