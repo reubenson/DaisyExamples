@@ -51,6 +51,49 @@ float delayReadPosR = 0.0f;  // Current read position offset for right channel
 float delayFilterStateL = 0.0f;
 float delayFilterStateR = 0.0f;
 
+// Audio-rate timing utilities
+static volatile uint32_t gAudioSampleCounterLow = 0;
+static volatile uint32_t gAudioSampleCounterHigh = 0;
+static float gAudioSampleRate = 48000.0f;
+
+inline float GetAudioSampleRate()
+{
+    return (gAudioSampleRate > 0.0f) ? gAudioSampleRate : 48000.0f;
+}
+
+inline void SetAudioSampleRate(float sampleRate)
+{
+    gAudioSampleRate = sampleRate;
+}
+
+inline void ResetAudioSampleCounter()
+{
+    gAudioSampleCounterLow = 0;
+    gAudioSampleCounterHigh = 0;
+}
+
+inline void IncrementAudioSampleCounter(uint32_t delta)
+{
+    uint32_t newLow = gAudioSampleCounterLow + delta;
+    if (newLow < gAudioSampleCounterLow)
+    {
+        gAudioSampleCounterHigh++;
+    }
+    gAudioSampleCounterLow = newLow;
+}
+
+inline uint64_t ReadAudioSampleCounter()
+{
+    uint32_t high1, low, high2;
+    do
+    {
+        high1 = gAudioSampleCounterHigh;
+        low = gAudioSampleCounterLow;
+        high2 = gAudioSampleCounterHigh;
+    } while (high1 != high2);
+    return (static_cast<uint64_t>(high1) << 32) | low;
+}
+
 // ============================================================================
 // Parameter Configuration - Compile-Time Constants (Zero RAM Usage)
 // ============================================================================
@@ -463,7 +506,7 @@ struct SequencerTrack {
     uint8_t noteCount = 4;  // Number of notes in this track's sequence (4 * multiplier)
     
     // Per-track note-off scheduling
-    uint32_t noteOffTime = 0;
+    uint64_t noteOffSample = 0;
     bool noteOffPending = false;
     uint8_t noteToTurnOff = 0;
     int8_t voiceToTurnOff = -1;
@@ -495,8 +538,12 @@ struct SequencerTrack {
         noteOffPending = false;
         noteToTurnOff = 0;
         voiceToTurnOff = -1;
+        noteOffSample = 0;
     }
 };
+
+// Forward declarations for sequencer timing helpers (used inside struct)
+inline void UpdateSequencerTiming();
 
 // Sequencer parameters and state
 struct SequencerParams {
@@ -526,6 +573,7 @@ struct SequencerParams {
     uint8_t currentSequenceStep = 0;
     uint32_t lastSequenceStepTime = 0;
     uint32_t sequenceStepInterval = 0;
+    uint32_t sequenceStepIntervalSamples = 0;
     uint8_t triggerNote = 36;  // MIDI note for triggers (C2)
     uint8_t ccTriggerChannel = 12;
     uint8_t ccValueChannel = 15;
@@ -534,17 +582,22 @@ struct SequencerParams {
     uint8_t currentSubdivision = 0; // 0-7, tracks which of 8 subdivisions we're on
     uint32_t lastSubdivisionTime = 0;
     uint32_t subdivisionInterval = 0; // Calculated as sequenceStepInterval / 8
+    uint32_t subdivisionIntervalSamples = 0;
+    uint64_t lastSequenceStepSample = 0;
+    uint64_t lastSubdivisionSample = 0;
     
     // Inline initialization (no function call overhead)
     void Init() {
         sequencerNotes.clear();
         clockInterval = static_cast<uint32_t>(60000 / (clockBpm * 24));
         lastClockTime = hw.seed.system.GetNow();
+        UpdateSequencerTiming();
+        lastSequenceStepSample = 0;
+        lastSubdivisionSample = 0;
         
         // Initialize subdivision timing
         currentSubdivision = 0;
         lastSubdivisionTime = 0;
-        subdivisionInterval = 0; // Will be calculated after sequenceStepInterval is set
         
         // Initialize all tracks
         for (int i = 0; i < 4; i++) {
@@ -561,6 +614,65 @@ struct SequencerParams {
 };
 
 SequencerParams sequencer;
+
+inline void UpdateSequencerTimingMs()
+{
+    if (sequencer.clockBpm <= 0)
+    {
+        sequencer.clockBpm = CLOCK_BPM_MIN;
+    }
+    sequencer.sequenceStepInterval = static_cast<uint32_t>(60000.0f / (sequencer.clockBpm * 4.0f));
+    sequencer.sequenceStepInterval = std::max<uint32_t>(1, sequencer.sequenceStepInterval);
+    sequencer.subdivisionInterval = std::max<uint32_t>(1, sequencer.sequenceStepInterval / 8);
+}
+
+inline void UpdateSequencerTimingSamples()
+{
+    float sampleRate = GetAudioSampleRate();
+    if (sampleRate <= 0.0f)
+    {
+        sampleRate = 48000.0f;
+    }
+    float stepSamples = (sampleRate * 60.0f) / (static_cast<float>(sequencer.clockBpm) * 4.0f);
+    sequencer.sequenceStepIntervalSamples = static_cast<uint32_t>(stepSamples);
+    sequencer.sequenceStepIntervalSamples = std::max<uint32_t>(1, sequencer.sequenceStepIntervalSamples);
+    sequencer.subdivisionIntervalSamples = std::max<uint32_t>(1, sequencer.sequenceStepIntervalSamples / 8);
+}
+
+inline void UpdateSequencerTiming()
+{
+    UpdateSequencerTimingMs();
+    UpdateSequencerTimingSamples();
+}
+
+inline uint32_t MsToSamples(float milliseconds)
+{
+    float sampleRate = GetAudioSampleRate();
+    if (sampleRate <= 0.0f)
+    {
+        sampleRate = 48000.0f;
+    }
+    uint32_t samples = static_cast<uint32_t>((sampleRate * milliseconds) / 1000.0f);
+    return std::max<uint32_t>(1, samples);
+}
+
+inline uint32_t ClampNoteOffDelaySamples(uint32_t desiredSamples)
+{
+    uint32_t guardSamples = MsToSamples(10.0f);
+    guardSamples = std::max<uint32_t>(1, guardSamples);
+    
+    if (sequencer.sequenceStepIntervalSamples <= guardSamples + 1)
+    {
+        return std::max<uint32_t>(1, sequencer.sequenceStepIntervalSamples);
+    }
+    return std::max<uint32_t>(1, std::min(desiredSamples, sequencer.sequenceStepIntervalSamples - guardSamples));
+}
+
+inline uint32_t GetNoteOffDelaySamples(float noteLengthPercent)
+{
+    uint32_t desiredSamples = static_cast<uint32_t>(sequencer.sequenceStepIntervalSamples * noteLengthPercent);
+    return ClampNoteOffDelaySamples(desiredSamples);
+}
 
 // Helper function to update track note intervals based on total sequence duration
 // Each track plays all its notes over the total sequence duration (sequenceStepInterval * TRIGGER_SEQUENCE_LENGTH)
@@ -1384,8 +1496,7 @@ static void UpdateSequencerEnvelopeTiming()
         // Update sequencer timing based on calculated BPM
         sequencer.clockBpm = static_cast<int32_t>(calculatedBpm);
         sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
-        sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));
-        sequencer.subdivisionInterval = sequencer.sequenceStepInterval / 8;
+        UpdateSequencerTiming();
         UpdateTrackNoteIntervals();
     }
 }
@@ -1681,8 +1792,7 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                 if (newBpm != sequencer.clockBpm) {
                     sequencer.clockBpm = newBpm;
                     sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
-                    sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));
-                    sequencer.subdivisionInterval = sequencer.sequenceStepInterval / 8;
+                    UpdateSequencerTiming();
                     UpdateTrackNoteIntervals();
                     // Update delay time if in BPM-sync mode
                     UpdateDelayTime();
@@ -1871,8 +1981,7 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                 if (newBpm != sequencer.clockBpm) {
                     sequencer.clockBpm = newBpm;
                     sequencer.clockInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 24));
-                    sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));
-                    sequencer.subdivisionInterval = sequencer.sequenceStepInterval / 8;
+                    UpdateSequencerTiming();
                     UpdateTrackNoteIntervals();
                     // Update delay time if in BPM-sync mode
                     UpdateDelayTime();
@@ -2563,6 +2672,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         out[3][i] = output3 > 0.0f ? output3 : 0.0f;
     }
 
+    // Update global audio sample counter for high-resolution scheduling
+    IncrementAudioSampleCounter(size);
+    
     // Note: Display updates moved to main loop to prevent audio dropouts
 }
 
@@ -2721,6 +2833,8 @@ int main(void)
     hw.Init();
     
     samplerate = hw.AudioSampleRate();
+    SetAudioSampleRate(samplerate);
+    ResetAudioSampleCounter();
     
     // Initialize envelopes FIRST (before loading settings)
     // This ensures the envelope objects exist before SetParamValue tries to configure them
@@ -3680,10 +3794,15 @@ void ProcessEncoder()
                     // Update track note intervals
                     UpdateTrackNoteIntervals();
                     
-                    // Initialize sequence step timing
+                    // Initialize sequence step timing with sample accuracy
+                    UpdateSequencerTiming();
                     sequencer.lastSequenceStepTime = hw.seed.system.GetNow();
-                    sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));  // 16th note timing
                     sequencer.currentSequenceStep = 0;
+                    sequencer.currentSubdivision = 0;
+                    uint64_t currentSample = ReadAudioSampleCounter();
+                    sequencer.lastSequenceStepSample = currentSample;
+                    sequencer.lastSubdivisionSample = currentSample;
+                    sequencer.lastSubdivisionTime = sequencer.lastSequenceStepTime;
                     
                     // When enabling sequencer mode, capture currently held notes
                     CaptureCurrentlyHeldNotes();
@@ -3720,9 +3839,8 @@ void ProcessEncoder()
                                 
                                 // Schedule note-off
                                 if (!shiftRegisterMode) {
-                                    uint32_t noteOffDelay = static_cast<uint32_t>(sequencer.sequenceStepInterval * track.noteLengthPercent);
-                                    noteOffDelay = std::min(noteOffDelay, sequencer.sequenceStepInterval - 10);
-                                    track.noteOffTime = hw.seed.system.GetNow() + noteOffDelay;
+                                    uint32_t noteOffDelaySamples = GetNoteOffDelaySamples(track.noteLengthPercent);
+                                    track.noteOffSample = currentSample + noteOffDelaySamples;
                                     track.noteOffPending = true;
                                     track.noteToTurnOff = noteToTrigger;
                                     track.voiceToTurnOff = trackIdx;
@@ -4378,12 +4496,14 @@ void InitTriggerSequence()
     // Initialize timing
     sequencer.currentSequenceStep = 0;
     sequencer.lastSequenceStepTime = hw.seed.system.GetNow();
-    sequencer.sequenceStepInterval = static_cast<uint32_t>(60000 / (sequencer.clockBpm * 4));  // 16th note timing
+    UpdateSequencerTiming();
+    uint64_t currentSample = ReadAudioSampleCounter();
+    sequencer.lastSequenceStepSample = currentSample;
     
     // Initialize subdivision timing (for CC multiplier feature)
     sequencer.currentSubdivision = 0;
-    sequencer.lastSubdivisionTime = hw.seed.system.GetNow();
-    sequencer.subdivisionInterval = sequencer.sequenceStepInterval / 8;
+    sequencer.lastSubdivisionTime = sequencer.lastSequenceStepTime;
+    sequencer.lastSubdivisionSample = currentSample;
     
     // Initialize track note intervals
     UpdateTrackNoteIntervals();
@@ -5193,99 +5313,71 @@ public:
             return;
         }
         
-        uint32_t currentTime = hw.seed.system.GetNow();
+        uint64_t currentSample = ReadAudioSampleCounter();
         
-        // Check if it's time to advance to the next sequence step (based on sequenceStepInterval time)
-        if ((currentTime - sequencer.lastSequenceStepTime) >= sequencer.sequenceStepInterval) {
-            sequencer.lastSequenceStepTime = currentTime;
-            
-            // Advance to next step
+        // Advance sequence steps based on sample-accurate timing
+        while (sequencer.sequenceStepIntervalSamples > 0 &&
+               (currentSample - sequencer.lastSequenceStepSample) >= sequencer.sequenceStepIntervalSamples)
+        {
             uint8_t previousStep = sequencer.currentSequenceStep;
+            sequencer.lastSequenceStepSample += sequencer.sequenceStepIntervalSamples;
+            sequencer.lastSequenceStepTime = hw.seed.system.GetNow();
             sequencer.currentSequenceStep = (sequencer.currentSequenceStep + 1) % TRIGGER_SEQUENCE_LENGTH;
             
-            // Check each track's trigger sequence and play notes when steps trigger
             for (int trackIdx = 0; trackIdx < 4; trackIdx++) {
                 SequencerTrack& track = sequencer.tracks[trackIdx];
                 
-                // Skip if track has no notes to play or density is 0
                 if (track.noteCount == 0 || sequencer.sequencerNotes.empty() || track.density <= 0.0f) {
                     continue;
                 }
                 
-                // Check if the current sequence step should trigger a note for this track
                 bool currentStepTriggers = track.triggerSequence[sequencer.currentSequenceStep];
                 
                 if (currentStepTriggers) {
-                    // Select and trigger note for this track
                     uint8_t noteToTrigger = SelectNoteForTrack(trackIdx);
                     
-                    // Create note event and route directly to this track's voice
                     NoteOnEvent event;
                     event.note = noteToTrigger;
                     event.velocity = 127;
-                    event.channel = trackIdx;  // Route directly to track's voice (bypass round-robin)
-        
-                    // Send directly to voice handler
+                    event.channel = trackIdx;
+                    
                     ProcessHandlerChainNoteOn(event);
-        
-                    // Schedule note-off based on track's note length percentage
+                    
                     if (!shiftRegisterMode) {
-                        uint32_t noteOffDelay = static_cast<uint32_t>(sequencer.sequenceStepInterval * track.noteLengthPercent);
-                        noteOffDelay = std::min(noteOffDelay, sequencer.sequenceStepInterval - 10); // Leave at least 10ms
-                        track.noteOffTime = currentTime + noteOffDelay;
+                        uint32_t noteOffDelaySamples = GetNoteOffDelaySamples(track.noteLengthPercent);
+                        track.noteOffSample = sequencer.lastSequenceStepSample + noteOffDelaySamples;
                         track.noteOffPending = true;
                         track.noteToTurnOff = noteToTrigger;
                         track.voiceToTurnOff = trackIdx;
                     }
-                    
-                    // Note: SelectNoteForTrack already advances noteIndex for ASC, DESC, FWD modes
-                    // For RND and BRN modes, it sets noteIndex directly, so no additional advance needed
                 }
             }
             
-            // Only reset tracks when sequence loops back to step 0 (full sequence completed)
             if (sequencer.currentSequenceStep == 0 && previousStep == TRIGGER_SEQUENCE_LENGTH - 1) {
-                // Full sequence completed - reset all tracks for new loop
-                // Note: We don't reset noteIndex here because we want notes to continue cycling
-                // through the sequence across multiple loops. Each track's noteIndex will
-                // naturally wrap around due to modulo operations in SelectNoteForTrack.
                 for (int i = 0; i < 4; i++) {
                     sequencer.tracks[i].currentNoteInSequence = 0;
-                    // Reset upDownDirection for UPD mode
                     sequencer.tracks[i].upDownDirection = true;
                 }
             }
         }
         
-        // Check subdivision timing (every 1/8 of a sequencer step) for CC processing
-        if ((currentTime - sequencer.lastSubdivisionTime) >= sequencer.subdivisionInterval) {
-            // Process CC slots for this subdivision
-            // ProcessCCSlotsWithSubdivision will check per-track trigger sequences internally
+        // Process subdivision timing for CC slots
+        while (sequencer.subdivisionIntervalSamples > 0 &&
+               (currentSample - sequencer.lastSubdivisionSample) >= sequencer.subdivisionIntervalSamples)
+        {
             ProcessCCSlotsWithSubdivision(sequencer.currentSubdivision);
-            
-            sequencer.lastSubdivisionTime = currentTime;
+            sequencer.lastSubdivisionSample += sequencer.subdivisionIntervalSamples;
+            sequencer.lastSubdivisionTime = hw.seed.system.GetNow();
             sequencer.currentSubdivision++;
-            
-            // Reset subdivision counter when it reaches 8 (but don't advance sequence step here)
             if (sequencer.currentSubdivision >= 8) {
                 sequencer.currentSubdivision = 0;
             }
         }
         
-        // Note: Notes are now played when sequence steps advance (see above), not based on noteInterval timing
-        // This allows density to control which steps trigger notes via Euclidean rhythm patterns
-        
-        // Process note-offs for all tracks
+        // Process note-offs for all tracks using sample timestamps
         for (int trackIdx = 0; trackIdx < 4; trackIdx++) {
             SequencerTrack& track = sequencer.tracks[trackIdx];
-            if (track.noteOffPending && currentTime >= track.noteOffTime) {
-                // Send note-off for this track's voice
-                NoteOffEvent event;
-                event.note = track.noteToTurnOff;
-                event.velocity = 0;
-                event.channel = trackIdx;
-                
-                // Find and turn off the voice playing this note
+            if (track.noteOffPending && currentSample >= track.noteOffSample) {
                 if (voices[trackIdx].note == track.noteToTurnOff) {
                     uint8_t bytes[3] = {static_cast<uint8_t>(0x80 + trackIdx), track.noteToTurnOff, 0};
                     hw.midi.SendMessage(bytes, 3);
