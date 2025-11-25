@@ -2373,7 +2373,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // Scale envelope amplitude by the index parameter value
     for (int j = 0; j < 4; j++) {
         // Multiply envelope amplitude (0.0-1.0) by index parameter to get final FM index
-        float index = envelopes[j].envSig * appState.fm2Index;
+        float index = envelopes[j].envSig * appState.fm2Index * 1;
         voiceFm2Osc[j].SetIndex(index);
     }
 
@@ -2550,17 +2550,17 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         
         if (mode == 1) {
             // Get modulator output from FM2 oscillators for voices 0 and 2
-            if (envelopes[0].noteGate) {
-                output2 = voiceFm2Osc[0].GetModulatorOutput();
+            if (envelopes[0].envSig > 0.0f) {
+                output2 = voiceFm2Osc[0].GetModulatorOutput() * voiceFm2Osc[0].GetIndex();
             }
-            if (envelopes[2].noteGate) {
-                output3 = voiceFm2Osc[2].GetModulatorOutput();
+            if (envelopes[2].envSig > 0.0f) {
+                output3 = voiceFm2Osc[2].GetModulatorOutput() * voiceFm2Osc[2].GetIndex();
             }
         }
-        
-        // Scale by envelope amplitude (VCA behavior)
-        out[2][i] = output2 * envelopes[0].envSig;
-        out[3][i] = output3 * envelopes[2].envSig;
+
+        // trying out unipolar FM for now ...
+        out[2][i] = output2 > 0.0f ? output2 : 0.0f;
+        out[3][i] = output3 > 0.0f ? output3 : 0.0f;
     }
 
     // Note: Display updates moved to main loop to prevent audio dropouts
