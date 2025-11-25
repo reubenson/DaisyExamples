@@ -346,9 +346,11 @@ template<typename NextHandler> class SequencerCaptureHandler;
 template<typename NextHandler> class ShiftRegisterHandler;
 template<typename NextHandler> class IntellijelTrackerHandler;
 template<typename NextHandler> class NormalVoiceHandler;
+template<typename NextHandler> class ControlHandler;
 
 void ProcessHandlerChainNoteOn(NoteOnEvent& event);
 void ProcessHandlerChainNoteOff(NoteOffEvent& event);
+void ProcessHandlerChainControlChange(ControlChangeEvent& event);
 void ProcessSequencerMidiSource();
 void AdvanceSequencerStep(); // Advance sequencer step (used by self-trigger mode)
 void ResetCCState(); // Reset CC state to clean state
@@ -751,6 +753,9 @@ struct UserState {
     float microModulation;      // 0.0-1.0 texture parameter
     float microWetDry;          // 0.0-1.0 wet/dry mix
     
+    // VOICE AMPLITUDE parameters (controlled via MIDI CC 100-103)
+    float voiceAmplitudes[4];   // 0.0-1.0 amplitude for voices 0-3
+    
     // Constructor with default normalizedValues
     float initialValue = 0.0f;
     UserState() :
@@ -812,7 +817,8 @@ struct UserState {
         microPulsaretLength(initialValue),  // Default 20ms (0.2 maps to ~20ms in 1-100ms range)
         microPulseWidth(initialValue),      // Default 50% duty cycle
         microModulation(initialValue),      // Default no modulation
-        microWetDry(initialValue)           // Default 0% wet (fully dry - no microsound)
+        microWetDry(initialValue),          // Default 0% wet (fully dry - no microsound)
+        voiceAmplitudes{1.0f, 1.0f, 1.0f, 1.0f}  // Default full amplitude for all voices
     {}
 };
 
@@ -2304,7 +2310,8 @@ void ApplyVCAs(float* data) {
         // snprintf(message, 60, "val: %d", voices[i].note);
         // Use envelope signal directly - velocity scaling is handled by sustain level
         envVal = std::max(envelopes[i].envSig, voicesMinLevel);
-        data[i] = data[i] * envVal;
+        // Apply voice amplitude multiplier (from MIDI CC 100-103)
+        data[i] = data[i] * envVal * appState.voiceAmplitudes[i];
 
         if (envVal > envMax)
         {
@@ -2696,6 +2703,12 @@ void HandleMidiMessage(MidiEvent m)
             // Forward polyphonic key pressure (aftertouch) to channel 15
             PolyphonicKeyPressureEvent event = m.AsPolyphonicKeyPressure();
             SendPolyphonicKeyPressure(15, event.note, event.pressure);
+            break;
+        }
+        case ControlChange:
+        {
+            ControlChangeEvent event = m.AsControlChange();
+            ProcessHandlerChainControlChange(event);
             break;
         }
         default: break;
@@ -4513,7 +4526,13 @@ void ProcessCCSlotsWithSubdivision(uint8_t subdivision)
     uint8_t triggeredValues[8];
     
     if (sequencer.sequencerMode) {
-        // SEQ mode ON: Process per-track CC pairs using track trigger sequence and CC probability
+        // SEQ mode ON: Only process CC events at the start of each sequence step (subdivision 0)
+        // Subdivisions are not used in SEQ mode - they're only for multiplier feature when SEQ mode is OFF
+        if (subdivision != 0) {
+            return; // Skip processing for subdivisions 1-7 in SEQ mode
+        }
+        
+        // Process per-track CC pairs using track trigger sequence and CC probability
         // Track 0 -> CC slots 0-1, Track 1 -> CC slots 2-3, etc.
         for (int trackIdx = 0; trackIdx < 4; trackIdx++) {
             SequencerTrack& track = sequencer.tracks[trackIdx];
@@ -4523,6 +4542,7 @@ void ProcessCCSlotsWithSubdivision(uint8_t subdivision)
             bool stepTriggers = track.triggerSequence[sequencer.currentSequenceStep];
             
             if (stepTriggers) {
+                // ... rest of the code remains the same
                 // Get CC probability for this track from appState
                 float ccProb = 0.0f;
                 switch(trackIdx) {
@@ -4658,6 +4678,7 @@ void BuildPattern(int level, std::vector<bool>& result, const std::vector<int>& 
 struct NullHandler {
     bool HandleNoteOn(NoteOnEvent& event) { return false; }
     bool HandleNoteOff(NoteOffEvent& event) { return false; }
+    bool HandleControlChange(ControlChangeEvent& event) { return false; }
 };
 
 // Template-based handler chain - zero runtime overhead
@@ -4689,6 +4710,11 @@ public:
         }
         // Always pass to next handler
         return this->GetNext().HandleNoteOff(event);
+    }
+    
+    bool HandleControlChange(ControlChangeEvent& event) {
+        // Always pass to next handler
+        return this->GetNext().HandleControlChange(event);
     }
 };
 
@@ -4731,6 +4757,11 @@ public:
         }
         // Pass to next handler if not in shift register mode
         return this->GetNext().HandleNoteOff(event);
+    }
+    
+    bool HandleControlChange(ControlChangeEvent& event) {
+        // Always pass to next handler
+        return this->GetNext().HandleControlChange(event);
     }
 };
 
@@ -4891,6 +4922,11 @@ public:
         // Pass to next handler
         return this->GetNext().HandleNoteOff(event);
     }
+    
+    bool HandleControlChange(ControlChangeEvent& event) {
+        // Always pass to next handler
+        return this->GetNext().HandleControlChange(event);
+    }
 };
 
 // IntellijelPitchHandler - handles current note processing for channel 15
@@ -4928,6 +4964,11 @@ public:
     bool HandleNoteOff(NoteOffEvent& event) {
         // Always pass to next handler (side effects, doesn't stop chain)
         return this->GetNext().HandleNoteOff(event);
+    }
+    
+    bool HandleControlChange(ControlChangeEvent& event) {
+        // Always pass to next handler
+        return this->GetNext().HandleControlChange(event);
     }
 };
 
@@ -4970,6 +5011,44 @@ public:
     bool HandleNoteOff(NoteOffEvent& event) {
         return this->GetNext().HandleNoteOff(event);
     }
+    
+    bool HandleControlChange(ControlChangeEvent& event) {
+        // Always pass to next handler
+        return this->GetNext().HandleControlChange(event);
+    }
+};
+
+// ControlHandler - processes MIDI CC messages for voice amplitude control
+// CC values 100-103 control amplitude of voices 0-3 respectively
+template<typename NextHandler>
+class ControlHandler : public HandlerBase<NextHandler> {
+public:
+    bool HandleNoteOn(NoteOnEvent& event) {
+        // Pass through to next handler
+        return this->GetNext().HandleNoteOn(event);
+    }
+    
+    bool HandleNoteOff(NoteOffEvent& event) {
+        // Pass through to next handler
+        return this->GetNext().HandleNoteOff(event);
+    }
+    
+    bool HandleControlChange(ControlChangeEvent& event) {
+        // Process CC values 100 and above
+        if (event.control_number >= 100) {
+            // CC 100-103 control amplitude of voices 0-3
+            if (event.control_number >= 100 && event.control_number <= 103) {
+                int voiceIndex = event.control_number - 100;
+                // Convert CC value (0-127) to amplitude (0.0-1.0)
+                float amplitude = event.value / 127.0f;
+                appState.voiceAmplitudes[voiceIndex] = amplitude;
+            }
+            // Handled - stop chain (don't pass to next handler)
+            return true;
+        }
+        // Not handled - pass to next handler
+        return this->GetNext().HandleControlChange(event);
+    }
 };
 
 // Define the handler chain type - compile-time composition
@@ -4977,7 +5056,9 @@ using HandlerChain = SequencerCaptureHandler<
     ShiftRegisterHandler<
         IntellijelPitchHandler<
             NormalVoiceHandler<
-                IntellijelTrackerHandler<NullHandler>
+                IntellijelTrackerHandler<
+                    ControlHandler<NullHandler>
+                >
             >
         >
     >
@@ -4993,6 +5074,10 @@ void ProcessHandlerChainNoteOn(NoteOnEvent& event) {
 
 void ProcessHandlerChainNoteOff(NoteOffEvent& event) {
     handlerChain.HandleNoteOff(event);
+}
+
+void ProcessHandlerChainControlChange(ControlChangeEvent& event) {
+    handlerChain.HandleControlChange(event);
 }
 
 // SequencerMidiSource - generates notes from sequencer array based on clock
