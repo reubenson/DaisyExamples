@@ -420,7 +420,7 @@ bool ccTriggerOffPending = false;
 
 // CC reset timing - for channel assignment on channel 16
 // to experimentally test for normalizedValue - send trig to next input and confirm 8 pulses
-const uint32_t CC_RESET_DELAY_MS = 15; // drops signal sometimes below 15ms
+const uint32_t CC_RESET_DELAY_MS = 17; // drops signal sometimes below 15ms
 uint8_t lastCCValue = 0; // Track the last CC normalizedValue sent (start with lowest CC normalizedValue)
 bool ccStateInitialized = false; // Track if CC state has been properly initialized
 
@@ -548,8 +548,6 @@ struct SequencerParams {
     uint32_t clockInterval = 0;
     bool clockEnabled = true;
     
-    // Deprecated: Shared trigger sequence removed - each track now has its own triggerSequence
-    // bool triggerSequence[TRIGGER_SEQUENCE_LENGTH] = {false};  // DEPRECATED
     uint8_t currentSequenceStep = 0;
     uint32_t lastSequenceStepTime = 0;
     uint32_t sequenceStepInterval = 0;
@@ -716,10 +714,6 @@ enum ParamId {
     PARAM_SEQ_TRACK1_DENSITY,  // Deprecated - use PARAM_SEQ1_DENSITY
     PARAM_SEQ_TRACK2_DENSITY,  // Deprecated - use PARAM_SEQ2_DENSITY
     PARAM_SEQ_TRACK3_DENSITY,  // Deprecated - use PARAM_SEQ3_DENSITY
-    PARAM_SEQ_TRACK0_MULT,     // Deprecated - use PARAM_SEQ0_MULT
-    PARAM_SEQ_TRACK1_MULT,     // Deprecated - use PARAM_SEQ1_MULT
-    PARAM_SEQ_TRACK2_MULT,     // Deprecated - use PARAM_SEQ2_MULT
-    PARAM_SEQ_TRACK3_MULT,     // Deprecated - use PARAM_SEQ3_MULT
     
     // DELAY Panel
     PARAM_DELAY_MODE,
@@ -3126,45 +3120,6 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
             default: return "0";
         }
     }
-    // Deprecated panels (kept for backward compatibility)
-    else if (panelId == 's') {
-        switch(paramIndex) {
-            case 0: // Density
-                {
-                    static char buf[8];
-                    snprintf(buf, sizeof(buf), "%d/%d", static_cast<int>(normalizedValue * ParamConfig::SEQ_DENSITY_MAX), ParamConfig::SEQ_DENSITY_MAX);
-                    return std::string(buf);
-                }
-            case 1: // Order
-                {
-                    // Map normalized value (0.0-1.0) to 6 modes
-                    if (normalizedValue < 0.1667f) {
-                        return STR_ASC;
-                    } else if (normalizedValue < 0.3333f) {
-                        return STR_DESC;
-                    } else if (normalizedValue < 0.5f) {
-                        return STR_UPD;
-                    } else if (normalizedValue < 0.6667f) {
-                        return STR_FWD;
-                    } else if (normalizedValue < 0.8333f) {
-                        return STR_RND;
-                    } else {
-                        return STR_BRN;
-                    }
-                }
-            case 2: // Length
-                return FormatPercent(normalizedValue);
-            case 3: // BPM
-                {
-                    // Map 0-1 to CLOCK_BPM_MIN-CLOCK_BPM_MAX and quantize to multiple of 5
-                    int32_t bpm = CLOCK_BPM_MIN + static_cast<int32_t>(normalizedValue * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
-                    bpm = ((bpm + 2) / 5) * 5;  // Round to nearest multiple of 5
-                    bpm = std::max(CLOCK_BPM_MIN, std::min(CLOCK_BPM_MAX, bpm));
-                    return std::to_string(static_cast<int>(bpm));
-                }
-            default: return "0";
-        }
-    }
     else if (panelId == 'c') {
         switch(paramIndex) {
             case 0: // CC1-2
@@ -4805,7 +4760,8 @@ public:
         
         // Process CC slots (once per sequence step)
         if (sequencer.sequencerMode) {
-            ProcessCCSlots();
+            // already handled in sequencer
+            // ProcessCCSlots();
         } else {
             ProcessCCSlots();
         }
