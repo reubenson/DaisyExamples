@@ -140,6 +140,7 @@ static const char* STR_LONG = "LONG";
 static const char* STR_DENS = "Dens";
 static const char* STR_ORD = "Ord";
 static const char* STR_CCP = "CC%";
+static const char* STR_OFFSET = "Off";
 static const char* STR_MULT = "Mult";
 
 // ============================================================================
@@ -487,6 +488,7 @@ struct SequencerTrack {
     float density = 0.0f;  // 0.0f to 16.0f - determines number of notes in Euclidean rhythm pattern
     SequencerOrderMode orderMode = SEQ_ORDER_ASC;
     float noteLengthPercent = 0.5f;  // Note length as percentage of step (10%-90%)
+    float offset = 0.0f;  // Offset in semitones (-12, -5, 0, 5, 12)
     
     // Per-track Euclidean rhythm pattern (density determines how many of 16 steps trigger)
     bool triggerSequence[TRIGGER_SEQUENCE_LENGTH] = {false};
@@ -524,6 +526,10 @@ struct SequencerTrack {
 
 // Forward declarations for sequencer timing helpers (used inside struct)
 inline void UpdateSequencerTiming();
+
+// Forward declarations for track offset functions (used inside SequencerParams::Init)
+inline float GetTrackOffset(int trackIdx);
+inline void SetTrackOffset(int trackIdx, float normalizedValue);
 
 // Sequencer parameters and state
 struct SequencerParams {
@@ -569,6 +575,9 @@ struct SequencerParams {
         // Initialize all tracks
         for (int i = 0; i < 4; i++) {
             tracks[i].Reset();
+            // Initialize offset from UserState
+            float offsetVal = GetTrackOffset(i);
+            SetTrackOffset(i, offsetVal);
         }
         
         InitTriggerSequence();
@@ -689,21 +698,25 @@ enum ParamId {
     PARAM_SEQ0_DENSITY,
     PARAM_SEQ0_ORDER,
     PARAM_SEQ0_CC_PROB,
+    PARAM_SEQ0_OFFSET,
     
     // Sequencer Track 1 Panel
     PARAM_SEQ1_DENSITY,
     PARAM_SEQ1_ORDER,
     PARAM_SEQ1_CC_PROB,
+    PARAM_SEQ1_OFFSET,
     
     // Sequencer Track 2 Panel
     PARAM_SEQ2_DENSITY,
     PARAM_SEQ2_ORDER,
     PARAM_SEQ2_CC_PROB,
+    PARAM_SEQ2_OFFSET,
     
     // Sequencer Track 3 Panel
     PARAM_SEQ3_DENSITY,
     PARAM_SEQ3_ORDER,
     PARAM_SEQ3_CC_PROB,
+    PARAM_SEQ3_OFFSET,
     
     // Deprecated parameters (kept for backward compatibility, but not used in UI)
     PARAM_SEQ_DENSITY,  // Deprecated - use per-track density
@@ -759,23 +772,27 @@ struct UserState {
     float tuningMidiEnable;     // 0.0-1.0 (>0.5 = enabled)
     float tuningBpm;            // 0.0-1.0 maps to CLOCK_BPM_MIN-CLOCK_BPM_MAX (moved from SEQ panel)
     
-    // Per-track sequencer parameters (3 parameters per track: density, order, cc probability)
+    // Per-track sequencer parameters (4 parameters per track: density, order, cc probability, offset)
     // Track 0
     float seq0Density;          // 0.0-1.0 maps to 0-16 triggers for track 0
     float seq0Order;            // 0.0-1.0 maps to order mode for track 0
     float seq0CcProb;           // 0.0-1.0 maps to 0-100% CC probability for track 0
+    float seq0Offset;           // 0.0-1.0 maps to offset in semitones (-12, -5, 0, 5, 12)
     // Track 1
     float seq1Density;
     float seq1Order;
     float seq1CcProb;
+    float seq1Offset;
     // Track 2
     float seq2Density;
     float seq2Order;
     float seq2CcProb;
+    float seq2Offset;
     // Track 3
     float seq3Density;
     float seq3Order;
     float seq3CcProb;
+    float seq3Offset;
     
     // Deprecated SEQUENCER parameters (kept for backward compatibility)
     float seqDensity;           // Deprecated - use per-track density
@@ -827,18 +844,22 @@ struct UserState {
         seq0Density(initialValue),      // Default 0.0 (no triggers)
         seq0Order(initialValue),        // Default ascending
         seq0CcProb(initialValue),       // Default 0% CC probability
+        seq0Offset(0.5f),               // Default 0 semitones (no change)
         // Track 1 sequencer parameters
         seq1Density(initialValue),
         seq1Order(initialValue),
         seq1CcProb(initialValue),
+        seq1Offset(0.5f),               // Default 0 semitones (no change)
         // Track 2 sequencer parameters
         seq2Density(initialValue),
         seq2Order(initialValue),
         seq2CcProb(initialValue),
+        seq2Offset(0.5f),               // Default 0 semitones (no change)
         // Track 3 sequencer parameters
         seq3Density(initialValue),
         seq3Order(initialValue),
         seq3CcProb(initialValue),
+        seq3Offset(0.5f),               // Default 0 semitones (no change)
         // Deprecated parameters (kept for backward compatibility)
         seqDensity(0.0f),
         seqOrder(initialValue),         // Default ascending
@@ -894,6 +915,16 @@ inline float GetTrackCcProb(int trackIdx) {
     }
 }
 
+inline float GetTrackOffset(int trackIdx) {
+    switch(trackIdx) {
+        case 0: return appState.seq0Offset;
+        case 1: return appState.seq1Offset;
+        case 2: return appState.seq2Offset;
+        case 3: return appState.seq3Offset;
+        default: return 0.5f;
+    }
+}
+
 // Helper function to map normalized value to SequencerOrderMode
 inline SequencerOrderMode NormalizedToOrderMode(float normalizedValue) {
     if (normalizedValue < 0.1667f) return SEQ_ORDER_ASC;
@@ -927,6 +958,39 @@ inline void SetTrackCcProb(int trackIdx, float normalizedValue) {
         int slotBase = trackIdx * 2;
         ccSlotProbabilities[slotBase] = prob;
         ccSlotProbabilities[slotBase + 1] = prob;
+    }
+}
+
+// Helper function to update track offset
+inline void SetTrackOffset(int trackIdx, float normalizedValue) {
+    SequencerTrack& track = sequencer.tracks[trackIdx];
+    
+    // Map normalized value (0.0-1.0) to 7 discrete offset values in semitones: -12, -5, -4, 0, 4, 5, 12
+    float offsetSemitones;
+    if (normalizedValue < 0.142857f) {
+        offsetSemitones = -12.0f;
+    } else if (normalizedValue < 0.285714f) {
+        offsetSemitones = -5.0f;
+    } else if (normalizedValue < 0.428571f) {
+        offsetSemitones = -4.0f;
+    } else if (normalizedValue < 0.571429f) {
+        offsetSemitones = 0.0f;
+    } else if (normalizedValue < 0.714286f) {
+        offsetSemitones = 4.0f;
+    } else if (normalizedValue < 0.857143f) {
+        offsetSemitones = 5.0f;
+    } else {
+        offsetSemitones = 12.0f;
+    }
+    
+    track.offset = offsetSemitones;
+    
+    // Update appState
+    switch(trackIdx) {
+        case 0: appState.seq0Offset = normalizedValue; break;
+        case 1: appState.seq1Offset = normalizedValue; break;
+        case 2: appState.seq2Offset = normalizedValue; break;
+        case 3: appState.seq3Offset = normalizedValue; break;
     }
 }
 
@@ -1026,8 +1090,8 @@ panelStruct displayPanels[] = {
         input1Name: STR_DENS,
         input2Name: STR_ORD,
         input3Name: STR_CCP,
-        input4Name: "",
-        bindings: {PARAM_SEQ0_DENSITY, PARAM_SEQ0_ORDER, PARAM_SEQ0_CC_PROB, PARAM_NONE}
+        input4Name: STR_OFFSET,
+        bindings: {PARAM_SEQ0_DENSITY, PARAM_SEQ0_ORDER, PARAM_SEQ0_CC_PROB, PARAM_SEQ0_OFFSET}
     },
     {
         name: "SEQ1",
@@ -1035,8 +1099,8 @@ panelStruct displayPanels[] = {
         input1Name: STR_DENS,
         input2Name: STR_ORD,
         input3Name: STR_CCP,
-        input4Name: "",
-        bindings: {PARAM_SEQ1_DENSITY, PARAM_SEQ1_ORDER, PARAM_SEQ1_CC_PROB, PARAM_NONE}
+        input4Name: STR_OFFSET,
+        bindings: {PARAM_SEQ1_DENSITY, PARAM_SEQ1_ORDER, PARAM_SEQ1_CC_PROB, PARAM_SEQ1_OFFSET}
     },
     {
         name: "SEQ2",
@@ -1044,8 +1108,8 @@ panelStruct displayPanels[] = {
         input1Name: STR_DENS,
         input2Name: STR_ORD,
         input3Name: STR_CCP,
-        input4Name: "",
-        bindings: {PARAM_SEQ2_DENSITY, PARAM_SEQ2_ORDER, PARAM_SEQ2_CC_PROB, PARAM_NONE}
+        input4Name: STR_OFFSET,
+        bindings: {PARAM_SEQ2_DENSITY, PARAM_SEQ2_ORDER, PARAM_SEQ2_CC_PROB, PARAM_SEQ2_OFFSET}
     },
     {
         name: "SEQ3",
@@ -1053,8 +1117,8 @@ panelStruct displayPanels[] = {
         input1Name: STR_DENS,
         input2Name: STR_ORD,
         input3Name: STR_CCP,
-        input4Name: "",
-        bindings: {PARAM_SEQ3_DENSITY, PARAM_SEQ3_ORDER, PARAM_SEQ3_CC_PROB, PARAM_NONE}
+        input4Name: STR_OFFSET,
+        bindings: {PARAM_SEQ3_DENSITY, PARAM_SEQ3_ORDER, PARAM_SEQ3_CC_PROB, PARAM_SEQ3_OFFSET}
     },
     {
         name: "DLY",
@@ -1104,10 +1168,10 @@ float knobValues[11][4] = {  // panelModesCount = 11
     {0.1f, 1.0f, 0.0f, 0.8f},  // Panel 1: MIXER
     {0.5f, 0.0f, 0.0f, 0.5},  // Panel 2: OSC
     {0.9f, 0.0f, 1.0f, 0.186441f},  // Panel 3: TUNING (T, empty, MIDI, BPM) - Default 120 BPM normalized (110/590)
-    {0.25f, 0.0f, 0.0f, 0.0f},  // Panel 4: SEQ0 (Dens, Ord, CC%, unused)
-    {0.25f, 0.0f, 0.0f, 0.0f},  // Panel 5: SEQ1 (Dens, Ord, CC%, unused)
-    {0.25f, 0.0f, 0.0f, 0.0f},  // Panel 6: SEQ2 (Dens, Ord, CC%, unused)
-    {0.25f, 0.0f, 0.0f, 0.0f},  // Panel 7: SEQ3 (Dens, Ord, CC%, unused)
+    {0.25f, 0.0f, 0.0f, 0.5f},  // Panel 4: SEQ0 (Dens, Ord, CC%, unused)
+    {0.25f, 0.0f, 0.0f, 0.5f},  // Panel 5: SEQ1 (Dens, Ord, CC%, unused)
+    {0.25f, 0.0f, 0.0f, 0.5f},  // Panel 6: SEQ2 (Dens, Ord, CC%, unused)
+    {0.25f, 0.0f, 0.0f, 0.5f},  // Panel 7: SEQ3 (Dens, Ord, CC%, unused)
     {0.7f, 0.5f, 0.5f, 0.0f},  // Panel 8: DELAY (Mode, Time, Damp, Mix)
     {0.2f, 0.5f, 0.0f, 0.0f},  // Panel 9: MICRO (PLen, PWid, Mod, Mix)
     {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 10: PRESET
@@ -1295,21 +1359,25 @@ float GetParamValue(ParamId paramId)
         case PARAM_SEQ0_DENSITY:        return GetTrackDensity(0);
         case PARAM_SEQ0_ORDER:          return GetTrackOrder(0);
         case PARAM_SEQ0_CC_PROB:       return GetTrackCcProb(0);
+        case PARAM_SEQ0_OFFSET:        return GetTrackOffset(0);
         
         // Sequencer Track 1 Panel
         case PARAM_SEQ1_DENSITY:        return GetTrackDensity(1);
         case PARAM_SEQ1_ORDER:          return GetTrackOrder(1);
         case PARAM_SEQ1_CC_PROB:        return GetTrackCcProb(1);
+        case PARAM_SEQ1_OFFSET:        return GetTrackOffset(1);
         
         // Sequencer Track 2 Panel
         case PARAM_SEQ2_DENSITY:        return GetTrackDensity(2);
         case PARAM_SEQ2_ORDER:          return GetTrackOrder(2);
         case PARAM_SEQ2_CC_PROB:        return GetTrackCcProb(2);
+        case PARAM_SEQ2_OFFSET:        return GetTrackOffset(2);
         
         // Sequencer Track 3 Panel
         case PARAM_SEQ3_DENSITY:        return GetTrackDensity(3);
         case PARAM_SEQ3_ORDER:          return GetTrackOrder(3);
         case PARAM_SEQ3_CC_PROB:        return GetTrackCcProb(3);
+        case PARAM_SEQ3_OFFSET:        return GetTrackOffset(3);
         
         // Deprecated parameters (kept for backward compatibility)
         case PARAM_SEQ_DENSITY:         return appState.seqDensity;
@@ -1697,6 +1765,11 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             appState.seq0CcProb = normalizedValue;
             SetTrackCcProb(0, normalizedValue);
             break;
+            
+        case PARAM_SEQ0_OFFSET:
+            appState.seq0Offset = normalizedValue;
+            SetTrackOffset(0, normalizedValue);
+            break;
         
         // Sequencer Track 1 Panel
         case PARAM_SEQ1_DENSITY:
@@ -1712,6 +1785,11 @@ void SetParamValue(ParamId paramId, float normalizedValue)
         case PARAM_SEQ1_CC_PROB:
             appState.seq1CcProb = normalizedValue;
             SetTrackCcProb(1, normalizedValue);
+            break;
+            
+        case PARAM_SEQ1_OFFSET:
+            appState.seq1Offset = normalizedValue;
+            SetTrackOffset(1, normalizedValue);
             break;
         
         // Sequencer Track 2 Panel
@@ -1729,6 +1807,11 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             appState.seq2CcProb = normalizedValue;
             SetTrackCcProb(2, normalizedValue);
             break;
+            
+        case PARAM_SEQ2_OFFSET:
+            appState.seq2Offset = normalizedValue;
+            SetTrackOffset(2, normalizedValue);
+            break;
         
         // Sequencer Track 3 Panel
         case PARAM_SEQ3_DENSITY:
@@ -1744,6 +1827,11 @@ void SetParamValue(ParamId paramId, float normalizedValue)
         case PARAM_SEQ3_CC_PROB:
             appState.seq3CcProb = normalizedValue;
             SetTrackCcProb(3, normalizedValue);
+            break;
+            
+        case PARAM_SEQ3_OFFSET:
+            appState.seq3Offset = normalizedValue;
+            SetTrackOffset(3, normalizedValue);
             break;
         
         // SEQUENCER Panel (deprecated - kept for backward compatibility)
@@ -3117,6 +3205,29 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                     snprintf(buf, sizeof(buf), "%d%%", probability);
                     return std::string(buf);
                 }
+            case 3: // Offset
+                {
+                    // Map normalized value to 7 discrete values in semitones: -12, -5, -4, 0, 4, 5, 12
+                    int offsetSemitones;
+                    if (normalizedValue < 0.142857f) {
+                        offsetSemitones = -12;
+                    } else if (normalizedValue < 0.285714f) {
+                        offsetSemitones = -5;
+                    } else if (normalizedValue < 0.428571f) {
+                        offsetSemitones = -4;
+                    } else if (normalizedValue < 0.571429f) {
+                        offsetSemitones = 0;
+                    } else if (normalizedValue < 0.714286f) {
+                        offsetSemitones = 4;
+                    } else if (normalizedValue < 0.857143f) {
+                        offsetSemitones = 5;
+                    } else {
+                        offsetSemitones = 12;
+                    }
+                    static char buf[8];
+                    snprintf(buf, sizeof(buf), "%d", offsetSemitones);
+                    return std::string(buf);
+                }
             default: return "0";
         }
     }
@@ -3540,10 +3651,12 @@ void ProcessEncoder()
                     for (int i = 0; i < 4; i++) {
                         float density = GetTrackDensity(i);
                         float orderVal = GetTrackOrder(i);
+                        float offsetVal = GetTrackOffset(i);
                         
                         // Set track parameters using helper functions
                         SetTrackDensity(i, density);
                         SetTrackOrder(i, orderVal);
+                        SetTrackOffset(i, offsetVal);
                         
                         // Use default note length (50%) - len parameter is deprecated
                         sequencer.tracks[i].noteLengthPercent = 0.5f;
@@ -4581,6 +4694,15 @@ template<typename NextHandler>
 class NormalVoiceHandler : public HandlerBase<NextHandler> {
 public:
     bool HandleNoteOn(NoteOnEvent& event) {
+        // Apply offset for sequencer-generated notes (channel 0-3 in sequencer mode)
+        // This is the last possible moment before the note is used
+        if (sequencer.sequencerMode && event.channel >= 0 && event.channel < 4) {
+            int trackIdx = event.channel;
+            SequencerTrack& track = sequencer.tracks[trackIdx];
+            int offsetNote = static_cast<int>(event.note) + static_cast<int>(track.offset);
+            event.note = static_cast<uint8_t>(std::max(0, std::min(127, offsetNote)));
+        }
+        
         int8_t voiceIndex = -1;
         
         // Check if channel is already set (0-3) AND we're in sequencer mode - this indicates sequencer routing
@@ -4994,7 +5116,8 @@ public:
                 track.lastNote = noteToTrigger;
                     break;
             }
-            
+        
+        // Return the original note - offset will be applied later in the handler chain
         return noteToTrigger;
     }
     
