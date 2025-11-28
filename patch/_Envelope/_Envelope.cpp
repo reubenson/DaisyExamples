@@ -421,7 +421,7 @@ bool ccTriggerOffPending = false;
 
 // CC reset timing - for channel assignment on channel 16
 // to experimentally test for normalizedValue - send trig to next input and confirm 8 pulses
-const uint32_t CC_RESET_DELAY_MS = 17; // drops signal sometimes below 15ms
+const uint32_t CC_RESET_DELAY_MS = 10; // drops signal sometimes below 15ms
 uint8_t lastCCValue = 0; // Track the last CC normalizedValue sent (start with lowest CC normalizedValue)
 bool ccStateInitialized = false; // Track if CC state has been properly initialized
 
@@ -433,8 +433,6 @@ uint32_t globalNoteCounter = 0; // Increments on every note-on
 // CC Queue System
 struct CCQueueItem {
     uint8_t ccValue;
-    uint32_t sendTime;
-    uint32_t holdUntil; // Time when this CC should be released
     bool isReset; // true if this is a reset to lowest normalizedValue
 };
 
@@ -4113,7 +4111,8 @@ void InitTriggerSequence()
 }
 
 
-// Legacy wrapper functions for backward compatibility
+// Add CC to queue - simplified, no timing calculation needed
+// Voice 4 (track 3) CCs are prioritized by inserting at head of queue
 void AddCCToQueue(uint8_t ccValue, bool isReset) {
     // Check if queue is full
     if (ccQueueCount >= CC_QUEUE_SIZE) {
@@ -4121,27 +4120,22 @@ void AddCCToQueue(uint8_t ccValue, bool isReset) {
         return;
     }
     
-    uint32_t currentTime = hw.seed.system.GetNow();
-    uint32_t sendTime;
+    // Voice 4 (track 3) uses CC slots 6-7, which map to values 109 and 127
+    // Prioritize these by inserting at head instead of tail
+    bool isVoice4 = (ccValue == 109 || ccValue == 127);
     
-    if (!isReset) {
-        if (ccQueueCount == 0) {
-            sendTime = currentTime + 10;
-        } else {
-            sendTime = currentTime + (ccQueueCount * CC_RESET_DELAY_MS) + 10;
-        }
+    if (isVoice4) {
+        // Insert at head (priority queue - will be processed next)
+        ccQueueHead = (ccQueueHead - 1 + CC_QUEUE_SIZE) % CC_QUEUE_SIZE;
+        ccQueue[ccQueueHead].ccValue = ccValue;
+        ccQueue[ccQueueHead].isReset = isReset;
     } else {
-        sendTime = currentTime + CC_RESET_DELAY_MS;
+        // Add to tail (normal FIFO behavior)
+        ccQueue[ccQueueTail].ccValue = ccValue;
+        ccQueue[ccQueueTail].isReset = isReset;
+        ccQueueTail = (ccQueueTail + 1) % CC_QUEUE_SIZE;
     }
     
-    uint32_t holdUntil = sendTime + CC_RESET_DELAY_MS;
-    
-    ccQueue[ccQueueTail].ccValue = ccValue;
-    ccQueue[ccQueueTail].sendTime = sendTime;
-    ccQueue[ccQueueTail].holdUntil = holdUntil;
-    ccQueue[ccQueueTail].isReset = isReset;
-    
-    ccQueueTail = (ccQueueTail + 1) % CC_QUEUE_SIZE;
     ccQueueCount++;
 }
 
@@ -4154,31 +4148,35 @@ void ProcessCCQueue() {
         lastCCValue = 0;
         ccIsLatched = false;
         ccStateInitialized = true;
+        ccLatchTime = currentTime; // Start timing from now
         // SetDebugMessage("CC Init");
     }
     
-    // Process only the next ready item in the queue (one at a time to respect timing)
+    // Process next item in queue if enough time has passed since last processing
+    // Optimize: process first item immediately if queue was empty, otherwise maintain spacing
     if (ccQueueCount > 0) {
-        CCQueueItem& item = ccQueue[ccQueueHead];
+        uint32_t timeSinceLastProcess = currentTime - ccLatchTime;
         
-        if (currentTime >= item.sendTime) {
-            // Check if enough time has passed since last trigger-on to prevent double-triggering
-            uint32_t timeSinceLastTrigger = currentTime - ccLatchTime;
-            if (timeSinceLastTrigger >= CC_RESET_DELAY_MS || !ccIsLatched) {
-                SendMidiMesssage(item.ccValue, 15, "CC");
-                lastCCValue = item.ccValue;
-                ccLatchTime = currentTime;
-                ccIsLatched = true;
+        // Process immediately if:
+        // 1. Enough time has passed (normal case - maintains spacing), OR
+        // 2. No CCs have been sent yet (first item - reduces initial latency to ~0ms)
+        bool canProcess = (timeSinceLastProcess >= CC_RESET_DELAY_MS) || !ccIsLatched;
+        
+        if (canProcess) {
+            CCQueueItem& item = ccQueue[ccQueueHead];
+            
+            SendMidiMesssage(item.ccValue, 15, "CC");
+            lastCCValue = item.ccValue;
+            ccLatchTime = currentTime; // Update timing for next item
+            ccIsLatched = true;
 
-                SendMidiMesssage(sequencer.triggerNote, sequencer.ccTriggerChannel, "TRIGGER_OFF");
-                SendMidiMesssage(sequencer.triggerNote, sequencer.ccTriggerChannel, "TRIGGER_ON");
-                // ccTriggerOffTime = currentTime + TRIGGER_OFF_DELAY_MS;
-                ccTriggerOffTime = currentTime + CC_RESET_DELAY_MS;
-                ccTriggerOffPending = true;
-                
-                ccQueueHead = (ccQueueHead + 1) % CC_QUEUE_SIZE;
-                ccQueueCount--;
-            }
+            SendMidiMesssage(sequencer.triggerNote, sequencer.ccTriggerChannel, "TRIGGER_OFF");
+            SendMidiMesssage(sequencer.triggerNote, sequencer.ccTriggerChannel, "TRIGGER_ON");
+            ccTriggerOffTime = currentTime + CC_RESET_DELAY_MS;
+            ccTriggerOffPending = true;
+            
+            ccQueueHead = (ccQueueHead + 1) % CC_QUEUE_SIZE;
+            ccQueueCount--;
         }
     }
     
@@ -4263,7 +4261,7 @@ void ProcessCCSlots()
         }
     }
     
-    // Queue all triggered CCs
+    // Queue all triggered CCs (no timing calculation needed - handled by ProcessCCQueue)
     for (int i = 0; i < triggeredSlots; i++) {
         AddCCToQueue(triggeredValues[i], false);
     }
@@ -4845,50 +4843,74 @@ public:
         uint64_t currentSample = ReadAudioSampleCounter();
         
         // Advance sequence steps based on sample-accurate timing
-        while (sequencer.sequenceStepIntervalSamples > 0 &&
-               (currentSample - sequencer.lastSequenceStepSample) >= sequencer.sequenceStepIntervalSamples)
-        {
-            uint8_t previousStep = sequencer.currentSequenceStep;
-            sequencer.lastSequenceStepSample += sequencer.sequenceStepIntervalSamples;
-            sequencer.lastSequenceStepTime = hw.seed.system.GetNow();
-            sequencer.currentSequenceStep = (sequencer.currentSequenceStep + 1) % TRIGGER_SEQUENCE_LENGTH;
+        // Calculate steps elapsed to prevent timing drift when processing multiple steps
+        if (sequencer.sequenceStepIntervalSamples > 0) {
+            uint64_t samplesSinceLastStep = currentSample - sequencer.lastSequenceStepSample;
+            uint64_t stepsElapsed = samplesSinceLastStep / sequencer.sequenceStepIntervalSamples;
             
-            for (int trackIdx = 0; trackIdx < 4; trackIdx++) {
-                SequencerTrack& track = sequencer.tracks[trackIdx];
+            // Process each step that should have occurred
+            // Limit to TRIGGER_SEQUENCE_LENGTH to prevent excessive processing
+            uint64_t stepsToProcess = (stepsElapsed > TRIGGER_SEQUENCE_LENGTH) ? TRIGGER_SEQUENCE_LENGTH : stepsElapsed;
+            
+            if (stepsToProcess > 0) {
+                // Calculate the exact sample position for the first step to process
+                // This prevents timing drift by using absolute timing, not accumulation
+                uint64_t firstStepSample = sequencer.lastSequenceStepSample + sequencer.sequenceStepIntervalSamples;
                 
-                if (sequencer.sequencerNotes.empty() || track.density <= 0.0f) {
-                    continue;
-                }
-                
-                bool currentStepTriggers = track.triggerSequence[sequencer.currentSequenceStep];
-                
-                if (currentStepTriggers) {
-                    uint8_t noteToTrigger = SelectNoteForTrack(trackIdx);
+                for (uint64_t step = 0; step < stepsToProcess; step++) {
+                    uint8_t previousStep = sequencer.currentSequenceStep;
                     
-                    NoteOnEvent event;
-                    event.note = noteToTrigger;
-                    event.velocity = 127;
-                    event.channel = trackIdx;
+                    // Calculate exact sample position for this step (absolute, not accumulated)
+                    // This ensures timing is independent of processing time
+                    uint64_t stepSample = firstStepSample + (step * sequencer.sequenceStepIntervalSamples);
+                    sequencer.lastSequenceStepSample = stepSample;
+                    sequencer.currentSequenceStep = (sequencer.currentSequenceStep + 1) % TRIGGER_SEQUENCE_LENGTH;
                     
-                    ProcessHandlerChainNoteOn(event);
+                    // Removed GetNow() call from inside loop - not needed for sample-accurate timing
+                    // This eliminates variable execution time that causes jitter
                     
-                    if (!shiftRegisterMode) {
-                        uint32_t noteOffDelaySamples = GetNoteOffDelaySamples(track.noteLengthPercent);
-                        track.noteOffSample = sequencer.lastSequenceStepSample + noteOffDelaySamples;
-                        track.noteOffPending = true;
-                        track.noteToTurnOff = noteToTrigger;
-                        track.voiceToTurnOff = trackIdx;
+                    for (int trackIdx = 0; trackIdx < 4; trackIdx++) {
+                        SequencerTrack& track = sequencer.tracks[trackIdx];
+                        
+                        if (sequencer.sequencerNotes.empty() || track.density <= 0.0f) {
+                            continue;
+                        }
+                        
+                        bool currentStepTriggers = track.triggerSequence[sequencer.currentSequenceStep];
+                        
+                        if (currentStepTriggers) {
+                            uint8_t noteToTrigger = SelectNoteForTrack(trackIdx);
+                            
+                            NoteOnEvent event;
+                            event.note = noteToTrigger;
+                            event.velocity = 127;
+                            event.channel = trackIdx;
+                            
+                            ProcessHandlerChainNoteOn(event);
+                            
+                            if (!shiftRegisterMode) {
+                                uint32_t noteOffDelaySamples = GetNoteOffDelaySamples(track.noteLengthPercent);
+                                track.noteOffSample = stepSample + noteOffDelaySamples;
+                                track.noteOffPending = true;
+                                track.noteToTurnOff = noteToTrigger;
+                                track.voiceToTurnOff = trackIdx;
+                            }
+                        }
+                    }
+                    
+                    // Process CC slots once per sequence step
+                    ProcessCCSlots();
+                    
+                    if (sequencer.currentSequenceStep == 0 && previousStep == TRIGGER_SEQUENCE_LENGTH - 1) {
+                        for (int i = 0; i < 4; i++) {
+                            sequencer.tracks[i].upDownDirection = true;
+                        }
                     }
                 }
-            }
-            
-            // Process CC slots once per sequence step
-            ProcessCCSlots();
-            
-            if (sequencer.currentSequenceStep == 0 && previousStep == TRIGGER_SEQUENCE_LENGTH - 1) {
-                for (int i = 0; i < 4; i++) {
-                    sequencer.tracks[i].upDownDirection = true;
-                }
+                
+                // Update lastSequenceStepTime once after processing all steps (not in the loop)
+                // This reduces system calls and eliminates timing jitter from variable GetNow() execution time
+                sequencer.lastSequenceStepTime = hw.seed.system.GetNow();
             }
         }
         
