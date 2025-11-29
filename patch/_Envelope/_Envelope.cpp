@@ -781,6 +781,12 @@ struct UserState {
     float seq3CcProb;
     float seq3Offset;
     
+    // Per-track CC inverse mode (one per track pair)
+    bool seq0CcInverse;          // If true, second CC slot inverts the sequence
+    bool seq1CcInverse;
+    bool seq2CcInverse;
+    bool seq3CcInverse;
+    
     // Deprecated SEQUENCER parameters (kept for backward compatibility)
     float seqDensity;           // Deprecated - use per-track density
     float seqOrder;             // Deprecated - use per-track order
@@ -847,6 +853,11 @@ struct UserState {
         seq3Order(initialValue),
         seq3CcProb(initialValue),
         seq3Offset(0.5f),               // Default 0 semitones (no change)
+        // CC inverse mode (default to false - normal behavior)
+        seq0CcInverse(false),
+        seq1CcInverse(false),
+        seq2CcInverse(false),
+        seq3CcInverse(true),
         // Deprecated parameters (kept for backward compatibility)
         seqDensity(0.0f),
         seqOrder(initialValue),         // Default ascending
@@ -4228,24 +4239,54 @@ void ProcessCCSlots()
             // Check if current step triggers for this track
             bool stepTriggers = track.triggerSequence[sequencer.currentSequenceStep];
             
-            if (stepTriggers) {
-                // Get CC probability for this track from appState
-                float ccProb = 0.0f;
-                switch(trackIdx) {
-                    case 0: ccProb = appState.seq0CcProb; break;
-                    case 1: ccProb = appState.seq1CcProb; break;
-                    case 2: ccProb = appState.seq2CcProb; break;
-                    case 3: ccProb = appState.seq3CcProb; break;
-                }
-                
-                // Convert CC probability (0.0-1.0) to percentage (0-100)
-                uint8_t prob = static_cast<uint8_t>(ccProb * 100.0f);
-                prob = std::min(static_cast<uint8_t>(100), prob);  // Clamp to 100
-                
-                // Check probability for this track's CC pair
-                if (ShouldFireWithProbability(prob)) {
-                    // Fire both CC slots for this track
+            // Get CC probability and inverse mode for this track from appState
+            float ccProb = 0.0f;
+            bool ccInverse = false;
+            switch(trackIdx) {
+                case 0: 
+                    ccProb = appState.seq0CcProb; 
+                    ccInverse = appState.seq0CcInverse;
+                    break;
+                case 1: 
+                    ccProb = appState.seq1CcProb; 
+                    ccInverse = appState.seq1CcInverse;
+                    break;
+                case 2: 
+                    ccProb = appState.seq2CcProb; 
+                    ccInverse = appState.seq2CcInverse;
+                    break;
+                case 3: 
+                    ccProb = appState.seq3CcProb; 
+                    ccInverse = appState.seq3CcInverse;
+                    break;
+            }
+            
+            // Convert CC probability (0.0-1.0) to percentage (0-100)
+            uint8_t prob = static_cast<uint8_t>(ccProb * 100.0f);
+            prob = std::min(static_cast<uint8_t>(100), prob);  // Clamp to 100
+            
+            // Determine which slots should fire based on inverse mode
+            bool firstSlotShouldFire = false;
+            bool secondSlotShouldFire = false;
+            
+            if (ccInverse) {
+                // Inverse mode: first slot follows sequencer, second inverts it
+                firstSlotShouldFire = stepTriggers;
+                secondSlotShouldFire = !stepTriggers;
+            } else {
+                // Normal mode: both slots fire when step triggers
+                firstSlotShouldFire = stepTriggers;
+                secondSlotShouldFire = stepTriggers;
+            }
+            
+            // Check probability for this track's CC pair (same probability applies to both)
+            if (ShouldFireWithProbability(prob)) {
+                // Fire first CC slot if it should fire
+                if (firstSlotShouldFire) {
                     triggeredValues[triggeredSlots++] = ccSlotValues[slotBase];
+                }
+                // Fire second CC slot if it should fire
+                if (secondSlotShouldFire) {
                     triggeredValues[triggeredSlots++] = ccSlotValues[slotBase + 1];
                 }
             }
