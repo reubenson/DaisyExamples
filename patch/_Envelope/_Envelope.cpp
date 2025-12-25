@@ -1083,7 +1083,7 @@ panelStruct displayPanels[] = {
         bindings: {PARAM_TUNING_INDEX, PARAM_NONE, PARAM_TUNING_MIDI_ENABLE, PARAM_TUNING_BPM}
     },
     {
-        name: "SEQ0",
+        name: "SEQ1",
         id: '0',
         input1Name: STR_DENS,
         input2Name: STR_ORD,
@@ -1092,7 +1092,7 @@ panelStruct displayPanels[] = {
         bindings: {PARAM_SEQ0_DENSITY, PARAM_SEQ0_ORDER, PARAM_SEQ0_CC_PROB, PARAM_SEQ0_OFFSET}
     },
     {
-        name: "SEQ1",
+        name: "SEQ2",
         id: '1',
         input1Name: STR_DENS,
         input2Name: STR_ORD,
@@ -1101,7 +1101,7 @@ panelStruct displayPanels[] = {
         bindings: {PARAM_SEQ1_DENSITY, PARAM_SEQ1_ORDER, PARAM_SEQ1_CC_PROB, PARAM_SEQ1_OFFSET}
     },
     {
-        name: "SEQ2",
+        name: "SEQ3",
         id: '2',
         input1Name: STR_DENS,
         input2Name: STR_ORD,
@@ -1110,7 +1110,7 @@ panelStruct displayPanels[] = {
         bindings: {PARAM_SEQ2_DENSITY, PARAM_SEQ2_ORDER, PARAM_SEQ2_CC_PROB, PARAM_SEQ2_OFFSET}
     },
     {
-        name: "SEQ3",
+        name: "SEQ4",
         id: '3',
         input1Name: STR_DENS,
         input2Name: STR_ORD,
@@ -1164,7 +1164,7 @@ bool knobCaughtUp[4] = {false, false, false, false};  // Track if knob has caugh
 float knobValues[11][4] = {  // panelModesCount = 11
     {0.0f, 0.5f, 0.8f, 0.0f},  // Panel 0: ADSR
     {0.1f, 1.0f, 0.0f, 0.8f},  // Panel 1: MIXER
-    {0.5f, 0.0f, 0.0f, 0.5},  // Panel 2: OSC
+    {0.5f, 0.0f, 0.0f, 0.5f},  // Panel 2: OSC
     {0.9f, 0.0f, 1.0f, 0.186441f},  // Panel 3: TUNING (T, empty, MIDI, BPM) - Default 120 BPM normalized (110/590)
     {0.25f, 0.0f, 0.0f, 0.5f},  // Panel 4: SEQ0 (Dens, Ord, CC%, unused)
     {0.25f, 0.0f, 0.0f, 0.5f},  // Panel 5: SEQ1 (Dens, Ord, CC%, unused)
@@ -2747,14 +2747,6 @@ int main(void)
         float amplitudes[16] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         voiceHarmonicOsc[i].SetAmplitudes(amplitudes);
     }
-    
-    // Initialize OSC parameters with sensible defaults
-    SetParamValue(PARAM_OSC_WAVEFORM, 0.0f);        // Start with sine
-    SetParamValue(PARAM_OSC_FM2_RATIO, 0.26f);       // 1:1 ratio
-    SetParamValue(PARAM_OSC_FM2_INDEX, 0.5f);        // Medium index
-    SetParamValue(PARAM_OSC_HARMONIC_IDX, 0.0f);    // First harmonic
-    SetParamValue(PARAM_OSC_HARMONIC_DECAY, 1.0f);  // Decay rate
-    SetParamValue(PARAM_OSC_HARMONIC_SKEW, 0.0f);   // No skew (fundamental emphasis)
 
     // Start the ADC and Audio Peripherals on the Hardware
     hw.StartAdc();
@@ -2937,44 +2929,6 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                     }
                 }
             default: return "Inter";
-        }
-    }
-    else if (panelId == 's') {
-        switch(paramIndex) {
-            case 0: // Density
-                {
-                    static char buf[8];
-                    snprintf(buf, sizeof(buf), "%d/%d", static_cast<int>(normalizedValue * ParamConfig::SEQ_DENSITY_MAX), ParamConfig::SEQ_DENSITY_MAX);
-                    return std::string(buf);
-                }
-            case 1: // Order
-                {
-                    // Map normalized value (0.0-1.0) to 6 modes
-                    if (normalizedValue < 0.1667f) {
-                        return STR_ASC;
-                    } else if (normalizedValue < 0.3333f) {
-                        return STR_DESC;
-                    } else if (normalizedValue < 0.5f) {
-                        return STR_UPD;
-                    } else if (normalizedValue < 0.6667f) {
-                        return STR_FWD;
-                    } else if (normalizedValue < 0.8333f) {
-                        return STR_RND;
-                    } else {
-                        return STR_BRN;
-                    }
-                }
-            case 2: // Length
-                return FormatPercent(normalizedValue);
-            case 3: // BPM
-                {
-                    // Map 0-1 to CLOCK_BPM_MIN-CLOCK_BPM_MAX and quantize to multiple of 5
-                    int32_t bpm = CLOCK_BPM_MIN + static_cast<int32_t>(normalizedValue * (CLOCK_BPM_MAX - CLOCK_BPM_MIN));
-                    bpm = ((bpm + 2) / 5) * 5;  // Round to nearest multiple of 5
-                    bpm = std::max(CLOCK_BPM_MIN, std::min(CLOCK_BPM_MAX, bpm));
-                    return std::to_string(static_cast<int>(bpm));
-                }
-            default: return "0";
         }
     }
     else if (panelId == 't') {
@@ -3287,31 +3241,27 @@ void UpdateOled()
         WriteFixedString(hw, knobPositions[i], paramValueY, 5, font_s, paramValueStr.c_str());
     }
     
-    // Show trigger sequence pattern when in TRIGSEQ mode
-    if (currentPanel.id == 's') {
-        // Show step counter with fixed width - move to avoid bottom-right area
-        WriteFixedStringF(hw, knobPositions[0], 24, 8, font_s, "Step:%02d", sequencer.currentSequenceStep);
-
-        // Show density for track 0 (first track) - each track now has its own pattern
-        int numTriggers = 0;
-        for (int i = 0; i < TRIGGER_SEQUENCE_LENGTH; i++) {
-            if (sequencer.tracks[0].triggerSequence[i]) numTriggers++;
-        }
-        WriteFixedStringF(hw, knobPositions[2], 24, 5, font_s, "D:%02d", numTriggers);
+    // Show sequence pattern for individual SEQ panels (SEQ1, SEQ2, SEQ3, SEQ4)
+    if (currentPanel.id == '0' || currentPanel.id == '1' || currentPanel.id == '2' || currentPanel.id == '3') {
+        // Map panel ID to track index: '0' -> 0, '1' -> 1, '2' -> 2, '3' -> 3
+        int trackIdx = currentPanel.id - '0';
         
-        // Show sequence pattern for track 0 as dots in one fixed-width string
+        // Show sequence pattern for this track as dots
         char patternStr[TRIGGER_SEQUENCE_LENGTH + 1];
         for (int i = 0; i < TRIGGER_SEQUENCE_LENGTH; i++) {
-            patternStr[i] = sequencer.tracks[0].triggerSequence[i] ? '*' : '-';
+            patternStr[i] = sequencer.tracks[trackIdx].triggerSequence[i] ? '*' : '-';
         }
         patternStr[TRIGGER_SEQUENCE_LENGTH] = '\0';
         WriteFixedString(hw, knobPositions[0], 32, TRIGGER_SEQUENCE_LENGTH, font_s, patternStr);
         
         // Show sequencer-specific information
         if (sequencer.sequencerMode) {
-            // Show note ordering mode (use first track's mode as reference)
+            // Show step counter with fixed width
+            WriteFixedStringF(hw, knobPositions[0], 24, 8, font_s, "Step:%02d", sequencer.currentSequenceStep);
+            
+            // Show note ordering mode for this track
             const char* modeStr;
-            switch (sequencer.tracks[0].orderMode) {
+            switch (sequencer.tracks[trackIdx].orderMode) {
                 case SEQ_ORDER_ASC: modeStr = STR_ASC; break;
                 case SEQ_ORDER_DESC: modeStr = STR_DESC; break;
                 case SEQ_ORDER_UPD: modeStr = STR_UPD; break;
@@ -3321,9 +3271,6 @@ void UpdateOled()
                 default: modeStr = STR_ASC; break;
             }
             WriteFixedString(hw, knobPositions[3], 32, 4, font_s, modeStr);
-            
-            // Show number of held notes
-            WriteFixedStringF(hw, knobPositions[0], 40, 4, font_s, "N:%d", static_cast<int>(sequencer.sequencerNotes.size()));
         }
     }
     // Show tuning information when in TUNING mode
