@@ -470,6 +470,14 @@ size_t ccQueueHead = 0;
 size_t ccQueueTail = 0;
 size_t ccQueueCount = 0;
 uint32_t ccLatchTime = 0; // Time when CC was last sent
+
+// Pitch Bend Queue System - for deferred MIDI pitch bend sends (avoids audio glitches)
+struct PendingPitchBend {
+    uint8_t channel;
+    int16_t value;
+    bool pending;
+};
+static PendingPitchBend pitchBendQueue[4] = {};
 bool ccIsLatched = false; // Whether CC is currently latched to a normalizedValue
 
 // Encoder long press timing
@@ -1269,6 +1277,8 @@ void      UpdateOled();
 // void      plucksApply();
 void      InitPan(float samplerate);
 void      SendPitchBend(uint8_t channel, int16_t bendValue);
+void      SetOscillatorFrequency(int voiceIndex, float baseFreq);
+float     HzDetuningToCents(float baseFreq, float detuneHz);
 void      ProcessCCSlots();
 void      AddCCToQueue(uint8_t ccValue, bool isReset = false);
 void      ProcessCCQueue();
@@ -1902,13 +1912,79 @@ void SetParamValue(ParamId paramId, float normalizedValue)
         
         // BNRL (Binaural) Panel
         case PARAM_BNRL_ENABLE:
-            appState.bnrlEnable = normalizedValue;
-            binauralEnabled = (normalizedValue >= 0.5f);
+            {
+                appState.bnrlEnable = normalizedValue;
+                bool wasEnabled = binauralEnabled;
+                binauralEnabled = (normalizedValue >= 0.5f);
+                
+                // If binaural state changed, update all active voices
+                if (wasEnabled != binauralEnabled) {
+                    for (int i = 0; i < 4; i++) {
+                        if (voices[i].note > 0) {
+                            // Recalculate base frequency and update oscillators
+                            float baseFreq = 440.0f * powf(2.0f, (voices[i].note - 69) / 12.0f);
+                            if (applyToInternalOsc) {
+                                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                                float frequencyMultiplier = CalculateFrequencyMultiplier(voices[i].note, tuning);
+                                baseFreq *= frequencyMultiplier;
+                            }
+                            SetOscillatorFrequency(i, baseFreq);
+                            
+                            // Update MIDI pitch bend for voices 1 and 3
+                            if (sendPitchBendMidi && (i == 1 || i == 3)) {
+                                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                                float centsDeviation = CalculateCentsDeviation(static_cast<uint8_t>(voices[i].note), tuning);
+                                if (binauralEnabled) {
+                                    centsDeviation += HzDetuningToCents(baseFreq, binauralSpreadHz / 2.0f);
+                                }
+                                int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
+                                SendPitchBend(static_cast<uint8_t>(i), pitchBendValue);
+                            }
+                        }
+                    }
+                }
+            }
             break;
             
         case PARAM_BNRL_SPREAD:
-            appState.bnrlSpread = normalizedValue;
-            binauralSpreadHz = normalizedValue * 30.0f;  // 0-30 Hz range
+            {
+                appState.bnrlSpread = normalizedValue;
+                float newSpreadHz = normalizedValue * 30.0f;  // 0-30 Hz range
+                
+                // Track last spread value that was applied to voices
+                static float lastAppliedSpreadHz = 0.0f;
+                
+                // Only update voices if spread changed by more than 0.5 Hz from last applied
+                float spreadDelta = fabsf(newSpreadHz - lastAppliedSpreadHz);
+                binauralSpreadHz = newSpreadHz;
+                
+                // Update active voices only if binaural enabled AND spread changed significantly
+                if (binauralEnabled && spreadDelta > 0.5f) {
+                    lastAppliedSpreadHz = newSpreadHz;  // Remember this as the new baseline
+                    
+                    for (int i = 0; i < 4; i++) {
+                        if (voices[i].note > 0) {
+                            // Recalculate base frequency and update oscillators
+                            float baseFreq = 440.0f * powf(2.0f, (voices[i].note - 69) / 12.0f);
+                            if (applyToInternalOsc) {
+                                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                                float frequencyMultiplier = CalculateFrequencyMultiplier(voices[i].note, tuning);
+                                baseFreq *= frequencyMultiplier;
+                            }
+                            SetOscillatorFrequency(i, baseFreq);
+                            
+                            // Queue MIDI pitch bend for voices 1 and 3 (deferred to main loop)
+                            if (sendPitchBendMidi && (i == 1 || i == 3)) {
+                                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                                float centsDeviation = CalculateCentsDeviation(static_cast<uint8_t>(voices[i].note), tuning);
+                                centsDeviation += HzDetuningToCents(baseFreq, binauralSpreadHz / 2.0f);
+                                int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
+                                pitchBendQueue[i] = {static_cast<uint8_t>(i), pitchBendValue, true};
+                            }
+                        }
+                    }
+                }
+            }
             break;
         
         case PARAM_NONE:
@@ -2908,6 +2984,15 @@ int main(void)
         
         // Process CC queue
         ProcessCCQueue();
+        
+        // Process deferred pitch bend queue (one per loop iteration to avoid audio glitches)
+        for (int i = 0; i < 4; i++) {
+            if (pitchBendQueue[i].pending) {
+                SendPitchBend(pitchBendQueue[i].channel, pitchBendQueue[i].value);
+                pitchBendQueue[i].pending = false;
+                break;  // Only one per loop iteration to spread MIDI load
+            }
+        }
         
         // Check for sequence trigger off timing
         // if (sequenceTriggerOffPending && currentTime >= sequenceTriggerOffTime)
