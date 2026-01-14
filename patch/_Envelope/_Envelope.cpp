@@ -318,6 +318,34 @@ Fm2 voiceFm2Osc[4];                        // FM2 oscillators for all 4 voices
 HarmonicOscillator<> voiceHarmonicOsc[4];    // Harmonic oscillators for all 4 voices (default 16 harmonics)
 InterpolatedOscillator panLfo;              // LFO for panning CV output
 InterpolatedOscillator internalPhaseOsc[4]; // Internal oscillators for phase generation (voices 1 and 3 use these)
+// Binaural state variables - using simple phase accumulators instead of heavy InterpolatedOscillator
+bool binauralEnabled = false;
+float binauralSpreadHz = 0.0f;
+float binauralPhase[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+float binauralFreqHz[4] = {440.0f, 440.0f, 440.0f, 440.0f};
+
+// Sine lookup table for fast binaural oscillator (256 entries, no trig calls needed)
+static float sineLUT[256];
+static bool sineLUTInitialized = false;
+
+static inline float fastSin(float phase) {
+    // phase is 0.0 to 1.0, returns sine value from lookup table
+    int idx = static_cast<int>(phase * 255.99f) & 255;
+    return sineLUT[idx];
+}
+
+// Equal power panning lookup tables (256 entries each, no trig calls needed)
+static float panLeftLUT[256];   // cos coefficients
+static float panRightLUT[256];  // sin coefficients
+
+static inline void fastPanEqualPower(float pan, float value, float* left, float* right) {
+    // pan is -1.0 to +1.0, map to 0-255
+    int idx = static_cast<int>((pan + 1.0f) * 127.5f);
+    if (idx < 0) idx = 0;
+    if (idx > 255) idx = 255;
+    *left = value * panLeftLUT[idx];
+    *right = value * panRightLUT[idx];
+}
 
 size_t blocksize = 16; //(333us latency vs 167us for 8)
 int panelMode;
@@ -727,6 +755,10 @@ enum ParamId {
     PARAM_MICRO_MODULATION,
     PARAM_MICRO_WETDRY,
     
+    // BNRL (Binaural) Panel
+    PARAM_BNRL_ENABLE,
+    PARAM_BNRL_SPREAD,
+    
     PARAM_NONE  // Used for unbound knobs
 };
 
@@ -809,6 +841,10 @@ struct UserState {
     float microModulation;      // 0.0-1.0 texture parameter
     float microWetDry;          // 0.0-1.0 wet/dry mix
     
+    // BNRL (Binaural) parameters
+    float bnrlEnable;           // 0.0-0.5 = off, 0.5-1.0 = on
+    float bnrlSpread;           // 0.0-1.0 maps to 0-30 Hz
+    
     // VOICE AMPLITUDE parameters (controlled via MIDI CC 100-103)
     float voiceAmplitudes[4];   // 0.0-1.0 amplitude for voices 0-3
     
@@ -875,6 +911,8 @@ struct UserState {
         microPulseWidth(initialValue),      // Default 50% duty cycle
         microModulation(initialValue),      // Default no modulation
         microWetDry(initialValue),          // Default 0% wet (fully dry - no microsound)
+        bnrlEnable(initialValue),           // Default off
+        bnrlSpread(initialValue),           // Default 0 Hz spread
         voiceAmplitudes{1.0f, 1.0f, 1.0f, 1.0f}  // Default full amplitude for all voices
     {}
 };
@@ -1138,6 +1176,15 @@ panelStruct displayPanels[] = {
                    PARAM_MICRO_MODULATION, PARAM_MICRO_WETDRY}
     },
     {
+        name: "BNRL",
+        id: 'b',
+        input1Name: "On",
+        input2Name: "Sprd",
+        input3Name: "",
+        input4Name: "",
+        bindings: {PARAM_BNRL_ENABLE, PARAM_BNRL_SPREAD, PARAM_NONE, PARAM_NONE}
+    },
+    {
         name: "SAVE",
         id: 'p',
         input1Name: "",
@@ -1161,7 +1208,7 @@ bool knobCaughtUp[4] = {false, false, false, false};  // Track if knob has caugh
 
 // Global knob normalizedValues storage - stores all knob positions for all panels (0.0-1.0 normalized)
 // Size matches actual panel count to save memory
-float knobValues[11][4] = {  // panelModesCount = 11
+float knobValues[12][4] = {  // panelModesCount = 12
     {0.0f, 0.5f, 0.8f, 0.0f},  // Panel 0: ADSR
     {0.1f, 1.0f, 0.0f, 0.8f},  // Panel 1: MIXER
     {0.5f, 0.0f, 0.0f, 0.5f},  // Panel 2: OSC
@@ -1172,7 +1219,8 @@ float knobValues[11][4] = {  // panelModesCount = 11
     {0.25f, 0.0f, 0.0f, 0.5f},  // Panel 7: SEQ3 (Dens, Ord, CC%, unused)
     {0.7f, 0.5f, 0.5f, 0.0f},  // Panel 8: DELAY (Mode, Time, Damp, Mix)
     {0.2f, 0.5f, 0.0f, 0.0f},  // Panel 9: MICRO (PLen, PWid, Mod, Mix)
-    {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 10: PRESET
+    {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 10: BNRL (On, Spread, unused, unused)
+    {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 11: PRESET
 };
 const float KNOB_CATCHUP_THRESHOLD = 0.05f;  // How close knob must be to catch up (5%)
 constexpr float MICROSOUND_MIN_ACTIVE_MIX = 0.02f; // Keep microsound fully bypassed near 0%
@@ -1852,6 +1900,17 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             // Wet/dry mixing now happens in ApplyMicrosound, not in PulsarSynth
             break;
         
+        // BNRL (Binaural) Panel
+        case PARAM_BNRL_ENABLE:
+            appState.bnrlEnable = normalizedValue;
+            binauralEnabled = (normalizedValue >= 0.5f);
+            break;
+            
+        case PARAM_BNRL_SPREAD:
+            appState.bnrlSpread = normalizedValue;
+            binauralSpreadHz = normalizedValue * 30.0f;  // 0-30 Hz range
+            break;
+        
         case PARAM_NONE:
         default:
             break;
@@ -1940,6 +1999,33 @@ void ApplyPanning(float* data) {
     // Sum all voices (volume control moved to crossfader)
     data[0] = L1 + L2 + L3 + L4;
     data[1] = R1 + R2 + R3 + R4;
+    
+    // Process binaural oscillators with opposite panning (no trig calls - uses LUTs)
+    if (binauralEnabled) {
+        static float sampleRateInv = 0.0f;
+        if (sampleRateInv == 0.0f) sampleRateInv = 1.0f / hw.AudioSampleRate();
+        
+        float binL = 0.0f, binR = 0.0f;
+        float panVals[4] = {-pan0, -pan1, -pan2, -pan3};  // Opposite pan values
+        
+        for (int i = 0; i < 4; i++) {
+            float envVal = std::max(envelopes[i].envSig, voicesMinLevel);
+            // Fast sine using lookup table
+            float osc = fastSin(binauralPhase[i]) * envVal * 0.5f;
+            binauralPhase[i] += binauralFreqHz[i] * sampleRateInv;
+            if (binauralPhase[i] >= 1.0f) binauralPhase[i] -= 1.0f;
+            
+            // Fast equal power panning using lookup tables
+            float l, r;
+            fastPanEqualPower(panVals[i], osc, &l, &r);
+            binL += l;
+            binR += r;
+        }
+        
+        data[0] += binL;
+        data[1] += binR;
+    }
+    
     hw.seed.dac.WriteValue(DacHandle::Channel::ONE, ((panOutput + 1.0f) / 2.0f) * 4095);
 }
 
@@ -2131,6 +2217,16 @@ float MidiNoteToFrequency(int8_t note, int8_t channel)
     return frequency;
 }
 
+// Convert Hz detuning to cents deviation for MIDI pitch bend
+// Returns negative cents when detuning down (lower frequency)
+float HzDetuningToCents(float baseFreq, float detuneHz)
+{
+    if (baseFreq <= 0.0f) return 0.0f;
+    float detunedFreq = baseFreq - detuneHz;
+    if (detunedFreq <= 0.0f) return 0.0f;
+    return 1200.0f * log2f(detunedFreq / baseFreq);
+}
+
 // Process oscillator based on selected mode
 // externalPhase: optional external phase value (0-1 range) for InterpolatedOscillator
 float ProcessOscillator(int voiceIndex, float externalPhase = -1.0f) {
@@ -2158,13 +2254,21 @@ float ProcessOscillator(int voiceIndex, float externalPhase = -1.0f) {
     }
 }
 
-void SetOscillatorFrequency(int voiceIndex, float freq) {
-    // Set frequency for all oscillator types so mode switching doesn't lose the pitch
-    voiceInterpOsc[voiceIndex].SetFreq(freq);
-    voiceFm2Osc[voiceIndex].SetFrequency(freq);
-    voiceHarmonicOsc[voiceIndex].SetFreq(freq);
+void SetOscillatorFrequency(int voiceIndex, float baseFreq) {
+    // Apply binaural detuning: main oscillator DOWN, binaural oscillator UP
+    float detuneHz = binauralEnabled ? (binauralSpreadHz / 2.0f) : 0.0f;
+    float mainFreq = baseFreq - detuneHz;
+    float binFreq = baseFreq + detuneHz;
+    
+    // Set frequency for all main oscillator types so mode switching doesn't lose the pitch
+    voiceInterpOsc[voiceIndex].SetFreq(mainFreq);
+    voiceFm2Osc[voiceIndex].SetFrequency(mainFreq);
+    voiceHarmonicOsc[voiceIndex].SetFreq(mainFreq);
     // Update internal phase oscillator frequency (used for phase addressing in voices 1 and 3)
-    internalPhaseOsc[voiceIndex].SetFreq(freq);
+    internalPhaseOsc[voiceIndex].SetFreq(mainFreq);
+    
+    // Set binaural oscillator frequency (detuned UP) - simple phase accumulator
+    binauralFreqHz[voiceIndex] = binFreq;
 }
 
 // Apply VCA to inputs based on envelope normalizedValues
@@ -2747,6 +2851,21 @@ int main(void)
         float amplitudes[16] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         voiceHarmonicOsc[i].SetAmplitudes(amplitudes);
     }
+    
+    // Initialize sine lookup table for fast binaural oscillators (no trig calls in audio loop)
+    if (!sineLUTInitialized) {
+        for (int i = 0; i < 256; i++) {
+            sineLUT[i] = sinf(i * 2.0f * M_PI / 256.0f);
+        }
+        // Initialize equal power panning lookup tables
+        for (int i = 0; i < 256; i++) {
+            float pan = (i / 127.5f) - 1.0f;  // -1.0 to +1.0
+            float angle = (pan + 1.0f) * M_PI * 0.25f;
+            panLeftLUT[i] = cosf(angle);
+            panRightLUT[i] = sinf(angle);
+        }
+        sineLUTInitialized = true;
+    }
 
     // Start the ADC and Audio Peripherals on the Hardware
     hw.StartAdc();
@@ -3303,6 +3422,16 @@ void UpdateOled()
     else if (currentPanel.id == 'p') {
         ShowPresetValues();
     }
+    // BNRL (Binaural) panel - show On/Off and Hz value
+    else if (currentPanel.id == 'b') {
+        // Show On/Off state for enable parameter
+        const char* enableStr = binauralEnabled ? "On" : "Off";
+        WriteFixedString(hw, knobPositions[0], 24, 4, font_s, enableStr);
+        
+        // Show spread in Hz (rounded to integer)
+        int spreadHz = static_cast<int>(binauralSpreadHz + 0.5f);
+        WriteFixedStringF(hw, knobPositions[1], 24, 5, font_s, "%dHz", spreadHz);
+    }
     
     // === BOTTOM ROW: General State Info (always visible) ===
     // Use entire bottom row (y=56-63) for general parameters
@@ -3749,6 +3878,13 @@ static void ApplyShiftRegisterState()
             if (sendPitchBendMidi && state.gate_on) {
                 const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
                 float centsDeviation = CalculateCentsDeviation(static_cast<uint8_t>(state.note), tuning);
+                
+                // Add binaural detuning for voices 1 and 3 (analog oscillator inputs via MIDI)
+                if (binauralEnabled && (i == 1 || i == 3)) {
+                    float baseFreq = 440.0f * powf(2.0f, (state.note - 69) / 12.0f);
+                    centsDeviation += HzDetuningToCents(baseFreq, binauralSpreadHz / 2.0f);
+                }
+                
                 int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
                 SendPitchBend(static_cast<uint8_t>(i), pitchBendValue);
             }
@@ -4037,6 +4173,13 @@ void ApplyTuningToSequencerNotes()
                 // Apply new tuning to this voice
                 const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
                 float centsDeviation = CalculateCentsDeviation(static_cast<uint8_t>(voices[i].note), tuning);
+                
+                // Add binaural detuning for voices 1 and 3 (analog oscillator inputs via MIDI)
+                if (binauralEnabled && (i == 1 || i == 3)) {
+                    float baseFreq = 440.0f * powf(2.0f, (voices[i].note - 69) / 12.0f);
+                    centsDeviation += HzDetuningToCents(baseFreq, binauralSpreadHz / 2.0f);
+                }
+                
                 int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
                 SendPitchBend(static_cast<uint8_t>(i), pitchBendValue);
             }
@@ -4384,6 +4527,13 @@ public:
             if (sendPitchBendMidi) {
                 const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
                 float centsDeviation = CalculateCentsDeviation(event.note, tuning);
+                
+                // Add binaural detuning for voices 1 and 3 (analog oscillator inputs via MIDI)
+                if (binauralEnabled && (event.channel == 1 || event.channel == 3)) {
+                    float baseFreq = 440.0f * powf(2.0f, (event.note - 69) / 12.0f);
+                    centsDeviation += HzDetuningToCents(baseFreq, binauralSpreadHz / 2.0f);
+                }
+                
                 int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
                 SendPitchBend(event.channel, pitchBendValue);
             }
@@ -4493,6 +4643,13 @@ public:
         if (sendPitchBendMidi) {
             const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
             float centsDeviation = CalculateCentsDeviation(event.note, tuning);
+            
+            // Add binaural detuning for voices 1 and 3 (analog oscillator inputs via MIDI)
+            if (binauralEnabled && (voiceIndex == 1 || voiceIndex == 3)) {
+                float baseFreq = 440.0f * powf(2.0f, (event.note - 69) / 12.0f);
+                centsDeviation += HzDetuningToCents(baseFreq, binauralSpreadHz / 2.0f);
+            }
+            
             int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
             SendPitchBend(voiceIndex, pitchBendValue);
         }
