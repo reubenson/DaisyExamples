@@ -323,6 +323,9 @@ bool binauralEnabled = false;
 float binauralSpreadHz = 0.0f;
 float binauralPhase[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 float binauralFreqHz[4] = {440.0f, 440.0f, 440.0f, 440.0f};
+// Binaural mode control flags
+bool digitalOnly = true;  // Use digital sine oscillators for voices 1 and 3 instead of MIDI pitch bend
+bool hardPan = true;      // Pan each oscillator pair hard left/right instead of LFO-based panning
 
 // Sine lookup table for fast binaural oscillator (256 entries, no trig calls needed)
 static float sineLUT[256];
@@ -763,9 +766,8 @@ enum ParamId {
     PARAM_MICRO_MODULATION,
     PARAM_MICRO_WETDRY,
     
-    // BNRL (Binaural) Panel
-    PARAM_BNRL_ENABLE,
-    PARAM_BNRL_SPREAD,
+    // OSC Binaural mode parameter (mode-specific)
+    PARAM_OSC_BNRL_SPREAD,
     
     PARAM_NONE  // Used for unbound knobs
 };
@@ -787,7 +789,7 @@ struct UserState {
     
     // OSC parameters
     float oscWaveform;          // 0.0-1.0 (sine->tri->square->saw)
-    float oscMode;              // 0.0-1.0 oscillator mode (0=Interpolated, 1=FM2, 2=Harmonic)
+    float oscMode;              // 0.0-1.0 oscillator mode (0=Interpolated, 1=FM2, 2=Harmonic, 3=Binaural)
     float fm2Ratio;             // 0.0-1.0 maps to 0.125-8.0
     float fm2Index;             // 0.0-1.0 maps to 0.0-1.0
     float harmonicIdx;          // 0.0-1.0 maps to 1-16 as integers
@@ -849,9 +851,8 @@ struct UserState {
     float microModulation;      // 0.0-1.0 texture parameter
     float microWetDry;          // 0.0-1.0 wet/dry mix
     
-    // BNRL (Binaural) parameters
-    float bnrlEnable;           // 0.0-0.5 = off, 0.5-1.0 = on
-    float bnrlSpread;           // 0.0-1.0 maps to 0-30 Hz
+    // OSC Binaural mode parameter (only used when oscMode == 3)
+    float oscBnrlSpread;        // 0.0-1.0 maps to 0-30 Hz
     
     // VOICE AMPLITUDE parameters (controlled via MIDI CC 100-103)
     float voiceAmplitudes[4];   // 0.0-1.0 amplitude for voices 0-3
@@ -919,8 +920,7 @@ struct UserState {
         microPulseWidth(initialValue),      // Default 50% duty cycle
         microModulation(initialValue),      // Default no modulation
         microWetDry(initialValue),          // Default 0% wet (fully dry - no microsound)
-        bnrlEnable(initialValue),           // Default off
-        bnrlSpread(initialValue),           // Default 0 Hz spread
+        oscBnrlSpread(initialValue),       // Default 0 Hz spread
         voiceAmplitudes{1.0f, 1.0f, 1.0f, 1.0f}  // Default full amplitude for all voices
     {}
 };
@@ -1184,15 +1184,6 @@ panelStruct displayPanels[] = {
                    PARAM_MICRO_MODULATION, PARAM_MICRO_WETDRY}
     },
     {
-        name: "BNRL",
-        id: 'b',
-        input1Name: "On",
-        input2Name: "Sprd",
-        input3Name: "",
-        input4Name: "",
-        bindings: {PARAM_BNRL_ENABLE, PARAM_BNRL_SPREAD, PARAM_NONE, PARAM_NONE}
-    },
-    {
         name: "SAVE",
         id: 'p',
         input1Name: "",
@@ -1227,7 +1218,6 @@ float knobValues[12][4] = {  // panelModesCount = 12
     {0.25f, 0.0f, 0.0f, 0.5f},  // Panel 7: SEQ3 (Dens, Ord, CC%, unused)
     {0.7f, 0.5f, 0.5f, 0.0f},  // Panel 8: DELAY (Mode, Time, Damp, Mix)
     {0.2f, 0.5f, 0.0f, 0.0f},  // Panel 9: MICRO (PLen, PWid, Mod, Mix)
-    {0.0f, 0.0f, 0.0f, 0.0f},  // Panel 10: BNRL (On, Spread, unused, unused)
     {0.0f, 0.0f, 0.0f, 0.0f}   // Panel 11: PRESET
 };
 const float KNOB_CATCHUP_THRESHOLD = 0.05f;  // How close knob must be to catch up (5%)
@@ -1405,6 +1395,7 @@ float GetParamValue(ParamId paramId)
         case PARAM_OSC_HARMONIC_IDX:    return appState.harmonicIdx;
         case PARAM_OSC_HARMONIC_DECAY:  return appState.harmonicDecay;
         case PARAM_OSC_HARMONIC_SKEW:   return appState.harmonicSkew;
+        case PARAM_OSC_BNRL_SPREAD:     return appState.oscBnrlSpread;
         
         // TUNING Panel
         case PARAM_TUNING_INDEX:        return appState.tuningIndex;
@@ -1607,8 +1598,39 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                 appState.oscMode = normalizedValue;
                 
                 // Reset phase tracking when switching to/from Interpolated mode to prevent stale values
-                int newMode = static_cast<int>(normalizedValue * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
-                int oldModeInt = static_cast<int>(oldMode * 2.99f);
+                int newMode = static_cast<int>(normalizedValue * 3.99f);  // 0-3: Interpolated, FM2, Harmonic, Binaural
+                int oldModeInt = static_cast<int>(oldMode * 3.99f);
+                
+                // Update binaural enabled state based on mode
+                bool wasEnabled = binauralEnabled;
+                binauralEnabled = (newMode == 3);
+                
+                // If binaural state changed, update all active voices
+                if (wasEnabled != binauralEnabled) {
+                    for (int i = 0; i < 4; i++) {
+                        if (voices[i].note > 0) {
+                            // Recalculate base frequency and update oscillators
+                            float baseFreq = 440.0f * powf(2.0f, (voices[i].note - 69) / 12.0f);
+                            if (applyToInternalOsc) {
+                                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                                float frequencyMultiplier = CalculateFrequencyMultiplier(voices[i].note, tuning);
+                                baseFreq *= frequencyMultiplier;
+                            }
+                            SetOscillatorFrequency(i, baseFreq);
+                            
+                            // Update MIDI pitch bend for voices 1 and 3 (only when digitalOnly is false)
+                            if (sendPitchBendMidi && (i == 1 || i == 3) && !digitalOnly) {
+                                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                                float centsDeviation = CalculateCentsDeviation(static_cast<uint8_t>(voices[i].note), tuning);
+                                if (binauralEnabled) {
+                                    centsDeviation += HzDetuningToCents(baseFreq, binauralSpreadHz / 2.0f);
+                                }
+                                int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
+                                SendPitchBend(static_cast<uint8_t>(i), pitchBendValue);
+                            }
+                        }
+                    }
+                }
                 
                 // Reset catch-up state for knobs 0-2 when mode changes
                 // The same physical knobs control different parameters in different modes
@@ -1910,46 +1932,13 @@ void SetParamValue(ParamId paramId, float normalizedValue)
             // Wet/dry mixing now happens in ApplyMicrosound, not in PulsarSynth
             break;
         
-        // BNRL (Binaural) Panel
-        case PARAM_BNRL_ENABLE:
+        // OSC Binaural mode parameter (mode-specific, only active when oscMode == 3)
+        case PARAM_OSC_BNRL_SPREAD:
             {
-                appState.bnrlEnable = normalizedValue;
-                bool wasEnabled = binauralEnabled;
-                binauralEnabled = (normalizedValue >= 0.5f);
-                
-                // If binaural state changed, update all active voices
-                if (wasEnabled != binauralEnabled) {
-                    for (int i = 0; i < 4; i++) {
-                        if (voices[i].note > 0) {
-                            // Recalculate base frequency and update oscillators
-                            float baseFreq = 440.0f * powf(2.0f, (voices[i].note - 69) / 12.0f);
-                            if (applyToInternalOsc) {
-                                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
-                                float frequencyMultiplier = CalculateFrequencyMultiplier(voices[i].note, tuning);
-                                baseFreq *= frequencyMultiplier;
-                            }
-                            SetOscillatorFrequency(i, baseFreq);
-                            
-                            // Update MIDI pitch bend for voices 1 and 3
-                            if (sendPitchBendMidi && (i == 1 || i == 3)) {
-                                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
-                                float centsDeviation = CalculateCentsDeviation(static_cast<uint8_t>(voices[i].note), tuning);
-                                if (binauralEnabled) {
-                                    centsDeviation += HzDetuningToCents(baseFreq, binauralSpreadHz / 2.0f);
-                                }
-                                int16_t pitchBendValue = CentsToPitchBend(centsDeviation, pitchBendRange);
-                                SendPitchBend(static_cast<uint8_t>(i), pitchBendValue);
-                            }
-                        }
-                    }
-                }
-            }
-            break;
-            
-        case PARAM_BNRL_SPREAD:
-            {
-                appState.bnrlSpread = normalizedValue;
-                float newSpreadHz = normalizedValue * 30.0f;  // 0-30 Hz range
+                // Clamp to 0-1 range to ensure full 0-30 Hz range
+                float clampedValue = std::max(0.0f, std::min(1.0f, normalizedValue));
+                appState.oscBnrlSpread = clampedValue;
+                float newSpreadHz = clampedValue * 30.0f;  // 0-30 Hz range
                 
                 // Track last spread value that was applied to voices
                 static float lastAppliedSpreadHz = 0.0f;
@@ -1958,8 +1947,9 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                 float spreadDelta = fabsf(newSpreadHz - lastAppliedSpreadHz);
                 binauralSpreadHz = newSpreadHz;
                 
-                // Update active voices only if binaural enabled AND spread changed significantly
-                if (binauralEnabled && spreadDelta > 0.5f) {
+                // Update active voices only if binaural enabled (mode == 3) AND spread changed significantly
+                int currentMode = static_cast<int>(appState.oscMode * 3.99f);
+                if ((currentMode == 3) && spreadDelta > 0.5f) {
                     lastAppliedSpreadHz = newSpreadHz;  // Remember this as the new baseline
                     
                     for (int i = 0; i < 4; i++) {
@@ -2067,6 +2057,15 @@ void ApplyPanning(float* data) {
     // Store LFO output for CV output (before amplitude scaling)
     float panOutput = panLfo.ProcessAtPhase(lfoPhase);
     
+    // Apply hard panning for main oscillators when binaural is enabled and hardPan is true
+    if (binauralEnabled && hardPan) {
+        // Main oscillators: ALL voices are hard panned left (binaural oscillators are hard panned right)
+        pan0 = -1.0f;  // Voice 0: hard left (main oscillator)
+        pan1 = -1.0f;  // Voice 1: hard left (main oscillator)
+        pan2 = -1.0f;  // Voice 2: hard left (main oscillator)
+        pan3 = -1.0f;  // Voice 3: hard left (main oscillator)
+    }
+    
     PanEqualPowerStereo(pan0, data[0], &L1, &R1);
     PanEqualPowerStereo(pan1, data[1], &L2, &R2);
     PanEqualPowerStereo(pan2, data[2], &L3, &R3);
@@ -2076,26 +2075,63 @@ void ApplyPanning(float* data) {
     data[0] = L1 + L2 + L3 + L4;
     data[1] = R1 + R2 + R3 + R4;
     
-    // Process binaural oscillators with opposite panning (no trig calls - uses LUTs)
+    // Process binaural oscillators with opposite panning
     if (binauralEnabled) {
-        static float sampleRateInv = 0.0f;
-        if (sampleRateInv == 0.0f) sampleRateInv = 1.0f / hw.AudioSampleRate();
-        
         float binL = 0.0f, binR = 0.0f;
-        float panVals[4] = {-pan0, -pan1, -pan2, -pan3};  // Opposite pan values
         
-        for (int i = 0; i < 4; i++) {
-            float envVal = std::max(envelopes[i].envSig, voicesMinLevel);
-            // Fast sine using lookup table
-            float osc = fastSin(binauralPhase[i]) * envVal * 0.5f;
-            binauralPhase[i] += binauralFreqHz[i] * sampleRateInv;
-            if (binauralPhase[i] >= 1.0f) binauralPhase[i] -= 1.0f;
+        // Determine panning values based on hardPan flag
+        float panVals[4];
+        if (hardPan) {
+            // Hard pan: main oscillators (all voices) are hard left
+            // Binaural oscillators (all voices) are hard right
+            panVals[0] = 1.0f;   // Voice 0 binaural: hard right (main is hard left)
+            panVals[1] = 1.0f;   // Voice 1 binaural: hard right (main is hard left)
+            panVals[2] = 1.0f;   // Voice 2 binaural: hard right (main is hard left)
+            panVals[3] = 1.0f;   // Voice 3 binaural: hard right (main is hard left)
+        } else {
+            // LFO-based opposite panning (original behavior)
+            panVals[0] = -pan0;
+            panVals[1] = -pan1;
+            panVals[2] = -pan2;
+            panVals[3] = -pan3;
+        }
+        
+        if (digitalOnly) {
+            // Use InterpolatedOscillator for anti-aliased sine generation
+            // Generate binaural oscillators for ALL voices (each voice has a pair: main + binaural)
+            for (int i = 0; i < 4; i++) {
+                float envVal = std::max(envelopes[i].envSig, voicesMinLevel);
+                // Always process oscillator to maintain phase continuity (even when envelope is zero)
+                // This prevents phase discontinuities that cause audio glitches
+                float osc = internalPhaseOsc[i].Process();
+                // Apply envelope after processing to maintain phase continuity
+                osc *= envVal * 0.5f;
+                
+                // Fast equal power panning using lookup tables
+                float l, r;
+                fastPanEqualPower(panVals[i], osc, &l, &r);
+                binL += l;
+                binR += r;
+            }
+        } else {
+            // Use lookup table for fast sine (original behavior, for MIDI pitch bend mode)
+            static float sampleRateInv = 0.0f;
+            if (sampleRateInv == 0.0f) sampleRateInv = 1.0f / hw.AudioSampleRate();
             
-            // Fast equal power panning using lookup tables
-            float l, r;
-            fastPanEqualPower(panVals[i], osc, &l, &r);
-            binL += l;
-            binR += r;
+            // Generate binaural oscillators for ALL voices (each voice has a pair: main + binaural)
+            for (int i = 0; i < 4; i++) {
+                float envVal = std::max(envelopes[i].envSig, voicesMinLevel);
+                // Fast sine using lookup table
+                float osc = fastSin(binauralPhase[i]) * envVal * 0.5f;
+                binauralPhase[i] += binauralFreqHz[i] * sampleRateInv;
+                if (binauralPhase[i] >= 1.0f) binauralPhase[i] -= 1.0f;
+                
+                // Fast equal power panning using lookup tables
+                float l, r;
+                fastPanEqualPower(panVals[i], osc, &l, &r);
+                binL += l;
+                binR += r;
+            }
         }
         
         data[0] += binL;
@@ -2306,8 +2342,8 @@ float HzDetuningToCents(float baseFreq, float detuneHz)
 // Process oscillator based on selected mode
 // externalPhase: optional external phase value (0-1 range) for InterpolatedOscillator
 float ProcessOscillator(int voiceIndex, float externalPhase = -1.0f) {
-    int mode = static_cast<int>(appState.oscMode * 2.99f); // 0-2: Interpolated, FM2, Harmonic
-    mode = std::max(0, std::min(2, mode)); // Clamp to 0-2
+    int mode = static_cast<int>(appState.oscMode * 3.99f); // 0-3: Interpolated, FM2, Harmonic, Binaural
+    mode = std::max(0, std::min(3, mode)); // Clamp to 0-3
     
     switch(mode) {
         case 0: // Interpolated
@@ -2321,6 +2357,12 @@ float ProcessOscillator(int voiceIndex, float externalPhase = -1.0f) {
             return voiceFm2Osc[voiceIndex].Process();
         case 2: // Harmonic
             return voiceHarmonicOsc[voiceIndex].Process();
+        case 3: // Binaural - use InterpolatedOscillator (binaural processing happens in ApplyPanning)
+            if (externalPhase >= 0.0f) {
+                return voiceInterpOsc[voiceIndex].ProcessAtPhase(externalPhase);
+            } else {
+                return voiceInterpOsc[voiceIndex].Process();
+            }
         default:
             if (externalPhase >= 0.0f) {
                 return voiceInterpOsc[voiceIndex].ProcessAtPhase(externalPhase);
@@ -2340,10 +2382,19 @@ void SetOscillatorFrequency(int voiceIndex, float baseFreq) {
     voiceInterpOsc[voiceIndex].SetFreq(mainFreq);
     voiceFm2Osc[voiceIndex].SetFrequency(mainFreq);
     voiceHarmonicOsc[voiceIndex].SetFreq(mainFreq);
-    // Update internal phase oscillator frequency (used for phase addressing in voices 1 and 3)
-    internalPhaseOsc[voiceIndex].SetFreq(mainFreq);
     
-    // Set binaural oscillator frequency (detuned UP) - simple phase accumulator
+    // Update internal phase oscillator frequency
+    // When binaural is enabled and digitalOnly is true, use for binaural audio generation (detuned UP)
+    // Otherwise, use for phase addressing in voices 1 and 3 (main frequency)
+    if (binauralEnabled && digitalOnly) {
+        // Use for binaural audio: set to detuned frequency
+        internalPhaseOsc[voiceIndex].SetFreq(binFreq);
+    } else {
+        // Use for phase addressing: set to main frequency
+        internalPhaseOsc[voiceIndex].SetFreq(mainFreq);
+    }
+    
+    // Set binaural oscillator frequency (detuned UP) - for non-digitalOnly mode (MIDI pitch bend)
     binauralFreqHz[voiceIndex] = binFreq;
 }
 
@@ -2450,8 +2501,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     for(size_t i = 0; i < size; i++)
     {
         // Determine mode first to know how to initialize results
-        int mode = static_cast<int>(appState.oscMode * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
-        mode = std::max(0, std::min(2, mode));
+        int mode = static_cast<int>(appState.oscMode * 3.99f);  // 0-3: Interpolated, FM2, Harmonic, Binaural
+        mode = std::max(0, std::min(3, mode));
         
         for (size_t j = 0; j < 4; j++)
         {
@@ -2459,15 +2510,27 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             // Initialize them to zero to prevent input signal bleed
             if (mode == 0 && (j == 0 || j == 2)) {
                 results[j] = 0.0f;  // Will be replaced with oscillator output
+            } else if (mode == 3) {
+                // In Binaural mode, all voices use digital oscillators
+                // Initialize all to zero to prevent input signal bleed
+                results[j] = 0.0f;  // Will be replaced with oscillator output
+            } else if (binauralEnabled && digitalOnly && (j == 1 || j == 3)) {
+                // When binaural digitalOnly is enabled, voices 1 and 3 use digital oscillators
+                // Initialize them to zero to prevent input signal bleed
+                results[j] = 0.0f;  // Will be replaced with oscillator output
             } else {
                 results[j] = in[j][i];  // Other voices use input directly
             }
         }
 
         // Process internal phase oscillators to advance their phase
-        // These are used for phase addressing in voices 1 and 3
-        for (int ch = 0; ch < 4; ch++) {
-            internalPhaseOsc[ch].Process();  // Advance phase, output is discarded
+        // These are used for phase addressing in voices 1 and 3 (when not in binaural digitalOnly mode)
+        // OR for binaural audio generation (when in binaural digitalOnly mode)
+        // When in binaural digitalOnly mode, phase is advanced in ApplyPanning during audio generation
+        if (!(binauralEnabled && digitalOnly)) {
+            for (int ch = 0; ch < 4; ch++) {
+                internalPhaseOsc[ch].Process();  // Advance phase, output is discarded
+            }
         }
         
         // Always compute oscillator outputs for all voices
@@ -2483,59 +2546,69 @@ void AudioCallback(AudioHandle::InputBuffer  in,
                 if (ch == 0 || ch == 2) {
                 // if (false) {
                     // Voices 0 and 2: use external audio inputs with phase unwrapping
-                    float audioInput = 0.0f;
-                    int trackIdx = (ch == 0) ? 0 : 1;  // Index into externalPhaseTrack array
-                    
-                    if (ch == 0) {
-                        audioInput = in[0][i];
-                    } else {  // ch == 2
-                        audioInput = in[2][i];
-                    }
-                    
-                    // Normalize input to full -1 to 1 range based on detected peak amplitude
-                    // This ensures we always use the full 0-1 phase range regardless of input level
-                    // Track peak amplitude with adaptive attack/decay to handle changing input levels
-                    float absInput = fabsf(audioInput);
-                    float attackAlpha = 0.01f;   // Faster attack when input exceeds peak
-                    float decayAlpha = 0.0001f;  // Very slow decay to track decreasing levels
-                    
-                    if (absInput > inputPeakAmplitude[trackIdx]) {
-                        // Fast attack when input exceeds current peak
-                        inputPeakAmplitude[trackIdx] = inputPeakAmplitude[trackIdx] * (1.0f - attackAlpha) + absInput * attackAlpha;
+                    // Skip external audio phase addressing when binaural mode is active
+                    if (mode == 3 || (binauralEnabled && digitalOnly)) {
+                        // Don't use external audio for phase addressing in binaural mode
+                        externalPhase = -1.0f;  // Will use internal oscillator phase
                     } else {
-                        // Slow decay to track decreasing input levels
-                        inputPeakAmplitude[trackIdx] = inputPeakAmplitude[trackIdx] * (1.0f - decayAlpha) + absInput * decayAlpha;
+                        float audioInput = 0.0f;
+                        int trackIdx = (ch == 0) ? 0 : 1;  // Index into externalPhaseTrack array
+                        
+                        if (ch == 0) {
+                            audioInput = in[0][i];
+                        } else {  // ch == 2
+                            audioInput = in[2][i];
+                        }
+                        
+                        // Normalize input to full -1 to 1 range based on detected peak amplitude
+                        // This ensures we always use the full 0-1 phase range regardless of input level
+                        // Track peak amplitude with adaptive attack/decay to handle changing input levels
+                        float absInput = fabsf(audioInput);
+                        float attackAlpha = 0.01f;   // Faster attack when input exceeds peak
+                        float decayAlpha = 0.0001f;  // Very slow decay to track decreasing levels
+                        
+                        if (absInput > inputPeakAmplitude[trackIdx]) {
+                            // Fast attack when input exceeds current peak
+                            inputPeakAmplitude[trackIdx] = inputPeakAmplitude[trackIdx] * (1.0f - attackAlpha) + absInput * attackAlpha;
+                        } else {
+                            // Slow decay to track decreasing input levels
+                            inputPeakAmplitude[trackIdx] = inputPeakAmplitude[trackIdx] * (1.0f - decayAlpha) + absInput * decayAlpha;
+                        }
+                        
+                        // Ensure minimum peak amplitude to avoid division issues
+                        if (inputPeakAmplitude[trackIdx] < 0.001f) {
+                            inputPeakAmplitude[trackIdx] = 0.001f;
+                        }
+                        
+                        // Normalize input to -1 to 1 range based on detected peak
+                        float normalizedInput = audioInput / (0.98f *inputPeakAmplitude[trackIdx]);
+                        
+                        // Clamp normalized input to prevent overshoot (keep away from edges to avoid clipping)
+                        normalizedInput = std::max(-1.0f, std::min(1.0f, normalizedInput));
+                        
+                        // Apply light smoothing to reduce high-frequency artifacts
+                        // This helps reduce aliasing and distortion from rapid phase changes
+                        float smoothingFactor = 0.95f;  // Light smoothing (95% previous, 5% new)
+                        normalizedInput = normalizedInputPrev[trackIdx] * smoothingFactor + normalizedInput * (1.0f - smoothingFactor);
+                        normalizedInputPrev[trackIdx] = normalizedInput;
+                        
+                        // Map from -1 to 1 range to 0 to 1 range (phase range)
+                        float mappedPhase = (normalizedInput + 1.0f) * 0.5f;
+                        
+                        // Normalize phase exactly like ProcessAtPhase does internally
+                        while (mappedPhase >= 1.0f) mappedPhase -= 1.0f;
+                        while (mappedPhase < 0.0f) mappedPhase += 1.0f;
+                        
+                        // Use mapped phase directly for wavetable lookup
+                        externalPhase = mappedPhase;
                     }
-                    
-                    // Ensure minimum peak amplitude to avoid division issues
-                    if (inputPeakAmplitude[trackIdx] < 0.001f) {
-                        inputPeakAmplitude[trackIdx] = 0.001f;
-                    }
-                    
-                    // Normalize input to -1 to 1 range based on detected peak
-                    float normalizedInput = audioInput / (0.98f *inputPeakAmplitude[trackIdx]);
-                    
-                    // Clamp normalized input to prevent overshoot (keep away from edges to avoid clipping)
-                    normalizedInput = std::max(-1.0f, std::min(1.0f, normalizedInput));
-                    
-                    // Apply light smoothing to reduce high-frequency artifacts
-                    // This helps reduce aliasing and distortion from rapid phase changes
-                    float smoothingFactor = 0.95f;  // Light smoothing (95% previous, 5% new)
-                    normalizedInput = normalizedInputPrev[trackIdx] * smoothingFactor + normalizedInput * (1.0f - smoothingFactor);
-                    normalizedInputPrev[trackIdx] = normalizedInput;
-                    
-                    // Map from -1 to 1 range to 0 to 1 range (phase range)
-                    float mappedPhase = (normalizedInput + 1.0f) * 0.5f;
-                    
-                    // Normalize phase exactly like ProcessAtPhase does internally
-                    while (mappedPhase >= 1.0f) mappedPhase -= 1.0f;
-                    while (mappedPhase < 0.0f) mappedPhase += 1.0f;
-                    
-                    // Use mapped phase directly for wavetable lookup
-                    externalPhase = mappedPhase;
                 } else {
                     // Voices 1 and 3: use internal oscillator phase
-                    externalPhase = internalPhaseOsc[ch].GetPhase();
+                    // Only use phase addressing when not in binaural digitalOnly mode
+                    // (in binaural digitalOnly mode, oscillators are used for audio generation)
+                    if (!(binauralEnabled && digitalOnly)) {
+                        externalPhase = internalPhaseOsc[ch].GetPhase();
+                    }
                 }
             }
 
@@ -2547,8 +2620,13 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         // Mode is already calculated above, reuse it
         // For voices 0 and 2: use oscillator output when in Interpolated mode (mode 0)
         // For voices 1 and 3: always mix into stereo output if useInternalOscillators is enabled
+        // In Binaural mode (mode 3): ALL voices use main oscillators (detuned down), binaural oscillators (detuned up) added in ApplyPanning
         for (int ch = 0; ch < 4; ch++) {
-            if (ch == 0 || ch == 2) {
+            if (mode == 3) {
+                // Binaural mode: ALL voices use main oscillator output (detuned down)
+                // Binaural oscillators (detuned up) are added in ApplyPanning for each voice
+                results[ch] = oscOutputs[ch];
+            } else if (ch == 0 || ch == 2) {
                 // Voices 0 and 2: use oscillator output in Interpolated mode
                 if (mode == 0) {
                     results[ch] = oscOutputs[ch];
@@ -2557,7 +2635,10 @@ void AudioCallback(AudioHandle::InputBuffer  in,
                 }
             } else {
                 // Voices 1 and 3: use oscillator output if useInternalOscillators is enabled
-                if (useInternalOscillators[ch]) {
+                // When binaural digitalOnly mode is enabled, keep results at 0 (binaural oscillators added in ApplyPanning)
+                if (binauralEnabled && digitalOnly) {
+                    results[ch] = 0.0f;  // Binaural oscillators will be added in ApplyPanning
+                } else if (useInternalOscillators[ch]) {
                     results[ch] = oscOutputs[ch];
                 }
             }
@@ -2580,10 +2661,11 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
         // Crossfader: mix processed output with external audio from inputs 1 and 3
         // Input 1 goes to left channel, input 3 goes to right channel
+        // When binaural mode is active, skip external audio inputs (all voices use digital oscillators)
         float processedLeft = results[0];
         float processedRight = results[1];
-        float externalLeft = in[1][i];
-        float externalRight = in[3][i];
+        float externalLeft = (mode == 3 || (binauralEnabled && digitalOnly)) ? 0.0f : in[1][i];
+        float externalRight = (mode == 3 || (binauralEnabled && digitalOnly)) ? 0.0f : in[3][i];
         ApplyCrossfader(&processedLeft, &processedRight, externalLeft, externalRight);
         
         out[0][i] = processedLeft;
@@ -2832,6 +2914,11 @@ int main(void)
     appState.tuningBpm = bpmKnobValue;
     appState.seqBpm = bpmKnobValue;  // Keep deprecated for backward compatibility
 
+    // Initialize binaural state from appState
+    binauralSpreadHz = appState.oscBnrlSpread * 30.0f;  // Convert normalized 0-1 to 0-30 Hz
+    int initialMode = static_cast<int>(appState.oscMode * 3.99f);
+    binauralEnabled = (initialMode == 3);  // Binaural enabled when mode is 3
+
     UpdateOled();
 
     // start MIDI handler
@@ -3055,8 +3142,8 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
         switch(paramIndex) {
             case 0: // Knob 1 - Mode specific
                 {
-                    int mode = static_cast<int>(appState.oscMode * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
-                    mode = std::max(0, std::min(2, mode));
+                    int mode = static_cast<int>(appState.oscMode * 3.99f);  // 0-3: Interpolated, FM2, Harmonic, Binaural
+                    mode = std::max(0, std::min(3, mode));
                     switch(mode) {
                         case 0: // Interpolated - waveform
                             if (normalizedValue < 0.25f) return STR_SINE;
@@ -3079,14 +3166,27 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                                 snprintf(buf, sizeof(buf), "H%d", idx);
                                 return std::string(buf);
                             }
+                        case 3: // Binaural - spread
+                            {
+                                // normalizedValue is already the parameter value (appState.oscBnrlSpread) passed from UpdateOled
+                                // Ensure we have a valid value - use the actual parameter value directly
+                                float spreadValue = normalizedValue;  // Already clamped in SetParamValue
+                                float spreadHz = spreadValue * 30.0f;
+                                // Format with integer Hz for cleaner display (0-30 range)
+                                int spreadHzInt = static_cast<int>(spreadHz + 0.5f);  // Round to nearest integer
+                                spreadHzInt = std::max(0, std::min(30, spreadHzInt));  // Clamp to valid range
+                                static char buf[8];
+                                snprintf(buf, sizeof(buf), "%dHz", spreadHzInt);
+                                return std::string(buf);
+                            }
                         default:
                             return STR_SINE;
                     }
                 }
             case 1: // Knob 2 - Mode specific
                 {
-                    int mode = static_cast<int>(appState.oscMode * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
-                    mode = std::max(0, std::min(2, mode));
+                    int mode = static_cast<int>(appState.oscMode * 3.99f);  // 0-3: Interpolated, FM2, Harmonic, Binaural
+                    mode = std::max(0, std::min(3, mode));
                     switch(mode) {
                         case 0: // Interpolated - empty
                             return "";
@@ -3103,17 +3203,20 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                                 snprintf(buf, sizeof(buf), "%dx", static_cast<int>(decay * 10.0f));
                                 return std::string(buf);
                             }
+                        case 3: // Binaural - empty
+                            return "";
                         default:
                             return "";
                     }
                 }
             case 2: // Knob 3 - Mode specific
                 {
-                    int mode = static_cast<int>(appState.oscMode * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
-                    mode = std::max(0, std::min(2, mode));
+                    int mode = static_cast<int>(appState.oscMode * 3.99f);  // 0-3: Interpolated, FM2, Harmonic, Binaural
+                    mode = std::max(0, std::min(3, mode));
                     switch(mode) {
                         case 0: // Interpolated - empty
                         case 1: // FM2 - empty
+                        case 3: // Binaural - empty
                             return "";
                         case 2: // Harmonic - skew
                             return std::to_string(static_cast<int>(normalizedValue * 100)) + "%";
@@ -3123,12 +3226,13 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                 }
             case 3: // Oscillator Mode
                 {
-                    int mode = static_cast<int>(normalizedValue * 2.99f); // 0-2: Interpolated, FM2, Harmonic
-                    mode = std::max(0, std::min(2, mode));
+                    int mode = static_cast<int>(normalizedValue * 3.99f); // 0-3: Interpolated, FM2, Harmonic, Binaural
+                    mode = std::max(0, std::min(3, mode));
                     switch(mode) {
                         case 0: return STR_INTER;
                         case 1: return "FM2";
                         case 2: return "Harm";
+                        case 3: return "Bnrl";
                         default: return STR_INTER;
                     }
                 }
@@ -3315,6 +3419,14 @@ void GetOscLabels(int mode, const char*& label1, const char*& label2, const char
             label2 = decay;
             label3 = skew;
             break;
+        case 3: // Binaural
+            {
+                static const char* spread = "Sprd";
+                label1 = spread;
+                label2 = empty;
+                label3 = empty;
+            }
+            break;
         default:
             label1 = wave;
             label2 = empty;
@@ -3359,8 +3471,8 @@ void UpdateOled()
     int oscMode = 0;
     
     if (isOscPanel) {
-        oscMode = static_cast<int>(appState.oscMode * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
-        oscMode = std::max(0, std::min(2, oscMode));
+        oscMode = static_cast<int>(appState.oscMode * 3.99f);  // 0-3: Interpolated, FM2, Harmonic, Binaural
+        oscMode = std::max(0, std::min(3, oscMode));
         const char* label1, *label2, *label3;
         GetOscLabels(oscMode, label1, label2, label3);
         WriteFixedString(hw, knobPositions[0], labelY, 5, font_s, label1);
@@ -3400,6 +3512,9 @@ void UpdateOled()
                     else if (i == 1) val = appState.harmonicDecay;
                     else if (i == 2) val = appState.harmonicSkew;
                     break;
+                case 3: // Binaural
+                    if (i == 0) val = appState.oscBnrlSpread;
+                    break;
             }
         }
         int meterWidth = static_cast<int>(val * maxMeterWidth);  // Scale 0.0-1.0 to 0-22 pixels
@@ -3438,11 +3553,16 @@ void UpdateOled()
                     else if (i == 1) paramValue = appState.harmonicDecay;
                     else if (i == 2) paramValue = appState.harmonicSkew;
                     break;
+                case 3: // Binaural
+                    if (i == 0) paramValue = appState.oscBnrlSpread;
+                    break;
             }
         }
         
         std::string paramValueStr = FormatParameterValue(currentPanel.id, i, paramValue);
-        WriteFixedString(hw, knobPositions[i], paramValueY, 5, font_s, paramValueStr.c_str());
+        // Use wider width for OSC panel to accommodate longer values like "30Hz" or "15.0Hz"
+        int displayWidth = (isOscPanel && i == 0 && oscMode == 3) ? 6 : 5;  // 6 chars for binaural spread (e.g., "30Hz")
+        WriteFixedString(hw, knobPositions[i], paramValueY, displayWidth, font_s, paramValueStr.c_str());
     }
     
     // Show sequence pattern for individual SEQ panels (SEQ1, SEQ2, SEQ3, SEQ4)
@@ -3506,16 +3626,6 @@ void UpdateOled()
     // PRESET panel - show first 4 knob normalizedValues
     else if (currentPanel.id == 'p') {
         ShowPresetValues();
-    }
-    // BNRL (Binaural) panel - show On/Off and Hz value
-    else if (currentPanel.id == 'b') {
-        // Show On/Off state for enable parameter
-        const char* enableStr = binauralEnabled ? "On" : "Off";
-        WriteFixedString(hw, knobPositions[0], 24, 4, font_s, enableStr);
-        
-        // Show spread in Hz (rounded to integer)
-        int spreadHz = static_cast<int>(binauralSpreadHz + 0.5f);
-        WriteFixedStringF(hw, knobPositions[1], 24, 5, font_s, "%dHz", spreadHz);
     }
     
     // === BOTTOM ROW: General State Info (always visible) ===
@@ -3784,8 +3894,8 @@ void ProcessKnobs()
         // For OSC panel, route knobs to mode-specific parameters
         // all other panels are handled by SetParamValue() via bindings
         if (currentPanel.id == 'o' && inputIndex < 3) {
-            int mode = static_cast<int>(appState.oscMode * 2.99f);  // 0-2: Interpolated, FM2, Harmonic
-            mode = std::max(0, std::min(2, mode));
+            int mode = static_cast<int>(appState.oscMode * 3.99f);  // 0-3: Interpolated, FM2, Harmonic, Binaural
+            mode = std::max(0, std::min(3, mode));
             
             ParamId modeSpecificParam = PARAM_NONE;
             switch(mode) {
@@ -3800,6 +3910,9 @@ void ProcessKnobs()
                     if (inputIndex == 0) modeSpecificParam = PARAM_OSC_HARMONIC_IDX;
                     else if (inputIndex == 1) modeSpecificParam = PARAM_OSC_HARMONIC_DECAY;
                     else if (inputIndex == 2) modeSpecificParam = PARAM_OSC_HARMONIC_SKEW;
+                    break;
+                case 3: // Binaural
+                    if (inputIndex == 0) modeSpecificParam = PARAM_OSC_BNRL_SPREAD;
                     break;
             }
             paramId = modeSpecificParam;
@@ -3822,7 +3935,8 @@ void ProcessKnobs()
                                           paramId == PARAM_OSC_FM2_INDEX ||
                                           paramId == PARAM_OSC_HARMONIC_IDX ||
                                           paramId == PARAM_OSC_HARMONIC_DECAY ||
-                                          paramId == PARAM_OSC_HARMONIC_SKEW);
+                                          paramId == PARAM_OSC_HARMONIC_SKEW ||
+                                          paramId == PARAM_OSC_BNRL_SPREAD);
             
             if (isOscModeSpecificParam) {
                 // Use actual parameter value for catch-up comparison
@@ -3965,7 +4079,8 @@ static void ApplyShiftRegisterState()
                 float centsDeviation = CalculateCentsDeviation(static_cast<uint8_t>(state.note), tuning);
                 
                 // Add binaural detuning for voices 1 and 3 (analog oscillator inputs via MIDI)
-                if (binauralEnabled && (i == 1 || i == 3)) {
+                // Only apply when digitalOnly is false (when using MIDI pitch bend)
+                if (binauralEnabled && (i == 1 || i == 3) && !digitalOnly) {
                     float baseFreq = 440.0f * powf(2.0f, (state.note - 69) / 12.0f);
                     centsDeviation += HzDetuningToCents(baseFreq, binauralSpreadHz / 2.0f);
                 }
@@ -4260,7 +4375,8 @@ void ApplyTuningToSequencerNotes()
                 float centsDeviation = CalculateCentsDeviation(static_cast<uint8_t>(voices[i].note), tuning);
                 
                 // Add binaural detuning for voices 1 and 3 (analog oscillator inputs via MIDI)
-                if (binauralEnabled && (i == 1 || i == 3)) {
+                // Only apply when digitalOnly is false (when using MIDI pitch bend)
+                if (binauralEnabled && (i == 1 || i == 3) && !digitalOnly) {
                     float baseFreq = 440.0f * powf(2.0f, (voices[i].note - 69) / 12.0f);
                     centsDeviation += HzDetuningToCents(baseFreq, binauralSpreadHz / 2.0f);
                 }
@@ -4614,7 +4730,8 @@ public:
                 float centsDeviation = CalculateCentsDeviation(event.note, tuning);
                 
                 // Add binaural detuning for voices 1 and 3 (analog oscillator inputs via MIDI)
-                if (binauralEnabled && (event.channel == 1 || event.channel == 3)) {
+                // Only apply when digitalOnly is false (when using MIDI pitch bend)
+                if (binauralEnabled && (event.channel == 1 || event.channel == 3) && !digitalOnly) {
                     float baseFreq = 440.0f * powf(2.0f, (event.note - 69) / 12.0f);
                     centsDeviation += HzDetuningToCents(baseFreq, binauralSpreadHz / 2.0f);
                 }
@@ -4730,7 +4847,8 @@ public:
             float centsDeviation = CalculateCentsDeviation(event.note, tuning);
             
             // Add binaural detuning for voices 1 and 3 (analog oscillator inputs via MIDI)
-            if (binauralEnabled && (voiceIndex == 1 || voiceIndex == 3)) {
+            // Only apply when digitalOnly is false (when using MIDI pitch bend)
+            if (binauralEnabled && (voiceIndex == 1 || voiceIndex == 3) && !digitalOnly) {
                 float baseFreq = 440.0f * powf(2.0f, (event.note - 69) / 12.0f);
                 centsDeviation += HzDetuningToCents(baseFreq, binauralSpreadHz / 2.0f);
             }
