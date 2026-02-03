@@ -109,7 +109,7 @@ namespace ParamConfig {
     
     // ADSR parameters
     static constexpr float ADSR_MIN_MS = 0.1f;
-    static constexpr float ADSR_MAX_MS = 1500.0f;
+    static constexpr float ADSR_MAX_MS = 3000.0f;
     
     // Pan parameters
     static constexpr float PAN_FREQ_MAX_HZ = 10.0f;
@@ -323,6 +323,8 @@ bool binauralEnabled = false;
 float binauralSpreadHz = 0.0f;
 float binauralPhase[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 float binauralFreqHz[4] = {440.0f, 440.0f, 440.0f, 440.0f};
+float binauralBaseFreqHz[4] = {440.0f, 440.0f, 440.0f, 440.0f};  // Base frequencies for env mode
+bool binauralEnvMode = false;  // Envelope-modulated spread mode
 // Binaural mode control flags
 bool digitalOnly = true;  // Use digital sine oscillators for voices 1 and 3 instead of MIDI pitch bend
 bool hardPan = true;      // Pan each oscillator pair hard left/right instead of LFO-based panning
@@ -768,7 +770,8 @@ enum ParamId {
     
     // OSC Binaural mode parameter (mode-specific)
     PARAM_OSC_BNRL_SPREAD,
-    
+    PARAM_OSC_BNRL_ENV,  // Envelope-modulated spread toggle
+
     PARAM_NONE  // Used for unbound knobs
 };
 
@@ -776,8 +779,8 @@ enum ParamId {
 // All normalizedValues stored in normalized 0.0-1.0 range
 struct UserState {
     // ADSR parameters (stored directly in milliseconds)
-    float adsrAttackMs;        // Attack time in milliseconds (0.1ms - 1500ms)
-    float adsrDecayReleaseMs;   // Decay/Release time in milliseconds (0.1ms - 1500ms)
+    float adsrAttackMs;        // Attack time in milliseconds (0.1ms - 3000ms)
+    float adsrDecayReleaseMs;   // Decay/Release time in milliseconds (0.1ms - 3000ms)
     float adsrSustain;          // Sustain level 0.0-1.0
     float adsrMin;              // Minimum envelope level 0.0-1.0
     
@@ -853,7 +856,8 @@ struct UserState {
     
     // OSC Binaural mode parameter (only used when oscMode == 3)
     float oscBnrlSpread;        // 0.0-1.0 maps to 0-30 Hz
-    
+    float oscBnrlEnv;           // 0.0-1.0 (>0.5 = env-modulated spread enabled)
+
     // VOICE AMPLITUDE parameters (controlled via MIDI CC 100-103)
     float voiceAmplitudes[4];   // 0.0-1.0 amplitude for voices 0-3
     
@@ -921,6 +925,7 @@ struct UserState {
         microModulation(initialValue),      // Default no modulation
         microWetDry(initialValue),          // Default 0% wet (fully dry - no microsound)
         oscBnrlSpread(initialValue),       // Default 0 Hz spread
+        oscBnrlEnv(initialValue),          // Default env mode disabled
         voiceAmplitudes{1.0f, 1.0f, 1.0f, 1.0f}  // Default full amplitude for all voices
     {}
 };
@@ -1396,7 +1401,8 @@ float GetParamValue(ParamId paramId)
         case PARAM_OSC_HARMONIC_DECAY:  return appState.harmonicDecay;
         case PARAM_OSC_HARMONIC_SKEW:   return appState.harmonicSkew;
         case PARAM_OSC_BNRL_SPREAD:     return appState.oscBnrlSpread;
-        
+        case PARAM_OSC_BNRL_ENV:        return appState.oscBnrlEnv;
+
         // TUNING Panel
         case PARAM_TUNING_INDEX:        return appState.tuningIndex;
         case PARAM_TUNING_MIDI_ENABLE:  return appState.tuningMidiEnable;
@@ -1976,7 +1982,30 @@ void SetParamValue(ParamId paramId, float normalizedValue)
                 }
             }
             break;
-        
+
+        case PARAM_OSC_BNRL_ENV:
+            {
+                appState.oscBnrlEnv = normalizedValue;
+                binauralEnvMode = (normalizedValue > 0.5f);
+
+                // Update active voices to reflect new mode
+                int currentMode = static_cast<int>(appState.oscMode * 3.99f);
+                if (currentMode == 3 && binauralEnabled) {
+                    for (int i = 0; i < 4; i++) {
+                        if (voices[i].note > 0) {
+                            float baseFreq = 440.0f * powf(2.0f, (voices[i].note - 69) / 12.0f);
+                            if (applyToInternalOsc) {
+                                const ScalaTuning* tuning = GetTuningByIndex(currentTuningIndex);
+                                float frequencyMultiplier = CalculateFrequencyMultiplier(voices[i].note, tuning);
+                                baseFreq *= frequencyMultiplier;
+                            }
+                            SetOscillatorFrequency(i, baseFreq);
+                        }
+                    }
+                }
+            }
+            break;
+
         case PARAM_NONE:
         default:
             break;
@@ -2106,7 +2135,7 @@ void ApplyPanning(float* data) {
                 float osc = internalPhaseOsc[i].Process();
                 // Apply envelope after processing to maintain phase continuity
                 osc *= envVal * 0.5f;
-                
+
                 // Fast equal power panning using lookup tables
                 float l, r;
                 fastPanEqualPower(panVals[i], osc, &l, &r);
@@ -2117,7 +2146,7 @@ void ApplyPanning(float* data) {
             // Use lookup table for fast sine (original behavior, for MIDI pitch bend mode)
             static float sampleRateInv = 0.0f;
             if (sampleRateInv == 0.0f) sampleRateInv = 1.0f / hw.AudioSampleRate();
-            
+
             // Generate binaural oscillators for ALL voices (each voice has a pair: main + binaural)
             for (int i = 0; i < 4; i++) {
                 float envVal = std::max(envelopes[i].envSig, voicesMinLevel);
@@ -2125,7 +2154,7 @@ void ApplyPanning(float* data) {
                 float osc = fastSin(binauralPhase[i]) * envVal * 0.5f;
                 binauralPhase[i] += binauralFreqHz[i] * sampleRateInv;
                 if (binauralPhase[i] >= 1.0f) binauralPhase[i] -= 1.0f;
-                
+
                 // Fast equal power panning using lookup tables
                 float l, r;
                 fastPanEqualPower(panVals[i], osc, &l, &r);
@@ -2373,29 +2402,53 @@ float ProcessOscillator(int voiceIndex, float externalPhase = -1.0f) {
 }
 
 void SetOscillatorFrequency(int voiceIndex, float baseFreq) {
+    // Store base frequency for envelope-modulated spread mode
+    binauralBaseFreqHz[voiceIndex] = baseFreq;
+
     // Apply binaural detuning: main oscillator DOWN, binaural oscillator UP
-    float detuneHz = binauralEnabled ? (binauralSpreadHz / 2.0f) : 0.0f;
+    // In env mode, main oscillators are NOT detuned (spread starts at 0)
+    float detuneHz = (binauralEnabled && !binauralEnvMode) ? (binauralSpreadHz / 2.0f) : 0.0f;
     float mainFreq = baseFreq - detuneHz;
     float binFreq = baseFreq + detuneHz;
-    
+
     // Set frequency for all main oscillator types so mode switching doesn't lose the pitch
     voiceInterpOsc[voiceIndex].SetFreq(mainFreq);
     voiceFm2Osc[voiceIndex].SetFrequency(mainFreq);
     voiceHarmonicOsc[voiceIndex].SetFreq(mainFreq);
-    
+
     // Update internal phase oscillator frequency
     // When binaural is enabled and digitalOnly is true, use for binaural audio generation (detuned UP)
+    // In env mode, we start at baseFreq and modulate via UpdateBinauralFrequencies()
     // Otherwise, use for phase addressing in voices 1 and 3 (main frequency)
     if (binauralEnabled && digitalOnly) {
-        // Use for binaural audio: set to detuned frequency
-        internalPhaseOsc[voiceIndex].SetFreq(binFreq);
+        // Use for binaural audio: set to detuned frequency (or base freq in env mode)
+        internalPhaseOsc[voiceIndex].SetFreq(binauralEnvMode ? baseFreq : binFreq);
     } else {
         // Use for phase addressing: set to main frequency
         internalPhaseOsc[voiceIndex].SetFreq(mainFreq);
     }
-    
+
     // Set binaural oscillator frequency (detuned UP) - for non-digitalOnly mode (MIDI pitch bend)
-    binauralFreqHz[voiceIndex] = binFreq;
+    // In env mode, start at baseFreq (will be modulated dynamically)
+    binauralFreqHz[voiceIndex] = binauralEnvMode ? baseFreq : binFreq;
+}
+
+// Update binaural oscillator frequencies based on envelope values (for env mode)
+// Called once per audio block, before sample processing
+void UpdateBinauralFrequencies() {
+    if (!binauralEnabled || !binauralEnvMode) return;
+
+    for (int i = 0; i < 4; i++) {
+        float envVal = std::max(envelopes[i].envSig, voicesMinLevel);
+        // Spread increases linearly with envelope: 0 at env=0, full spread at env=1
+        float modulatedFreq = binauralBaseFreqHz[i] + (binauralSpreadHz * envVal);
+
+        if (digitalOnly) {
+            internalPhaseOsc[i].SetFreq(modulatedFreq);
+        }
+        // For non-digitalOnly mode, store the modulated frequency for phase accumulator
+        binauralFreqHz[i] = modulatedFreq;
+    }
 }
 
 // Apply VCA to inputs based on envelope normalizedValues
@@ -2473,6 +2526,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         float index = envelopes[j].envSig * appState.fm2Index * 1;
         voiceFm2Osc[j].SetIndex(index);
     }
+
+    // Update binaural oscillator frequencies based on envelope (for env mode)
+    UpdateBinauralFrequencies();
 
     // float trig, nn, decay;       // Pluck Vars
     // float sig, delsig;           // Mono Audio Vars
@@ -2916,6 +2972,7 @@ int main(void)
 
     // Initialize binaural state from appState
     binauralSpreadHz = appState.oscBnrlSpread * 30.0f;  // Convert normalized 0-1 to 0-30 Hz
+    binauralEnvMode = (appState.oscBnrlEnv > 0.5f);  // Env mode enabled when > 0.5
     int initialMode = static_cast<int>(appState.oscMode * 3.99f);
     binauralEnabled = (initialMode == 3);  // Binaural enabled when mode is 3
 
@@ -3203,8 +3260,8 @@ std::string FormatParameterValue(char panelId, int paramIndex, float normalizedV
                                 snprintf(buf, sizeof(buf), "%dx", static_cast<int>(decay * 10.0f));
                                 return std::string(buf);
                             }
-                        case 3: // Binaural - empty
-                            return "";
+                        case 3: // Binaural - env toggle
+                            return binauralEnvMode ? "Env" : "---";
                         default:
                             return "";
                     }
@@ -3422,8 +3479,9 @@ void GetOscLabels(int mode, const char*& label1, const char*& label2, const char
         case 3: // Binaural
             {
                 static const char* spread = "Sprd";
+                static const char* env = "Env";
                 label1 = spread;
-                label2 = empty;
+                label2 = env;
                 label3 = empty;
             }
             break;
@@ -3913,6 +3971,7 @@ void ProcessKnobs()
                     break;
                 case 3: // Binaural
                     if (inputIndex == 0) modeSpecificParam = PARAM_OSC_BNRL_SPREAD;
+                    else if (inputIndex == 1) modeSpecificParam = PARAM_OSC_BNRL_ENV;
                     break;
             }
             paramId = modeSpecificParam;
@@ -3931,12 +3990,13 @@ void ProcessKnobs()
             // instead of stored knob position, since the same physical knob controls different
             // parameters depending on the mode
             float targetValue;
-            bool isOscModeSpecificParam = (paramId == PARAM_OSC_FM2_RATIO || 
+            bool isOscModeSpecificParam = (paramId == PARAM_OSC_FM2_RATIO ||
                                           paramId == PARAM_OSC_FM2_INDEX ||
                                           paramId == PARAM_OSC_HARMONIC_IDX ||
                                           paramId == PARAM_OSC_HARMONIC_DECAY ||
                                           paramId == PARAM_OSC_HARMONIC_SKEW ||
-                                          paramId == PARAM_OSC_BNRL_SPREAD);
+                                          paramId == PARAM_OSC_BNRL_SPREAD ||
+                                          paramId == PARAM_OSC_BNRL_ENV);
             
             if (isOscModeSpecificParam) {
                 // Use actual parameter value for catch-up comparison
