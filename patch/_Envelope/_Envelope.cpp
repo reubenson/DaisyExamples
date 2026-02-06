@@ -443,6 +443,11 @@ bool debugMessageActive = false;  // Whether debug message should be displayed
 uint32_t debugMessageTime = 0;  // When debug message was set
 const uint32_t DEBUG_MESSAGE_DURATION_MS = 2000;  // How long to show debug message (2 seconds)
 
+// Audio overload detection system
+bool audioOverloadActive = false;  // Flag indicating current overload state
+uint32_t audioOverloadTime = 0;  // Timestamp when overload was detected
+const uint32_t AUDIO_OVERLOAD_DISPLAY_MS = 500;  // How long to show indicator after overload stops
+
 // Trigger off timing
 // uint32_t triggerOffTime = 0;
 // const uint32_t TRIGGER_OFF_DELAY_MS = 50;
@@ -1284,6 +1289,9 @@ void      SetDebugMessageF(const char* format, ...);
 void      ClearDebugMessage();
 bool      IsDebugMessageExpired();
 
+// Audio overload detection functions
+bool      IsAudioOverloadExpired();
+
 // SD Card functions
 void      ShowPresetValues();
 bool      SavePreset();
@@ -1371,6 +1379,14 @@ bool IsDebugMessageExpired()
     
     uint32_t currentTime = hw.seed.system.GetNow();
     return (currentTime - debugMessageTime) >= DEBUG_MESSAGE_DURATION_MS;
+}
+
+bool IsAudioOverloadExpired()
+{
+    if (!audioOverloadActive) return true;
+    
+    uint32_t currentTime = hw.seed.system.GetNow();
+    return (currentTime - audioOverloadTime) >= AUDIO_OVERLOAD_DISPLAY_MS;
 }
 
 // ============================================================================
@@ -2291,14 +2307,14 @@ void ApplyLimiter(float* data) {
     static float limiterPeakR = 0.5f;
     
     // Pre-gain (can be adjusted if needed, 1.0 = no pre-gain)
-    float preGain = 0.45f;
+    float preGain = 0.25f;
     
     // Process left channel
     float leftPre = data[0] * preGain;
     float leftPeak = fabsf(leftPre);
     // SLOPE: smooth peak tracking (attack: 0.05, release: 0.00002)
     float leftError = leftPeak - limiterPeakL;
-    limiterPeakL += (leftError > 0 ? 0.05f : 0.00002f) * leftError;
+    limiterPeakL += (leftError > 0 ? 0.1f : 0.00002f) * leftError;
     float leftGain = (limiterPeakL <= 1.0f ? 1.0f : 1.0f / limiterPeakL);
     data[0] = SoftLimit(leftPre * leftGain * 0.65f);
     
@@ -2310,6 +2326,12 @@ void ApplyLimiter(float* data) {
     limiterPeakR += (rightError > 0 ? 0.05f : 0.00002f) * rightError;
     float rightGain = (limiterPeakR <= 1.0f ? 1.0f : 1.0f / limiterPeakR);
     data[1] = SoftLimit(rightPre * rightGain * 0.65f);
+    
+    // Detect audio overload (limiter is actively reducing gain)
+    if (limiterPeakL > 1.0f || limiterPeakR > 1.0f) {
+        audioOverloadActive = true;
+        audioOverloadTime = hw.seed.system.GetNow();
+    }
 }
 
 float IncrementTowards(float normalizedValue, float target)
@@ -3503,10 +3525,11 @@ void UpdateOled()
     hw.display.DrawRect(0, 0, 15, 63, false, true);  // Black background
     
     // Display panel name vertically (one character per row)
+    // Limited to 6 characters to leave room for overload indicator in bottom left
     int startY = 0;
     const char* panelName = currentPanel.name;
     if (panelName) {
-        for (size_t i = 0; panelName[i] != '\0' && i < 7; i++) {
+        for (size_t i = 0; panelName[i] != '\0' && i < 6; i++) {
             char charStr[2] = {panelName[i], '\0'};
             hw.display.SetCursor(2, startY + i * 9);  // 9 pixels between rows for font_s
             hw.display.WriteString(charStr, font_s, true);
@@ -3688,6 +3711,15 @@ void UpdateOled()
     
     // === BOTTOM ROW: General State Info (always visible) ===
     // Use entire bottom row (y=56-63) for general parameters
+    
+    // Display audio overload indicator in bottom left corner
+    if (audioOverloadActive && !IsAudioOverloadExpired()) {
+        hw.display.SetCursor(2, 56);
+        hw.display.WriteString("X", font_s, true);
+    } else if (IsAudioOverloadExpired()) {
+        // Clear overload flag if it has expired
+        audioOverloadActive = false;
+    }
     
     // Check if debug message should be displayed
     if (debugMessageActive && !IsDebugMessageExpired()) {
